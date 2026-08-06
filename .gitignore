@@ -8,6 +8,7 @@ Sandbox
 xml/
 raw_responses/
 *.csv
+*.xlsx
 *.json
 tests/
 
