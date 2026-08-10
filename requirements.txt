@@ -1,0 +1,26 @@
+# conda env: GraphDataBase  (python 3.13)
+#   /opt/anaconda3/envs/GraphDataBase/bin/python
+
+# XML parsing and data handling
+lxml
+pandas
+pydantic
+
+# reference resolution (Crossref) and web lookups
+requests
+beautifulsoup4
+
+# chemistry lookups
+pubchempy
+chemicals
+
+# graph database
+neo4j
+
+# LLM backends for the prose route (either one; ollama is the default)
+ollama
+anthropic
+
+# not installed yet -- the prose route has a hook for it in
+# des_pipeline/extract_text_llm.py:normalize_components
+# chemdataextractor2
