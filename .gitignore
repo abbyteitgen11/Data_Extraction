@@ -1,6 +1,8 @@
 .DS_Store
 __pycache__
+.env
 *.txt
+!requirements.txt
 *.xml
 data/
 ElsevierAPIKey
@@ -9,6 +11,5 @@ xml/
 raw_responses/
 *.csv
 *.xlsx
-*.json
 tests/
 
