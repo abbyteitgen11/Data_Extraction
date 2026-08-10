@@ -24,6 +24,7 @@ DES_LLM_BACKEND=anthropic and ANTHROPIC_API_KEY.
 """
 import json
 import re
+import time
 
 from pydantic import ValidationError
 
@@ -63,9 +64,18 @@ def call_llm(prompt, schema_json, backend=None):
         response = chat(
             model=config.OLLAMA_MODEL,
             messages=[{"role": "user", "content": prompt}],
-            format=schema_json,              # constrains the output to our schema
-            options={"temperature": 0},      # deterministic
+            format=schema_json,                    # constrains the output to our schema
+            think=config.OLLAMA_THINK,             # off: we discard reasoning, so skip it
+            keep_alive=config.OLLAMA_KEEP_ALIVE,   # survive the slow steps either side
+            options={
+                "temperature": 0,                  # deterministic
+                "num_ctx": config.OLLAMA_NUM_CTX,
+                "num_predict": config.OLLAMA_NUM_PREDICT,
+            },
         )
+        if response.done_reason == "length":
+            print(f"    warning: hit num_predict ({config.OLLAMA_NUM_PREDICT}); "
+                  f"the JSON is probably truncated")
         return response.message.content
 
     if backend == "anthropic":
@@ -139,20 +149,26 @@ def normalize_components(names, section_text=""):
 
 # ---------- one section ----------
 def extract_section(section_id, title, text, review_doi="", backend=None):
-    """-> list[LLMMeasurement] for one prose section."""
+    """-> (list[LLMMeasurement], elapsed_seconds) for one prose section."""
     hint = config.PROPERTY_SECTIONS.get(title, "any of the six properties")
     prompt = PROMPT.format(title=title, property_hint=hint, text=text)
 
+    started = time.time()
     raw = call_llm(prompt, LLMExtraction.model_json_schema(), backend=backend)
+    elapsed = time.time() - started
+
     config.RAW_LLM_DIR.mkdir(parents=True, exist_ok=True)
     (config.RAW_LLM_DIR / f"{section_id or 'section'}.json").write_text(raw, encoding="utf-8")
 
     try:
         drafts = LLMExtraction.model_validate_json(raw).measurements
     except ValidationError as exc:
+        hint_text = ""
+        if not raw.rstrip().endswith("}"):
+            hint_text = f" -- output looks cut off; try a larger num_predict"
         print(f"    {section_id} {title!r}: output did not validate "
-              f"({exc.errors()[0]['msg']})")
-        return []
+              f"({exc.errors()[0]['msg']}){hint_text}")
+        return [], elapsed
 
     rows = []
     for draft in drafts:
@@ -170,7 +186,7 @@ def extract_section(section_id, title, text, review_doi="", backend=None):
             review_doi=review_doi,
             verified=verified(draft.value, text),
         ))
-    return rows
+    return rows, elapsed
 
 
 # ---------- all sections ----------
@@ -184,14 +200,23 @@ def run(sections, review_doi="", only_property_sections=True, backend=None):
         print("  no matching prose sections (use --all-sections to widen)")
         return []
 
-    print(f"  {len(chosen)} section(s) via {backend or config.LLM_BACKEND}")
-    rows = []
+    backend_name = backend or config.LLM_BACKEND
+    detail = ""
+    if backend_name == "ollama":
+        detail = (f" ({config.OLLAMA_MODEL}, think={config.OLLAMA_THINK}, "
+                  f"num_ctx={config.OLLAMA_NUM_CTX})")
+    print(f"  {len(chosen)} section(s) via {backend_name}{detail}")
+
+    rows, total_seconds = [], 0.0
     for sid, title, text in chosen:
-        found = extract_section(sid, title, text, review_doi, backend=backend)
+        found, elapsed = extract_section(sid, title, text, review_doi, backend=backend)
+        total_seconds += elapsed
         ok = sum(1 for r in found if r.verified)
-        print(f"    {sid} {title[:34]:<36} {len(found):>3} found, {ok:>3} verified")
+        print(f"    {sid} {title[:30]:<32} {elapsed:6.1f}s  "
+              f"{len(found):>3} found, {ok:>3} verified")
         rows += found
 
     total_ok = sum(1 for r in rows if r.verified)
-    print(f"  {len(rows)} measurements, {total_ok} with a value present in the source text")
+    print(f"  {len(rows)} measurements, {total_ok} with a value present in the source text"
+          f"  ({total_seconds / 60:.1f} min total)")
     return rows

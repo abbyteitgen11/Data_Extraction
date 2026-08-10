@@ -96,6 +96,21 @@ Component *attribution* is not checked and is where the model is weakest, so rev
 `sections_llm.csv` by hand before trusting it. If quality matters more than running
 locally, set `DES_LLM_BACKEND=anthropic`.
 
+**Thinking is deliberately off.** qwen3 is a reasoning model and ollama enables thinking
+by default, but this pipeline reads only `message.content` and discards
+`message.thinking` — so every reasoning token is wasted work. Measured on the Melting
+point section: 678 s producing 22,305 characters of discarded reasoning for a
+1,865-character answer, versus 158 s with `think=False`. Ollama also caps the context at
+4096 tokens by default regardless of the model, and one section prompt is already ~2400,
+which left too little room to generate.
+
+| Env var | Default | Why |
+|---|---|---|
+| `DES_OLLAMA_THINK` | `0` | set to `1` to re-enable reasoning; ~4x slower |
+| `DES_OLLAMA_NUM_CTX` | `8192` | ollama's own default of 4096 is too small here |
+| `DES_OLLAMA_NUM_PREDICT` | `4096` | runaway guard only — anything near 1024 truncates the JSON and it fails to parse |
+| `DES_OLLAMA_KEEP_ALIVE` | `30m` | the `components` step can run longer than ollama's 5-minute unload |
+
 ## The graph
 
 ```

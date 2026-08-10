@@ -93,6 +93,26 @@ LLM_BACKEND = os.environ.get("DES_LLM_BACKEND", "ollama")     # "ollama" | "anth
 OLLAMA_MODEL = os.environ.get("DES_OLLAMA_MODEL", "qwen3")
 ANTHROPIC_MODEL = os.environ.get("DES_ANTHROPIC_MODEL", "claude-sonnet-4-5")
 
+# qwen3 is a reasoning model and ollama turns thinking on by default. We read only
+# message.content and discard message.thinking, so every reasoning token is wasted:
+# measured on the Melting point section, thinking produced 22,305 characters of
+# discarded reasoning for a 1,865-character answer, and took 678 s instead of 158 s.
+OLLAMA_THINK = os.environ.get("DES_OLLAMA_THINK", "0") == "1"
+
+# ollama defaults to a 4096-token context regardless of what the model supports
+# (qwen3 handles 40960). A single section prompt is already ~2400 tokens, which left
+# too little room to generate -- the likely cause of the empty Electrical conductivity
+# result and the fabricated Density rows.
+OLLAMA_NUM_CTX = int(os.environ.get("DES_OLLAMA_NUM_CTX", 8192))
+
+# A runaway guard, not a budget. The largest real answer was 1302 tokens; setting this
+# anywhere near 1024 truncates the JSON mid-object and it fails to parse.
+OLLAMA_NUM_PREDICT = int(os.environ.get("DES_OLLAMA_NUM_PREDICT", 4096))
+
+# In an --steps all run the components step sits before the LLM and can take 20+
+# minutes, well past ollama's 5-minute default unload.
+OLLAMA_KEEP_ALIVE = os.environ.get("DES_OLLAMA_KEEP_ALIVE", "30m")
+
 # ---------- Neo4j ----------
 NEO4J_URI = os.environ.get("NEO4J_URI", "neo4j://127.0.0.1:7687")
 NEO4J_USER = os.environ.get("NEO4J_USER", "neo4j")
