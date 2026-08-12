@@ -17,7 +17,7 @@ one-row-per-measurement view that the graph loader and any ML training will want
 import re
 
 from . import config, xml_utils
-from .extract_references import reference_fields
+from .extract_references import sources
 from .schema import MeasurementRow, MixtureRow, TableRow
 
 
@@ -44,16 +44,7 @@ def parse_ratio(entry):
 
     # Strip the leading marker so "i6:4" -> "6:4", "us2:1" -> "2:1".
     stripped = re.sub(r"^(i|us|C-?)", "", raw)
-    parts = [p.strip() for p in stripped.split(":")] if stripped else []
-    nums = []
-    for p in parts[:3]:
-        try:
-            nums.append(float(p))
-        except ValueError:
-            nums.append(None)
-    while len(nums) < 3:
-        nums.append(None)
-    return raw, nums, flag
+    return raw, xml_utils.split_ratio(stripped), flag
 
 
 def parse_components(hba, hbd):
@@ -61,26 +52,6 @@ def parse_components(hba, hbd):
     comps = [hba.strip()] + [c.strip() for c in hbd.split("/")]
     flag = "quaternary+" if len(comps) > 3 else ""
     return (comps + [None, None, None])[:3], flag
-
-
-def _sources(ref_numbers, reference_map):
-    """Collect aligned per-source metadata for the papers a row cites.
-
-    Only references that resolved to a DOI are included, so every value in
-    Source_DOIs matches a Paper node in the graph. Source_ref_numbers keeps the
-    full list either way, so nothing is lost.
-    """
-    keys = ("doi", "authors", "title", "journal", "volume", "issue", "pages", "year")
-    collected = {k: [] for k in keys}
-    for n in ref_numbers:
-        meta = reference_map.get(n)
-        if not meta or not meta.get("doi"):
-            continue
-        fields = reference_fields(meta)
-        for k in keys:
-            collected[k].append(str(fields[k]).replace(config.SOURCE_SEP, "/"))
-    sep = config.SOURCE_SEP
-    return {k: sep.join(v) for k, v in collected.items()}
 
 
 def parse_table2(table, reference_map, review):
@@ -108,7 +79,7 @@ def parse_table2(table, reference_map, review):
         ratio_raw, (r1, r2, r3), ratio_flag = parse_ratio(entries[2])
         ref_text = xml_utils.text(entries[9]).strip("[]").replace("–", "-")
         ref_numbers = xml_utils.expand_ref_field(ref_text)
-        sources = _sources(ref_numbers, reference_map)
+        cited = sources(ref_numbers, reference_map)
 
         names = ":".join(n for n in (c1, c2, c3) if n)
         record = {
@@ -123,14 +94,14 @@ def parse_table2(table, reference_map, review):
             "Ref": ref_text,
             **review_fields,
             "Source_ref_numbers": ",".join(str(n) for n in ref_numbers),
-            "Source_DOIs": sources["doi"],
-            "Source_authors": sources["authors"],
-            "Source_titles": sources["title"],
-            "Source_journals": sources["journal"],
-            "Source_volumes": sources["volume"],
-            "Source_issues": sources["issue"],
-            "Source_pages": sources["pages"],
-            "Source_years": sources["year"],
+            "Source_DOIs": cited["doi"],
+            "Source_authors": cited["authors"],
+            "Source_titles": cited["title"],
+            "Source_journals": cited["journal"],
+            "Source_volumes": cited["volume"],
+            "Source_issues": cited["issue"],
+            "Source_pages": cited["pages"],
+            "Source_years": cited["year"],
             "_locus": f"row {i}",
         }
 

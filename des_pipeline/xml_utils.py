@@ -44,6 +44,23 @@ def attr_endswith(el, suffix):
     return next((v for k, v in el.attrib.items() if k.endswith(suffix)), None)
 
 
+# Bracketed citation groups: "[88]", "[26-28]", "[1,26-28]". Used by the figure
+# captions, the Table 2 reference column and the prose route, so it lives here.
+CITATION = re.compile(r"\[(\d[\d,\s–—-]*)\]")
+
+
+def split_ratio(raw, n=3):
+    """'1:2' -> [1.0, 2.0, None]. Unparseable parts become None, padded to n."""
+    parts = [p.strip() for p in str(raw or "").split(":")] if raw else []
+    nums = []
+    for p in parts[:n]:
+        try:
+            nums.append(float(p))
+        except ValueError:
+            nums.append(None)
+    return nums + [None] * (n - len(nums))
+
+
 def clean_number(s):
     """Return a float, or None. Handles unicode minus, thousands commas and dashes."""
     s = s.strip().replace(",", "")

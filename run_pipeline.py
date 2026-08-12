@@ -18,7 +18,10 @@ import sys
 
 from des_pipeline import config, router, xml_utils
 
-ALL_STEPS = ["route", "refs", "table", "figures", "components", "text", "graph"]
+# "text" runs before "components" so the prose-only component names exist by the time
+# the PubChem lookup runs. "table" and "text" both read the reference cache, so "refs"
+# has to have run at least once.
+ALL_STEPS = ["route", "refs", "table", "figures", "text", "aliases", "components", "graph"]
 
 
 def main(argv=None):
@@ -37,8 +40,8 @@ def main(argv=None):
                         help="text: send every prose section, not just the six property ones")
     parser.add_argument("--wipe", action="store_true",
                         help="graph: delete the database before loading")
-    parser.add_argument("--include-llm", action="store_true",
-                        help="graph: also load the unverified prose measurements")
+    parser.add_argument("--no-prose", action="store_true",
+                        help="graph: skip the prose measurements (they load by default)")
     args = parser.parse_args(argv)
 
     steps = ALL_STEPS if args.steps == "all" else [s.strip() for s in args.steps.split(",")]
@@ -62,7 +65,7 @@ def main(argv=None):
 
     # --- references -------------------------------------------------------
     reference_map = None
-    if {"refs", "table"} & set(steps):
+    if {"refs", "table", "text"} & set(steps):
         from des_pipeline import extract_references as refs
 
         print("references:")
@@ -98,33 +101,44 @@ def main(argv=None):
             config.FIGURES_CSV,
         )
 
+    # --- prose ------------------------------------------------------------
+    if "text" in steps:
+        from des_pipeline import extract_text_llm as text
+        from des_pipeline.schema import LLMMeasurement
+
+        print("prose sections:")
+        rows = text.run(routed.sections, routed.review.get("doi", ""),
+                        reference_map=reference_map,
+                        only_property_sections=not args.all_sections,
+                        allow_lookup=network)
+        xml_utils.write_csv(rows, config.SECTIONS_LLM_CSV, model=LLMMeasurement)
+
+    # --- abbreviations ----------------------------------------------------
+    if "aliases" in steps:
+        from des_pipeline import suggest_aliases
+
+        print("abbreviations:")
+        suggest_aliases.report()
+
     # --- components -------------------------------------------------------
     if "components" in steps:
         from des_pipeline import enrich_components as components
 
         print("components:")
         names = components.distinct_components()
-        rows = components.enrich_all(names, limit=args.limit,
+        extra = components.prose_components()          # names seen only in the prose
+        if extra:
+            print(f"  {len(extra)} prose-only component(s): {', '.join(extra)}")
+        rows = components.enrich_all(names + extra, limit=args.limit,
                                      network=network, use_nist=args.nist)
         xml_utils.write_csv(rows, config.COMPONENTS_CSV)
-
-    # --- prose ------------------------------------------------------------
-    if "text" in steps:
-        from des_pipeline import extract_text_llm as text
-
-        print("prose sections:")
-        from des_pipeline.schema import LLMMeasurement
-
-        rows = text.run(routed.sections, routed.review.get("doi", ""),
-                        only_property_sections=not args.all_sections)
-        xml_utils.write_csv(rows, config.SECTIONS_LLM_CSV, model=LLMMeasurement)
 
     # --- graph ------------------------------------------------------------
     if "graph" in steps:
         from des_pipeline import build_graph
 
         print("graph:")
-        build_graph.build(wipe=args.wipe, include_llm=args.include_llm)
+        build_graph.build(wipe=args.wipe, include_prose=not args.no_prose)
 
     print("\ndone.")
 

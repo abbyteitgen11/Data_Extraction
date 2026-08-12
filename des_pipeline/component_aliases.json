@@ -1,0 +1,49 @@
+{
+  "__comment": "Abbreviations as THIS paper (10.1016/j.molliq.2023.121899) uses them. Per-paper: a second review needs its own review. The right-hand side should be a Table 2 component name; it is redirected to Table 2's most frequent spelling automatically, so you do not need to reproduce the paper's typos.",
+  "__how_this_was_built": "Each entry is evidence-backed, not guessed. Two sources: (a) the paper defines it inline as 'Full name (ABBR)'; (b) a prose measurement's value+ratio matches exactly one Table 2 row, which names the components in full. Run 'python run_pipeline.py --steps aliases' to regenerate candidates for anything still unresolved.",
+  "__warning": "Do NOT fill these in from general chemistry knowledge. In this paper Gly is glycolic acid (not glycerol), Glu is glutaric acid, and AA is acetamide (not acetic acid). An LLM asked to expand these gets roughly half wrong, and its wrong answers are often real chemicals that exist in Table 2, so nothing downstream would catch the error.",
+  "__unresolved_on_purpose": "LA is used for BOTH lactic acid and levulinic acid in this paper -- the density 1.1031 row is unambiguously TBAB:Levulinic acid, but the melting-point section writes 'ChCl:Lactic acid (LA)'. It stays out of this file so neither meaning is silently assumed. 'amino acids' is a compound class, not a compound.",
+
+  "ChCl": "Choline chloride",
+  "[Ch]Cl": "Choline chloride",
+  "ChAc": "Choline acetate",
+  "ChBr": "Choline bromide",
+
+  "EG": "Ethylene glycol",
+  "DEG": "Diethylene glycol",
+  "TEG": "Triethylene glycol",
+
+  "TBAB": "Tetrabutylammonium bromide",
+  "TBABr": "Tetrabutylammonium bromide",
+  "TBAC": "Tetrabutylammonium chloride",
+  "TBACl": "Tetrabutylammonium chloride",
+  "TBAI": "Tetrabutylammonium iodide",
+  "TBAHS": "Tetrabutylammonium hydrogen sulfate",
+  "TBPB": "Tetrabutylphosphonium bromide",
+  "__note_TEAB": "Table 2 spells this two ways: 'Tetraethylammnoium bromide' (8 rows, the paper's own typo) and 'Tetraethylammonium bromide' (3 rows). Those are different strings, so they are different Component nodes. TEAB points at the typo because that is where most of its table data lives, which is what lets prose measurements merge with it. Fix by cleaning the table spellings, not by changing this line.",
+  "TEAB": "Tetraethylammnoium bromide",
+  "TEAC": "Tetraethylammonium chloride",
+  "TPAB": "Tetrapropylammonium bromide",
+  "ATPPB": "Allyltriphenylphosphonium bromide",
+
+  "EABr": "Ethylammonium bromide",
+  "PABr": "Propylammonium bromide",
+  "BABr": "Butylammonium bromide",
+  "EtNH3Cl": "Ethylammonium chloride",
+
+  "[BMIM]Br": "1-butyl-3-methyl imidazolium bromide",
+  "BMIMBr": "1-butyl-3-methyl imidazolium bromide",
+  "ZnBr2": "Zinc bromide",
+  "ZnCl2": "Zinc chloride",
+  "NaCl": "Sodium chloride",
+
+  "U": "Urea",
+  "AA": "Acetamide",
+  "DMU": "N,N-dimethylurea",
+  "CF3CONH2": "Trifluoroacetamide",
+  "BA": "Benzilic acid",
+  "Py": "Pyrogallol",
+  "PY": "Pyrogallol",
+  "Gly": "Glycolic acid",
+  "Glu": "Glutaric acid"
+}

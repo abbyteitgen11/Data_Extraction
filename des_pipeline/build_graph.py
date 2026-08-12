@@ -151,10 +151,66 @@ def _measurement_rows(long_rows):
         "unit": r.get("Unit"),
         "temperature_C": r.get("Temperature_C"),
         "locus": r.get("Locus") or "",
+        "origin": "table",
+        "evidence": "",
         "review_doi": r.get("Review_DOI") or config.REVIEW_DOI,
         "source_dois": _split(r.get("Source_DOIs")),
         "ref_numbers": r.get("Source_ref_numbers") or "",
     } for r in long_rows]
+
+
+def _prose_measurement_rows(prose):
+    """Prose rows in the same shape as _measurement_rows, so they share the Cypher."""
+    return [{
+        "key": r["Measurement_key"],
+        "mixture": r["Mixture"],
+        "property": r["property"],
+        "value": r["value"],
+        "unit": r.get("unit"),
+        "temperature_C": r.get("temperature_C"),
+        "locus": f"{r.get('section_id') or ''} {r.get('section_title') or ''}".strip(),
+        "origin": "prose",
+        "evidence": r.get("source_text") or "",     # the sentence it was read from
+        "review_doi": r.get("Review_DOI") or config.REVIEW_DOI,
+        "source_dois": _split(r.get("Source_DOIs")),
+        "ref_numbers": r.get("Source_ref_numbers") or "",
+    } for r in prose]
+
+
+def _prose_mixture_rows(prose, components_by_name):
+    """One record per distinct prose Mixture, components pre-split and null-filtered."""
+    from . import xml_utils
+
+    seen, rows = set(), []
+    for r in prose:
+        mixture = r.get("Mixture")
+        if not mixture or mixture in seen:
+            continue
+        seen.add(mixture)
+        names = [n.strip() for n in str(r.get("components_resolved") or "").split(";") if n.strip()]
+        ratios = xml_utils.split_ratio(r.get("molar_ratio"), n=len(names) or 1)
+        comps = []
+        for i, name in enumerate(names):
+            extra = components_by_name.get(name, {})
+            comps.append({
+                "name": name,
+                "ratio": ratios[i] if i < len(ratios) else None,
+                "role": "HBA" if i == 0 else "HBD",
+                "smiles": extra.get("smiles"),
+                "cas": extra.get("cas"),
+                "cid": int(extra["cid"]) if extra.get("cid") is not None else None,
+                "formula": extra.get("molecular_formula"),
+            })
+        rows.append({
+            "row_id": r.get("Row_id") or "",
+            "mixture": mixture,
+            "ratio_raw": r.get("molar_ratio") or "",
+            "components": comps,
+            "review_doi": r.get("Review_DOI") or config.REVIEW_DOI,
+            "source_dois": _split(r.get("Source_DOIs")),
+            "ref_numbers": r.get("Source_ref_numbers") or "",
+        })
+    return rows
 
 
 # ---------- Cypher ----------
@@ -180,10 +236,11 @@ UNWIND $rows AS row
 MERGE (mix:Mixture {name: row.mixture})
   SET mix.row_id = row.row_id, mix.ratio_raw = row.ratio_raw,
       mix.ratio_flag = row.ratio_flag, mix.component_flag = row.component_flag,
-      mix.n_components = size(row.components)
+      mix.n_components = size(row.components), mix.origin = 'table'
 
 FOREACH (c IN row.components |
   MERGE (comp:Component {name: c.name})
+    ON CREATE SET comp.origin = 'table'
     SET comp.smiles  = coalesce(c.smiles, comp.smiles),
         comp.cas     = coalesce(c.cas, comp.cas),
         comp.cid     = coalesce(c.cid, comp.cid),
@@ -205,12 +262,40 @@ FOREACH (d IN row.source_dois |
 # One block per property. The label cannot be parameterised in Cypher without
 # APOC, so it is substituted from config.PROPERTY_NAMES — our own constant, never
 # user input.
+PROSE_MIXTURES_CYPHER = """
+UNWIND $rows AS row
+MERGE (mix:Mixture {name: row.mixture})
+  ON CREATE SET mix.row_id = row.row_id, mix.ratio_raw = row.ratio_raw,
+                mix.n_components = size(row.components), mix.origin = 'prose'
+
+FOREACH (c IN row.components |
+  MERGE (comp:Component {name: c.name})
+    ON CREATE SET comp.origin = 'prose'
+  SET comp.smiles  = coalesce(c.smiles, comp.smiles),
+      comp.cas     = coalesce(c.cas, comp.cas),
+      comp.cid     = coalesce(c.cid, comp.cid),
+      comp.formula = coalesce(c.formula, comp.formula)
+  MERGE (comp)-[part:PART_OF]->(mix)
+    SET part.molar_ratio = c.ratio, part.role = c.role
+)
+
+MERGE (review:Paper {doi: row.review_doi})
+MERGE (mix)-[:REVIEW_PAPER]->(review)
+
+FOREACH (d IN row.source_dois |
+  MERGE (src:Paper {doi: d})
+  MERGE (mix)-[rep:REPORTED_IN]->(src)
+    SET rep.ref_numbers = row.ref_numbers
+)
+"""
+
 MEASUREMENTS_CYPHER = """
 UNWIND $rows AS r
 MATCH (mix:Mixture {{name: r.mixture}})
 MERGE (m:{label} {{key: r.key}})
   SET m.value = r.value, m.unit = r.unit, m.temperature_C = r.temperature_C,
-      m.property = r.property, m.mixture = r.mixture, m.locus = r.locus
+      m.property = r.property, m.mixture = r.mixture, m.locus = r.locus,
+      m.origin = r.origin, m.evidence = r.evidence
 MERGE (mix)-[has:HAS_{rel}]->(m)
   SET has.temperature_C = r.temperature_C
 
@@ -225,10 +310,20 @@ FOREACH (d IN r.source_dois |
 """
 
 
-def build(wipe=False, include_llm=False):
+def build(wipe=False, include_prose=True):
     table = _read(config.TABLE_CSV).to_dict("records")
     long_rows = _read(config.LONG_CSV).to_dict("records")
     references = _read(config.REFERENCES_CSV).to_dict("records")
+
+    # Only rows the prose route judged loadable: a real number, present in the
+    # section text, not already in Table 2, and every component name resolved.
+    prose = []
+    if include_prose and config.SECTIONS_LLM_CSV.exists():
+        prose_csv = _read(config.SECTIONS_LLM_CSV)
+        if not prose_csv.empty and "status" in prose_csv.columns:
+            prose = [r for r in prose_csv.to_dict("records") if r.get("status") == "ok"]
+            print(f"  {len(prose)} prose measurement(s) of {len(prose_csv)} rows "
+                  f"passed the status checks")
 
     components_by_name = {}
     if config.COMPONENTS_CSV.exists():
@@ -242,6 +337,7 @@ def build(wipe=False, include_llm=False):
     # Every DOI a measurement points at must have a Paper node, or the MERGE below
     # would invent an empty one.
     cited = {d for r in table for d in _split(r.get("Source_DOIs"))}
+    cited |= {d for r in prose for d in _split(r.get("Source_DOIs"))}
     known = {r["doi"] for r in references if r.get("doi")}
     missing = cited - known
     assert not missing, f"{len(missing)} cited DOIs are absent from references.csv: {list(missing)[:3]}"
@@ -260,6 +356,8 @@ def build(wipe=False, include_llm=False):
     papers = _paper_rows(references)
     mixtures = _mixture_rows(table, components_by_name)
     measurements = _measurement_rows(long_rows)
+    prose_mixtures = _prose_mixture_rows(prose, components_by_name)
+    prose_measurements = _prose_measurement_rows(prose)
 
     driver = _driver()
     try:
@@ -276,70 +374,52 @@ def build(wipe=False, include_llm=False):
         driver.execute_query(MIXTURES_CYPHER, rows=mixtures, database_=config.NEO4J_DATABASE)
         print(f"  mixtures: {len(mixtures)} rows")
 
+        if prose_mixtures:
+            # Separate statement using ON CREATE SET, so a prose row can never
+            # overwrite the identity of a mixture Table 2 already created.
+            driver.execute_query(PROSE_MIXTURES_CYPHER, rows=prose_mixtures,
+                                 database_=config.NEO4J_DATABASE)
+            print(f"  prose mixtures: {len(prose_mixtures)}")
+
         for prop in PROPERTY_NAMES:
             rows = [m for m in measurements if m["property"] == prop]
-            if not rows:
+            extra = [m for m in prose_measurements if m["property"] == prop]
+            if not rows and not extra:
                 continue
             driver.execute_query(
                 MEASUREMENTS_CYPHER.format(label=prop, rel=prop.upper()),
-                rows=rows,
+                rows=rows + extra,
                 database_=config.NEO4J_DATABASE,
             )
-            print(f"  {prop:<18} {len(rows):>5}")
-
-        if include_llm and config.SECTIONS_LLM_CSV.exists():
-            _load_llm(driver)
+            suffix = f"  (+{len(extra)} prose)" if extra else ""
+            print(f"  {prop:<18} {len(rows):>5}{suffix}")
 
         _report(driver)
     finally:
         driver.close()
 
 
-def _load_llm(driver):
-    """Optional: load the prose measurements, tagged so they stay distinguishable."""
-    rows = _read(config.SECTIONS_LLM_CSV)
-    if rows.empty or "verified" not in rows.columns:
-        print("  no prose measurements to load")
-        return
-    rows = rows[rows["verified"] == True].to_dict("records")   # noqa: E712 - pandas mask
-    if not rows:
-        print("  no verified prose measurements to load")
-        return
-    for prop in PROPERTY_NAMES:
-        subset = [{
-            "key": f"LLM:{r['section_id']}:{prop}:{r['value']}",
-            "value": r["value"], "unit": r.get("unit"),
-            "temperature_C": r.get("temperature_C"),
-            "components": r.get("components") or "",
-            "section": r.get("section_title") or "",
-            "review_doi": r.get("review_doi") or config.REVIEW_DOI,
-        } for r in rows if r["property"] == prop]
-        if not subset:
-            continue
-        driver.execute_query(f"""
-            UNWIND $rows AS r
-            MERGE (m:{prop} {{key: r.key}})
-              SET m.value = r.value, m.unit = r.unit, m.temperature_C = r.temperature_C,
-                  m.property = '{prop}', m.source = 'prose', m.needs_review = true,
-                  m.components_text = r.components, m.section = r.section
-            MERGE (review:Paper {{doi: r.review_doi}})
-            MERGE (m)-[:REVIEW_PAPER]->(review)
-        """, rows=subset, database_=config.NEO4J_DATABASE)
-    print(f"  loaded {len(rows)} prose measurements (flagged needs_review)")
-
-
 def _report(driver):
+    def query(cypher):
+        records, _, _ = driver.execute_query(cypher, database_=config.NEO4J_DATABASE)
+        return records
+
     print("\n  nodes:")
-    records, _, _ = driver.execute_query(
-        "MATCH (n) RETURN labels(n)[0] AS label, count(*) AS n ORDER BY n DESC",
-        database_=config.NEO4J_DATABASE,
-    )
-    for r in records:
+    for r in query("MATCH (n) RETURN labels(n)[0] AS label, count(*) AS n ORDER BY n DESC"):
         print(f"    {r['label']:<18} {r['n']:>6}")
+
     print("  relationships:")
-    records, _, _ = driver.execute_query(
-        "MATCH ()-[r]->() RETURN type(r) AS type, count(*) AS n ORDER BY n DESC",
-        database_=config.NEO4J_DATABASE,
-    )
-    for r in records:
+    for r in query("MATCH ()-[r]->() RETURN type(r) AS type, count(*) AS n ORDER BY n DESC"):
         print(f"    {r['type']:<18} {r['n']:>6}")
+
+    print("  by origin:")
+    for label, cypher in (
+        ("measurements", "MATCH (n) WHERE n.origin IS NOT NULL AND NOT n:Mixture "
+                         "AND NOT n:Component RETURN n.origin AS origin, count(*) AS n"),
+        ("mixtures", "MATCH (n:Mixture) RETURN n.origin AS origin, count(*) AS n"),
+        ("components", "MATCH (n:Component) RETURN n.origin AS origin, count(*) AS n"),
+    ):
+        counts = {r["origin"]: r["n"] for r in query(cypher)}
+        summary = ", ".join(f"{k or 'unset'} {v}" for k, v in sorted(counts.items(),
+                                                                    key=lambda kv: -kv[1]))
+        print(f"    {label:<14} {summary}")

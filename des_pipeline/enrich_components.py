@@ -31,6 +31,7 @@ import json
 import re
 import time
 import warnings
+from collections import Counter
 
 import pandas as pd
 
@@ -245,6 +246,205 @@ def distinct_components(path=None):
         for value in df[column].dropna():
             name = str(value).strip()
             if name and name not in seen:
+                seen.add(name)
+                names.append(name)
+    return names
+
+
+# ---------- resolving prose component names to Table 2 names ----------
+#
+# The prose writes "ChCl:EG(1:2)"; Table 2 writes "Choline chloride" / "Ethylene
+# glycol". The paper defines none of its abbreviations, so this has to be a lookup,
+# never a guess. Measured: qwen3 expands roughly half of them wrongly, and the wrong
+# answers are plausible -- it reads TBAB as tetraETHYLammonium bromide when the paper
+# means tetraBUTYL. Four such wrong answers are themselves real Table 2 entries, so
+# matching against the table vocabulary does not catch them; it legitimises them.
+#
+# Hence: exact / alias / alphanumeric lookup only. No fuzzy matching and no
+# initialism matching -- "ChAc" is both Chloroacetic acid and Choline acetate, "AA"
+# is both Acetic acid and Aconitic acid. A name we cannot resolve is flagged and
+# kept out of the graph. Missing data is visible; wrong chemistry is not.
+
+_TRAILING_ABBR = re.compile(r"\s*\([A-Za-z0-9\[\]\-]{1,12}\)\s*$")
+
+
+def _norm_key(name):
+    """Match key: lowercase, whitespace-collapsed, trailing '(ABBR)' removed."""
+    s = re.sub(r"\s+", " ", str(name or "")).strip()
+    s = _TRAILING_ABBR.sub("", s)
+    return s.lower().strip()
+
+
+def _alnum_key(name):
+    """Looser key ignoring spaces and punctuation: 'Diethanol amine' == 'Diethanolamine'."""
+    return re.sub(r"[^a-z0-9]", "", str(name or "").lower())
+
+
+def load_aliases(path=None):
+    """The human-curated abbreviation map. Keys are matched case-insensitively."""
+    path = path or config.COMPONENT_ALIASES
+    if not path.exists():
+        return {}
+    raw = json.loads(path.read_text())
+    return {k.strip().lower(): v for k, v in raw.items()
+            if not k.startswith("__") and v}
+
+
+def component_index(path=None, alias_path=None):
+    """Build the lookup used by resolve_component().
+
+    Table 2 spells some components more than one way ('Levulinic acid' /
+    'Levulinic Acid'), so the canonical form is the MOST FREQUENT spelling. That
+    way a resolved prose name lands on the Component node that already has the
+    most edges, rather than creating a second variant.
+    """
+    df = pd.read_csv(path or config.TABLE_CSV)
+    counts = Counter()
+    for column in ("Component_1", "Component_2", "Component_3"):
+        counts.update(str(v).strip() for v in df[column].dropna() if str(v).strip())
+
+    canonical = {}
+    for name, n in counts.most_common():           # most frequent first wins
+        canonical.setdefault(_norm_key(name), name)
+    alnum = {}
+    for name, n in counts.most_common():
+        alnum.setdefault(_alnum_key(name), name)
+
+    aliases = load_aliases(alias_path)
+    for abbr, full in aliases.items():
+        if _norm_key(full) not in canonical:
+            print(f"    note: alias {abbr!r} -> {full!r} is not a Table 2 component "
+                  f"(fine if it is prose-only, but check the spelling)")
+    # Prose-only components PubChem confirmed on an earlier run, so a second run
+    # resolves them without touching the network.
+    prose_vocabulary = {}
+    for name, row in _load_cache().items():
+        if row.get("lookup_status") == "ok" and _norm_key(name) not in canonical:
+            prose_vocabulary[_norm_key(name)] = name
+
+    return {"canonical": canonical, "alnum": alnum, "aliases": aliases,
+            "vocabulary": set(counts), "prose_vocabulary": prose_vocabulary}
+
+
+# Words that mark a compound CLASS rather than a compound. PubChem would either
+# miss these or, worse, match them to an unrelated single substance.
+_CLASS_WORDS = re.compile(
+    r"\b(acids|salts?|halides|bromides|chlorides|iodides|compounds?|derivatives|"
+    r"analogues|mixtures?|species|based)\b", re.I)
+
+
+def looks_like_chemical(name):
+    """Cheap filter deciding whether a name is worth a PubChem lookup.
+
+    Keeps '1,5-pentanediol'; rejects 'Amino acids', 'Choline salt',
+    'Tetraalkyl ammonium halides', 'HBD' and 'RCl'.
+    """
+    n = str(name or "").strip()
+    if len(n) < 4 or n.isupper():          # too short, or a bare abbreviation
+        return False
+    if _CLASS_WORDS.search(n):
+        return False
+    return bool(re.search(r"[a-z]{3}", n))
+
+
+def resolve_component(name, index, allow_lookup=False):
+    """One name -> (canonical name or None, how it was resolved).
+
+    The alias file is consulted FIRST, on the raw string. It is human-verified and
+    the model's expansion is not, so where they disagree the human wins.
+
+    With allow_lookup, a name that matches nothing in Table 2 but that PubChem
+    recognises is accepted as a prose-only component -- that is how a genuinely new
+    chemical like '1,5-pentanediol' gets into the graph. PubChem is the arbiter, so
+    this is still a lookup rather than a guess. Results are cached on disk.
+    """
+    raw = str(name or "").strip()
+    if not raw:
+        return None, "empty"
+
+    def canonicalise(value):
+        """Redirect an alias onto Table 2's most-frequent spelling of that name.
+
+        Table 2 spells several components two ways -- 'Tetraethylammnoium bromide'
+        (8 uses, the paper's own typo) vs 'Tetraethylammonium bromide' (3). Going
+        through the index means an alias lands on the busier node whichever
+        spelling was written here.
+        """
+        return index["canonical"].get(_norm_key(value), value)
+
+    alias = index["aliases"].get(raw.lower())
+    if alias:
+        return canonicalise(alias), "alias"
+
+    key = _norm_key(raw)
+    if key in index["canonical"]:                  # also handles a trailing "(ABBR)"
+        return index["canonical"][key], "table"
+
+    # "choline acetate (ChAc)" -> try the abbreviation itself against the aliases
+    trailing = _TRAILING_ABBR.search(raw)
+    if trailing:
+        abbr = trailing.group(0).strip().strip("()").lower()
+        if abbr in index["aliases"]:
+            return canonicalise(index["aliases"][abbr]), "alias"
+
+    alnum = _alnum_key(key)
+    if alnum in index["alnum"]:
+        return index["alnum"][alnum], "alnum"
+
+    # Prose-only component confirmed by PubChem on an earlier run.
+    if key in index["prose_vocabulary"]:
+        return index["prose_vocabulary"][key], "pubchem"
+
+    if allow_lookup and looks_like_chemical(raw):
+        cache = _load_cache()
+        row = cache.get(raw)
+        if row is None:
+            import requests
+
+            row = lookup(raw, requests.Session()).model_dump()
+            cache[raw] = row
+            _save_cache(cache)
+        if row.get("lookup_status") == "ok":
+            index["prose_vocabulary"][key] = raw
+            return raw, "pubchem"
+
+    return None, "unresolved"
+
+
+def resolve_components(names, index, allow_lookup=False):
+    """-> (resolved, unresolved, status) where status is resolved|partial|unresolved."""
+    resolved, unresolved = [], []
+    for name in names or []:
+        canonical, _how = resolve_component(name, index, allow_lookup=allow_lookup)
+        (resolved if canonical else unresolved).append(canonical or str(name).strip())
+    if not resolved:
+        status = "unresolved"
+    elif unresolved:
+        status = "partial"
+    else:
+        status = "resolved"
+    return resolved, unresolved, status
+
+
+def prose_components(path=None, index=None):
+    """Component names used in the prose that Table 2 never mentions.
+
+    These are the genuinely new chemicals the paper discusses in text only --
+    '1,5-pentanediol' appears six times in the prose and nowhere in the table -- and
+    they are what the PubChem step has to cover beyond the table's own vocabulary.
+    """
+    path = path or config.SECTIONS_LLM_CSV
+    if not path.exists():
+        return []
+    df = pd.read_csv(path)
+    if "components_resolved" not in df.columns:
+        return []
+    vocabulary = (index or component_index())["vocabulary"]
+    names, seen = [], set()
+    for cell in df.components_resolved.dropna():
+        for name in str(cell).split(";"):
+            name = name.strip()
+            if name and name not in vocabulary and name not in seen:
                 seen.add(name)
                 names.append(name)
     return names

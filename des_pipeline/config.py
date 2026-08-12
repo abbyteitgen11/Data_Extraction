@@ -42,6 +42,12 @@ REFERENCE_CACHE = ROOT / "reference_map.json"      # existing cache, kept in pla
 COMPONENT_CACHE = DATA / "components_cache.json"
 RAW_LLM_DIR = ROOT / "raw_responses"
 
+# Human-curated abbreviation map. Lives next to the code (not in data/) because it
+# is edited by hand and worth version-controlling; JSON rather than CSV because
+# .gitignore excludes *.csv.
+COMPONENT_ALIASES = Path(__file__).resolve().parent / "component_aliases.json"
+ALIAS_SUGGESTIONS_CSV = DATA / "alias_suggestions.csv"
+
 # ---------- the paper we are extracting from ----------
 REVIEW_DOI = "10.1016/j.molliq.2023.121899"
 
@@ -64,6 +70,21 @@ PROPERTIES = [
 ]
 PROPERTY_NAMES = tuple(name for _, name, _ in PROPERTIES)
 PROPERTY_UNITS = {name: unit for _, name, unit in PROPERTIES}
+
+# Prose writes units however the authors felt like it. Map the spellings we have
+# seen onto the table's, so the graph does not end up with g·cm-3, g⋅cm-3 and
+# g*cm^-3 as three different units. An unrecognised unit is kept verbatim rather
+# than coerced -- a genuinely different scale should be visible, not hidden.
+UNIT_ALIASES = {
+    "c": "C", "°c": "C", "˚c": "C", "oc": "C", "celsius": "C", "k": "K",
+    "g·cm-3": "g*cm^-3", "g⋅cm-3": "g*cm^-3", "g cm-3": "g*cm^-3",
+    "g/cm3": "g*cm^-3", "g/cm^3": "g*cm^-3", "g·cm−3": "g*cm^-3", "g/ml": "g*cm^-3",
+    "mpa·s": "mPa*s", "mpa⋅s": "mPa*s", "mpa s": "mPa*s", "mpa.s": "mPa*s", "cp": "mPa*s",
+    "ms·cm-1": "mS*cm^-1", "ms⋅cm-1": "mS*cm^-1", "ms/cm": "mS*cm^-1",
+    "ms cm-1": "mS*cm^-1", "ms·cm−1": "mS*cm^-1",
+    "mn·m-1": "mN*m^-1", "mn⋅m-1": "mN*m^-1", "mn/m": "mN*m^-1",
+    "mn m-1": "mN*m^-1", "mn·m−1": "mN*m^-1",
+}
 
 # Table 2's footnote: "At a40 C, b20 C, c60 C, d45 C, e30 C, f35 C, g50 C, h55 C".
 # A superscript letter on a value means it was measured at that temperature.
@@ -100,18 +121,26 @@ ANTHROPIC_MODEL = os.environ.get("DES_ANTHROPIC_MODEL", "claude-sonnet-4-5")
 OLLAMA_THINK = os.environ.get("DES_OLLAMA_THINK", "0") == "1"
 
 # ollama defaults to a 4096-token context regardless of what the model supports
-# (qwen3 handles 40960). A single section prompt is already ~2400 tokens, which left
-# too little room to generate -- the likely cause of the empty Electrical conductivity
-# result and the fabricated Density rows.
-OLLAMA_NUM_CTX = int(os.environ.get("DES_OLLAMA_NUM_CTX", 8192))
+# (qwen3 handles 40960). Prompt plus answer now runs to ~7000 tokens: the section
+# text is up to 1900, the instructions ~1200, and a full answer 3000-4000 because
+# every record carries a verbatim source_text quote.
+OLLAMA_NUM_CTX = int(os.environ.get("DES_OLLAMA_NUM_CTX", 16384))
 
-# A runaway guard, not a budget. The largest real answer was 1302 tokens; setting this
-# anywhere near 1024 truncates the JSON mid-object and it fails to parse.
-OLLAMA_NUM_PREDICT = int(os.environ.get("DES_OLLAMA_NUM_PREDICT", 4096))
+# A runaway guard, not a budget. Set it too low and the JSON is cut off mid-object
+# and fails to parse entirely -- 4096 truncated four of the six sections once every
+# record had to carry all eight fields.
+OLLAMA_NUM_PREDICT = int(os.environ.get("DES_OLLAMA_NUM_PREDICT", 8192))
 
 # In an --steps all run the components step sits before the LLM and can take 20+
 # minutes, well past ollama's 5-minute default unload.
 OLLAMA_KEEP_ALIVE = os.environ.get("DES_OLLAMA_KEEP_ALIVE", "30m")
+
+# qwen3 ships with repeat_penalty = 1, i.e. none. Copying long verbatim quotes at
+# temperature 0 then invites degeneration: one run got stuck mid-quote on
+# "...It was shown that the viscos" and emitted "0" until it hit num_predict,
+# truncating the whole JSON response. A mild penalty breaks those loops without
+# noticeably affecting the structured output.
+OLLAMA_REPEAT_PENALTY = float(os.environ.get("DES_OLLAMA_REPEAT_PENALTY", 1.1))
 
 # ---------- Neo4j ----------
 NEO4J_URI = os.environ.get("NEO4J_URI", "neo4j://127.0.0.1:7687")

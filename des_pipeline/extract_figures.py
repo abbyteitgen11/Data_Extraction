@@ -13,18 +13,13 @@ need once the plots are digitised.
 Fill in the `extracted_csv` column when a figure has been digitised; nothing in
 the pipeline writes to it.
 """
-import re
-
 from . import xml_utils
 from .schema import FigureRow
-
-# Bracketed citation groups in a caption: "[88]", "[26-28]", "[1,26-28]".
-_CITATION = re.compile(r"\[(\d[\d,\s–—-]*)\]")
 
 
 def _cited_references(caption):
     numbers = []
-    for group in _CITATION.findall(caption):
+    for group in xml_utils.CITATION.findall(caption):
         numbers += xml_utils.expand_ref_field(group)
     return sorted(set(numbers))
 

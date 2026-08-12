@@ -13,7 +13,7 @@ belongs to the n-th title in Source_titles, and so on.
 """
 from typing import Literal, Optional, get_args
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from .config import PROPERTY_NAMES
 
@@ -176,24 +176,49 @@ class ComponentRow(BaseModel):
 
 
 class LLMMeasurement(BaseModel):
-    """A measurement the LLM claims to have found in prose. -> data/sections_llm.csv
+    """One measurement claimed in prose. -> data/sections_llm.csv
 
-    Never loaded into the graph without --include-llm. Prose numbers are far less
-    trustworthy than the table.
+    Only rows with status == "ok" are loaded into the graph. See STATUS_ORDER below.
     """
 
-    components: str = ""                 # ";"-joined, e.g. "choline chloride;urea"
+    Row_id: str = ""                     # "P-0001"; for humans, not a graph key
+    Measurement_key: str = ""            # content-derived, so re-loads are idempotent
+
+    # --- identity ---
+    components: str = ""                 # ";"-joined, exactly as the model wrote them
+    components_resolved: str = ""        # ";"-joined canonical Table-2 names
+    unresolved_components: str = ""      # the ones we refused to guess at
+    component_status: str = ""           # resolved | partial | unresolved
     molar_ratio: Optional[str] = None
+    Mixture: str = ""                    # "A:B (1:2)" — same convention as Table 2
+
+    # --- the measurement ---
     property: PropertyName
-    value: float
-    unit: Optional[str] = None
+    value: Optional[float] = None        # None when the text only ranks or compares
+    unit: Optional[str] = None           # canonicalised to the Table 2 spelling
+    unit_raw: Optional[str] = None       # exactly as the model wrote it
     temperature_C: Optional[float] = None
-    source_text: str = ""                # the model's quote — checked against the real text
+
+    # --- provenance ---
+    source_text: str = ""                # the model's quote
+    quote_found: bool = False            # ...and whether it is really in the section
     section_id: str = ""
     section_title: str = ""
-    review_doi: str = ""
-    verified: bool = False               # does `value` actually occur in the XML section?
-    status: str = "needs_review"
+    Source_ref_numbers: str = ""         # harvested from the citation, e.g. "113"
+    Source_DOIs: str = ""                # "|"-joined, same convention as the table route
+    ref_source: str = ""                 # agreed | text | llm | none
+    Review_DOI: str = ""
+
+    # --- verdicts ---
+    verified: bool = False               # does `value` occur in the real section text?
+    duplicate_of: str = ""               # a table Measurement_key, e.g. "T2-0303:Density"
+    duplicate_kind: str = ""             # components+value | value_only
+    status: str = "ok"                   # see STATUS_ORDER
+
+
+# What keeps a prose row out of the graph, in precedence order. First match wins.
+# Only "ok" is loaded.
+STATUS_ORDER = ("qualitative", "unverified", "duplicate", "unresolved_components", "ok")
 
 
 class LLMExtraction(BaseModel):
@@ -205,17 +230,38 @@ class LLMExtraction(BaseModel):
 class LLMMeasurementDraft(BaseModel):
     """What we ask the model for — deliberately smaller than LLMMeasurement.
 
-    Fields we already know (section, DOI, verification) are filled in afterwards
-    rather than asked for, so the model has less room to invent.
+    Every field is REQUIRED BUT NULLABLE, i.e. `Field(description=...)` with no
+    default. This is load-bearing: in pydantic v2 `Optional[X] = None` leaves the
+    field out of the schema's `required` list, so the grammar lets the model skip
+    the key entirely — which is exactly why molar_ratio, unit and temperature_C
+    came back 0/59 populated. With no default the model must emit the key and
+    decide between a value and null.
+
+    The descriptions are dropped by ollama when it converts this schema to a GBNF
+    grammar (they do reach the anthropic backend, which passes input_schema
+    through). So the same instructions are repeated in extract_text_llm.PROMPT.
     """
 
-    components: list[str]
-    molar_ratio: Optional[str] = None
-    property: PropertyName
-    value: float
-    unit: Optional[str] = None
-    temperature_C: Optional[float] = None
-    source_text: str
+    components: list[str] = Field(
+        description="Chemicals in the DES, HBA first. Full chemical names, never "
+                    "abbreviations: 'Choline chloride', not 'ChCl'.")
+    molar_ratio: Optional[str] = Field(
+        description="Mixing ratio exactly as written, e.g. '1:2', '1:1.5', '1:1:1'.")
+    property: PropertyName = Field(
+        description="Which of the six properties this number is.")
+    value: Optional[float] = Field(
+        description="The number stated in the text. null when the text only ranks or "
+                    "compares DESs without giving a number. Never invent one.")
+    unit: Optional[str] = Field(
+        description="Unit as written, e.g. '°C', 'g·cm-3', 'mPa·s', 'mS·cm-1'.")
+    temperature_C: Optional[float] = Field(
+        description="Measurement temperature in Celsius, if stated separately.")
+    ref_numbers: Optional[str] = Field(
+        description="The bracketed citation this number is attributed to, e.g. '113' "
+                    "or '73,80'. The nearest one, not every citation in the sentence.")
+    source_text: str = Field(
+        description="The clause containing the number, verbatim and SHORT -- at most "
+                    "about 150 characters, not a whole paragraph.")
 
 
 LLMExtraction.model_rebuild()

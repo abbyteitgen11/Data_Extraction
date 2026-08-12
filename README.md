@@ -52,12 +52,17 @@ python run_pipeline.py --steps route                    # inventory, no side eff
 python run_pipeline.py --steps refs,table --no-network   # ~5 s, uses the cache
 python run_pipeline.py --steps refs                      # Crossref, ~1 min
 python run_pipeline.py --steps figures
-python run_pipeline.py --steps components --limit 20     # PubChem; drop --limit for all 494
 python run_pipeline.py --steps text                      # LLM, needs `ollama serve`
+python run_pipeline.py --steps aliases                   # abbreviation candidates
+python run_pipeline.py --steps components --limit 20     # PubChem; drop --limit for all 494
 python run_pipeline.py --steps graph --wipe
 ```
 
-`table` reads the reference cache, so run `refs` at least once first.
+Order matters in two places: `table` and `text` both read the reference cache, so run
+`refs` at least once first; and `text` runs before `components` so prose-only component
+names exist by the time the PubChem lookup runs. `--steps all` already does both.
+
+Prose measurements load into the graph by default; `--no-prose` skips them.
 
 ## What comes out
 
@@ -71,7 +76,8 @@ Everything lands in `data/` (gitignored).
 | `components.csv` | 494 | PubChem identifiers and pure-component properties |
 | `figures.csv` | 11 | worklist for manual digitisation (WebPlotDigitizer) |
 | `tables_unhandled.csv` | 1 | tables with no parser yet (Table 1) |
-| `sections_llm.csv` | — | prose measurements, flagged `needs_review` |
+| `sections_llm.csv` | — | prose measurements, with `status` deciding which reach the graph |
+| `alias_suggestions.csv` | — | abbreviation candidates from `--steps aliases` |
 
 In `table2_with_dois.csv` the `Source_*` columns are multi-valued and positionally
 aligned: the n-th DOI in `Source_DOIs` belongs to the n-th title in `Source_titles`.
@@ -82,19 +88,67 @@ a time value).
 
 ### On the prose route
 
-Routing one section at a time works, but local `qwen3` output is still weak. On the six
-property sections it returned 34 measurements: values and components are broadly right
-for viscosity and surface tension, but it invented two measurements outright for the
-density section (components `A;B;C`, a sentence that is not in the paper) and folded
-temperatures into the component list for melting point.
+Prose measurements are first-class: they attach to the same `Mixture` and `Component`
+nodes as table data and carry the same `REPORTED_IN` / `REVIEW_PAPER` provenance. But
+they only get there if they survive five checks, applied in order — the first failure
+wins and sets `status`:
 
-The `verified` column catches the fabrications — it checks each value against the real
-XML section text, not against the model's own quoted sentence, so a hallucination cannot
-validate itself. It flagged exactly those two rows and nothing else.
+| status | meaning | in graph |
+|---|---|---|
+| `qualitative` | no number; the text only ranked or compared | no |
+| `unverified` | the value does not occur in the real section text | no |
+| `duplicate` | Table 2 already has it (`duplicate_of` names the row) | no |
+| `unresolved_components` | a chemical name we refused to guess at | no |
+| `ok` | — | **yes** |
 
-Component *attribution* is not checked and is where the model is weakest, so review
-`sections_llm.csv` by hand before trusting it. If quality matters more than running
-locally, set `DES_LLM_BACKEND=anthropic`.
+`verified` compares against the XML section text, not the model's own quoted sentence, so
+a hallucination cannot validate itself.
+
+**Abbreviations are the hard part, and they are resolved by lookup, never by guessing.**
+The prose writes `ChCl:EG(1:2)`; Table 2 writes the names out in full; and the paper
+defines none of its abbreviations — ChCl (50 uses), TBAB (47) and TBAC (36) are never
+spelled out anywhere. Asking qwen3 to expand them gets roughly half wrong, and wrong in a
+way that looks right: it reads `TBAB` as tetra**ethyl**ammonium bromide when the paper
+means tetra**butyl**, `Gly` as glycine when this paper means glycolic acid. Four such
+wrong answers are themselves real Table 2 entries, so checking against the table
+vocabulary does not catch them — it legitimises them.
+
+So `des_pipeline/component_aliases.json` is authoritative. It is human-edited, and every
+entry is evidence-backed rather than recalled: either the paper defines it inline, or a
+prose measurement's value and ratio match exactly one Table 2 row that names the
+components in full. `--steps aliases` regenerates candidates for anything unresolved:
+
+```
+abbreviation             uses  candidate from Table 2         confidence
+TBAB                        8  Tetrabutylammonium bromide     strong
+LA                          1  Levulinic acid                 strong
+```
+
+Treat it as a proposal, not an answer — for `TBAC` the top-ranked candidate is *Glycerol*,
+which is wrong. Anything you do not confirm stays out of the graph. Note that `LA` means
+**both** lactic and levulinic acid in this paper depending on the section, which is why it
+is deliberately absent from the alias file.
+
+The alias file is **per-paper**. A second review needs its own.
+
+A component named in prose but absent from Table 2 — `1,5-pentanediol` appears six times
+in the text and nowhere in the table — is accepted only if **PubChem** recognises it, and
+then flows into the enrichment step like any other component. A cheap word filter keeps
+compound *classes* ("Amino acids", "Choline salt", "Tetraalkyl ammonium halides") and
+non-chemicals ("HBD", "RCl") from being looked up at all.
+
+Component *attribution* is still where the model is weakest, so read `sections_llm.csv`
+before trusting it. For better quality set `DES_LLM_BACKEND=anthropic`.
+
+Two ollama settings matter for this route beyond speed. `num_ctx` must fit prompt plus a
+long answer (~7000 tokens); at 4096 or 8192 the JSON is cut off mid-object and the whole
+section is lost. And qwen3 ships with `repeat_penalty = 1`, i.e. none, which let it
+degenerate mid-quote — one run got stuck on `"...It was shown that the viscos"` and emitted
+`0` until it hit the token cap. Hence `DES_OLLAMA_REPEAT_PENALTY=1.1` and the instruction
+to keep quotes short.
+
+Re-running `--steps text` after a prompt change leaves orphaned prose nodes, because keys
+are derived from content. Reload with `--steps graph --wipe`.
 
 **Thinking is deliberately off.** qwen3 is a reasoning model and ollama enables thinking
 by default, but this pipeline reads only `message.content` and discards
@@ -107,9 +161,10 @@ which left too little room to generate.
 | Env var | Default | Why |
 |---|---|---|
 | `DES_OLLAMA_THINK` | `0` | set to `1` to re-enable reasoning; ~4x slower |
-| `DES_OLLAMA_NUM_CTX` | `8192` | ollama's own default of 4096 is too small here |
-| `DES_OLLAMA_NUM_PREDICT` | `4096` | runaway guard only — anything near 1024 truncates the JSON and it fails to parse |
-| `DES_OLLAMA_KEEP_ALIVE` | `30m` | the `components` step can run longer than ollama's 5-minute unload |
+| `DES_OLLAMA_NUM_CTX` | `16384` | ollama's own default of 4096 is far too small; prompt plus answer runs to ~7000 tokens |
+| `DES_OLLAMA_NUM_PREDICT` | `8192` | runaway guard only — set it too low and the JSON is truncated mid-object and fails to parse |
+| `DES_OLLAMA_REPEAT_PENALTY` | `1.1` | qwen3 defaults to 1 (none) and degenerates while copying long quotes |
+| `DES_OLLAMA_KEEP_ALIVE` | `30m` | steps either side can run longer than ollama's 5-minute unload |
 
 ## The graph
 
@@ -127,6 +182,14 @@ which left too little room to generate.
 (:Density) -[:REPORTED_IN {ref_numbers}]-> (:Paper {role:'primary'})   where the data came from
 (:Density) -[:REVIEW_PAPER]-------------->  (:Paper {role:'review'})   where we read it
 (:Mixture) -[:REPORTED_IN]/[:REVIEW_PAPER]-> (:Paper)
+```
+
+Every measurement, mixture and component carries `origin` — `'table'` or `'prose'` — so
+the two sources stay separable. Prose measurements also carry `evidence`, the sentence
+they were read from.
+
+```cypher
+MATCH (m:Mixture)-[:HAS_VISCOSITY]->(v) WHERE v.origin = 'table' RETURN v.value;
 ```
 
 The two relationship types are the point: `REPORTED_IN` reaches the paper that actually

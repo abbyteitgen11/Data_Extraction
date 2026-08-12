@@ -14,6 +14,7 @@ exact, and because it is keyed it never re-runs the expensive search from pass 1
 Enriched values are written to separate cr_* keys so the cache stays
 backwards-compatible and the original XML metadata is never overwritten.
 """
+import html
 import json
 import time
 
@@ -261,9 +262,14 @@ def enrich_review(review, network=True, cache=None):
 
 # ---------- the shape everything downstream reads ----------
 def reference_fields(meta):
-    """Normalise one reference to flat strings, preferring Crossref over the XML."""
+    """Normalise one reference to flat strings, preferring Crossref over the XML.
+
+    Crossref returns HTML-escaped text, so 34 of these journals arrive as
+    "Chemical Engineering &amp; Technology". Unescaping here rather than at fetch
+    time fixes what is already in reference_map.json without re-querying.
+    """
     authors = meta.get("cr_authors") or "; ".join(meta.get("authors") or [])
-    return {
+    fields = {
         "doi": meta.get("doi") or "",
         "authors": authors,
         "title": meta.get("cr_title") or meta.get("title") or "",
@@ -273,6 +279,32 @@ def reference_fields(meta):
         "pages": meta.get("pages") or "",
         "year": meta.get("cr_year") or meta.get("year") or "",
     }
+    for key in ("authors", "title", "journal"):
+        fields[key] = html.unescape(str(fields[key]))
+    return fields
+
+
+def sources(ref_numbers, reference_map):
+    """Aligned per-source metadata for a set of cited reference numbers.
+
+    Only references that resolved to a DOI are included, so every value in the
+    returned "doi" list matches a Paper node in the graph. Each key holds a
+    SOURCE_SEP-joined string, and the lists are positionally aligned: the n-th DOI
+    belongs to the n-th title.
+
+    Shared by the table route and the prose route so both resolve provenance the
+    same way.
+    """
+    keys = ("doi", "authors", "title", "journal", "volume", "issue", "pages", "year")
+    collected = {k: [] for k in keys}
+    for n in ref_numbers:
+        meta = (reference_map or {}).get(n)
+        if not meta or not meta.get("doi"):
+            continue
+        fields = reference_fields(meta)
+        for k in keys:
+            collected[k].append(str(fields[k]).replace(config.SOURCE_SEP, "/"))
+    return {k: config.SOURCE_SEP.join(v) for k, v in collected.items()}
 
 
 def to_rows(reference_map):
