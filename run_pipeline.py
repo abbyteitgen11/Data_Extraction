@@ -23,7 +23,8 @@ from des_pipeline import config, router, xml_utils
 # has to have run at least once.
 # "aliases" is a human-review step -- it proposes abbreviation definitions for you to
 # confirm by hand -- so it is deliberately not part of an "all" run.
-ALL_STEPS = ["route", "refs", "table", "figures", "text", "aliases", "components", "graph"]
+#ALL_STEPS = ["route", "refs", "table", "figures", "text", "aliases", "components", "graph"]
+ALL_STEPS = ["components"]
 DEFAULT_STEPS = [s for s in ALL_STEPS if s != "aliases"]
 
 def main(argv=None):
@@ -134,7 +135,7 @@ def main(argv=None):
         if extra:
             print(f"  {len(extra)} prose-only component(s): {', '.join(extra)}")
         rows = components.enrich_all(names + extra, limit=args.limit,
-                                     network=network, use_nist=args.nist)
+                                     network=network, use_nist=not args.nist)
         xml_utils.write_csv(rows, config.COMPONENTS_CSV)
 
     # --- graph ------------------------------------------------------------
