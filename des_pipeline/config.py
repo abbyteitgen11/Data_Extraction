@@ -10,7 +10,8 @@ from pathlib import Path
 
 # ---------- paths ----------
 ROOT = Path(__file__).resolve().parent.parent
-XML = ROOT / "SadeghiDESReview.xml"
+XML_FILES = ROOT / "xml"
+XML = XML_FILES / "SadeghiDESReview.xml"
 DATA = ROOT / "data"
 
 
@@ -38,7 +39,7 @@ SECTIONS_LLM_CSV = DATA / "sections_llm.csv"
 TABLES_UNHANDLED_CSV = DATA / "tables_unhandled.csv"
 
 # Caches. Expensive to rebuild, so they are kept separate from the outputs.
-REFERENCE_CACHE = ROOT / "reference_map.json"      # existing cache, kept in place
+REFERENCE_CACHE = DATA / "reference_map.json"      # existing cache, kept in place
 COMPONENT_CACHE = DATA / "components_cache.json"
 RAW_LLM_DIR = ROOT / "raw_responses"
 

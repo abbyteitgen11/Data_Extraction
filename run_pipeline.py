@@ -21,8 +21,8 @@ from des_pipeline import config, router, xml_utils
 # "text" runs before "components" so the prose-only component names exist by the time
 # the PubChem lookup runs. "table" and "text" both read the reference cache, so "refs"
 # has to have run at least once.
-ALL_STEPS = ["route", "refs", "table", "figures", "text", "aliases", "components", "graph"]
-
+#ALL_STEPS = ["route", "refs", "table", "figures", "text", "aliases", "components", "graph"]
+ALL_STEPS = ["graph"]
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__,
