@@ -42,12 +42,16 @@ TABLES_UNHANDLED_CSV = DATA / "tables_unhandled.csv"
 REFERENCE_CACHE = DATA / "reference_map.json"      # existing cache, kept in place
 COMPONENT_CACHE = DATA / "components_cache.json"
 RAW_LLM_DIR = ROOT / "raw_responses"
+# Model responses keyed by content. A full prose run costs 30-45 minutes, so this is
+# what makes re-assessing a paper after an alias-file change effectively free.
+LLM_CACHE_DIR = RAW_LLM_DIR / "cache"
 
 # Human-curated abbreviation map. Lives next to the code (not in data/) because it
 # is edited by hand and worth version-controlling; JSON rather than CSV because
 # .gitignore excludes *.csv.
 COMPONENT_ALIASES = Path(__file__).resolve().parent / "component_aliases.json"
 ALIAS_SUGGESTIONS_CSV = DATA / "alias_suggestions.csv"
+ALIAS_CANDIDATES_CSV = DATA / "alias_candidates.csv"
 
 # ---------- the paper we are extracting from ----------
 REVIEW_DOI = "10.1016/j.molliq.2023.121899"

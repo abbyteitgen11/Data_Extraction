@@ -21,8 +21,10 @@ from des_pipeline import config, router, xml_utils
 # "text" runs before "components" so the prose-only component names exist by the time
 # the PubChem lookup runs. "table" and "text" both read the reference cache, so "refs"
 # has to have run at least once.
-#ALL_STEPS = ["route", "refs", "table", "figures", "text", "aliases", "components", "graph"]
-ALL_STEPS = ["graph"]
+# "aliases" is a human-review step -- it proposes abbreviation definitions for you to
+# confirm by hand -- so it is deliberately not part of an "all" run.
+ALL_STEPS = ["route", "refs", "table", "figures", "text", "aliases", "components", "graph"]
+DEFAULT_STEPS = [s for s in ALL_STEPS if s != "aliases"]
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__,
@@ -42,9 +44,11 @@ def main(argv=None):
                         help="graph: delete the database before loading")
     parser.add_argument("--no-prose", action="store_true",
                         help="graph: skip the prose measurements (they load by default)")
+    parser.add_argument("--refresh-llm", action="store_true",
+                        help="text: ignore the response cache and re-call the model")
     args = parser.parse_args(argv)
 
-    steps = ALL_STEPS if args.steps == "all" else [s.strip() for s in args.steps.split(",")]
+    steps = DEFAULT_STEPS if args.steps == "all" else [s.strip() for s in args.steps.split(",")]
     unknown = [s for s in steps if s not in ALL_STEPS]
     if unknown:
         parser.error(f"unknown step(s): {', '.join(unknown)}")
@@ -110,7 +114,7 @@ def main(argv=None):
         rows = text.run(routed.sections, routed.review.get("doi", ""),
                         reference_map=reference_map,
                         only_property_sections=not args.all_sections,
-                        allow_lookup=network)
+                        allow_lookup=network, refresh_llm=args.refresh_llm)
         xml_utils.write_csv(rows, config.SECTIONS_LLM_CSV, model=LLMMeasurement)
 
     # --- abbreviations ----------------------------------------------------
@@ -118,7 +122,7 @@ def main(argv=None):
         from des_pipeline import suggest_aliases
 
         print("abbreviations:")
-        suggest_aliases.report()
+        suggest_aliases.report(routed.sections, routed.review.get("doi", ""))
 
     # --- components -------------------------------------------------------
     if "components" in steps:

@@ -270,7 +270,11 @@ def reference_fields(meta):
     """
     authors = meta.get("cr_authors") or "; ".join(meta.get("authors") or [])
     fields = {
+        "key": paper_key(meta),
         "doi": meta.get("doi") or "",
+        "match_score": meta.get("match_score"),
+        "title_agreement": meta.get("title_agreement"),
+        "raw": meta.get("raw") or "",
         "authors": authors,
         "title": meta.get("cr_title") or meta.get("title") or "",
         "journal": meta.get("cr_journal") or meta.get("journal") or "",
@@ -284,22 +288,32 @@ def reference_fields(meta):
     return fields
 
 
+def paper_key(meta, review_doi=None):
+    """Stable node identity: the DOI when Crossref matched one, else '<review>#refN'.
+
+    A reference Crossref could not resolve is still a real paper that real
+    measurements came from, and it still needs to be exactly one node. Merging on
+    `doi` cannot do that -- Neo4j uniqueness constraints ignore nulls, so every
+    DOI-less reference would collapse into one another silently.
+    """
+    return meta.get("doi") or f"{review_doi or config.REVIEW_DOI}#ref{meta['num']}"
+
+
 def sources(ref_numbers, reference_map):
     """Aligned per-source metadata for a set of cited reference numbers.
 
-    Only references that resolved to a DOI are included, so every value in the
-    returned "doi" list matches a Paper node in the graph. Each key holds a
-    SOURCE_SEP-joined string, and the lists are positionally aligned: the n-th DOI
-    belongs to the n-th title.
+    EVERY cited reference is included, whether or not Crossref matched it: `key` is
+    always populated and is what the graph merges on, while `doi` may be blank. The
+    lists stay positionally aligned -- the n-th key belongs to the n-th title --
+    precisely because nothing is skipped.
 
-    Shared by the table route and the prose route so both resolve provenance the
-    same way.
+    Shared by the table route and the prose route so both carry provenance the same way.
     """
-    keys = ("doi", "authors", "title", "journal", "volume", "issue", "pages", "year")
+    keys = ("key", "doi", "authors", "title", "journal", "volume", "issue", "pages", "year")
     collected = {k: [] for k in keys}
     for n in ref_numbers:
         meta = (reference_map or {}).get(n)
-        if not meta or not meta.get("doi"):
+        if not meta:                        # a citation number with no bibliography entry
             continue
         fields = reference_fields(meta)
         for k in keys:
@@ -314,6 +328,7 @@ def to_rows(reference_map):
         f = reference_fields(meta)
         rows.append(ReferenceRow(
             ref_number=meta["num"],
+            key=f["key"],
             authors=f["authors"],
             title=f["title"],
             journal=f["journal"],

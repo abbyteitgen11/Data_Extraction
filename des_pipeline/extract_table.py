@@ -95,6 +95,7 @@ def parse_table2(table, reference_map, review):
             **review_fields,
             "Source_ref_numbers": ",".join(str(n) for n in ref_numbers),
             "Source_DOIs": cited["doi"],
+            "Source_paper_keys": cited["key"],
             "Source_authors": cited["authors"],
             "Source_titles": cited["title"],
             "Source_journals": cited["journal"],
@@ -140,6 +141,7 @@ def to_long(rows):
                 Locus=locus,
                 Source_ref_numbers=mixture.Source_ref_numbers,
                 Source_DOIs=mixture.Source_DOIs,
+                Source_paper_keys=mixture.Source_paper_keys,
                 Review_DOI=mixture.Review_DOI,
             ))
     return out

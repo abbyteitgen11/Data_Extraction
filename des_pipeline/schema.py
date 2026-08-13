@@ -83,6 +83,7 @@ class MixtureRow(BaseModel):
     # --- the primary papers the data actually came from ("|"-joined) ---
     Source_ref_numbers: str = ""
     Source_DOIs: str = ""
+    Source_paper_keys: str = ""
     Source_authors: str = ""
     Source_titles: str = ""
     Source_journals: str = ""
@@ -109,6 +110,7 @@ class MeasurementRow(BaseModel):
     Locus: str = ""                      # provenance: "row 7"
     Source_ref_numbers: str = ""
     Source_DOIs: str = ""
+    Source_paper_keys: str = ""
     Review_DOI: str = ""
 
 
@@ -116,6 +118,7 @@ class ReferenceRow(BaseModel):
     """One bibliography entry. -> data/references.csv"""
 
     ref_number: int
+    key: str = ""                        # the DOI, or "<review_doi>#refN" when unmatched
     authors: str = ""
     title: str = ""
     journal: str = ""
@@ -186,6 +189,8 @@ class LLMMeasurement(BaseModel):
 
     # --- identity ---
     components: str = ""                 # ";"-joined, exactly as the model wrote them
+    components_written: str = ""         # the tokens the paper's own quote wrote
+    components_source: str = ""          # source_text | model -- which one won
     components_resolved: str = ""        # ";"-joined canonical Table-2 names
     unresolved_components: str = ""      # the ones we refused to guess at
     component_status: str = ""           # resolved | partial | unresolved
@@ -206,6 +211,7 @@ class LLMMeasurement(BaseModel):
     section_title: str = ""
     Source_ref_numbers: str = ""         # harvested from the citation, e.g. "113"
     Source_DOIs: str = ""                # "|"-joined, same convention as the table route
+    Source_paper_keys: str = ""           # what the graph merges Paper nodes on
     ref_source: str = ""                 # agreed | text | llm | none
     Review_DOI: str = ""
 

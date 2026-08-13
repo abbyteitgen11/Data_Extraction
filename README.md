@@ -104,32 +104,62 @@ wins and sets `status`:
 `verified` compares against the XML section text, not the model's own quoted sentence, so
 a hallucination cannot validate itself.
 
-**Abbreviations are the hard part, and they are resolved by lookup, never by guessing.**
-The prose writes `ChCl:EG(1:2)`; Table 2 writes the names out in full; and the paper
-defines none of its abbreviations — ChCl (50 uses), TBAB (47) and TBAC (36) are never
-spelled out anywhere. Asking qwen3 to expand them gets roughly half wrong, and wrong in a
-way that looks right: it reads `TBAB` as tetra**ethyl**ammonium bromide when the paper
-means tetra**butyl**, `Gly` as glycine when this paper means glycolic acid. Four such
-wrong answers are themselves real Table 2 entries, so checking against the table
-vocabulary does not catch them — it legitimises them.
+**Abbreviations are resolved from the paper's own words, by lookup, never by guessing.**
 
-So `des_pipeline/component_aliases.json` is authoritative. It is human-edited, and every
-entry is evidence-backed rather than recalled: either the paper defines it inline, or a
-prose measurement's value and ratio match exactly one Table 2 row that names the
-components in full. `--steps aliases` regenerates candidates for anything unresolved:
+Two separate things go wrong if you let the model name the chemicals. It expands
+abbreviations incorrectly — reading `ChAc` (choline **acetate**) as "Choline chloride",
+`TBAC` (…**chloride**) as "Tetrabutylammonium bromide", `NaCl` as "Tetrabutylammonium
+bromide". And because those wrong answers are themselves real Table 2 entries, checking
+against the table vocabulary does not catch them; it legitimises them. This was live: 15
+distinct wrong mappings across 27 of 138 rows.
+
+So the pipeline reads the DES formula out of the quoted `source_text` and resolves *that*:
 
 ```
-abbreviation             uses  candidate from Table 2         confidence
-TBAB                        8  Tetrabutylammonium bromide     strong
-LA                          1  Levulinic acid                 strong
+source_text   "ChAc:EG(1:2, 23 °C) [113]"
+              -> components_written  ChAc;EG
+              -> components_resolved Choline acetate;Ethylene glycol
+              -> components_source   source_text
 ```
 
-Treat it as a proposal, not an answer — for `TBAC` the top-ranked candidate is *Glycerol*,
-which is wrong. Anything you do not confirm stays out of the graph. Note that `LA` means
-**both** lactic and levulinic acid in this paper depending on the section, which is why it
-is deliberately absent from the alias file.
+The model's own list is used only when the quote contains no formula at all (an ordinal
+sentence like `[BF4]− (67 °C) > acetate (18 °C) > …`). When one sentence ranks several
+DESs, the clause containing the row's number wins, which is what stops a value being
+pinned to the wrong solvent.
 
-The alias file is **per-paper**. A second review needs its own.
+`des_pipeline/component_aliases.json` is the authority for what an abbreviation means. An
+entry earns its place two ways only: the paper **defines it in its own text**
+("choline acetate (ChAc)"), or it is one of a handful of universally-used ones (`ChCl`,
+`ChAc`, `ChBr`, `EG`). Nothing else. An abbreviation that is not there does not resolve,
+and rows using it stay out of the graph.
+
+### Adding a paper
+
+1. `--steps text` — extract (cached, so re-runs are free).
+2. `--steps aliases` — proposes definitions two independent ways: every "Full name (ABBR)"
+   the paper writes, matched with the Schwartz–Hearst algorithm, **and** for anything still
+   unresolved, the Table 2 components whose measurements match the prose value.
+3. Paste the entries you believe into `component_aliases.json`, with the paper's DOI in
+   `source`.
+4. Re-run `--steps text` for **every** paper — free, because responses are cached — so
+   earlier papers are re-assessed against the grown map. Then reload the graph.
+
+Read the `verdict` column. `conflicts_with_table` is the one that earns the tool its keep:
+
+```
+CONFLICT  LA: the text says 'Lactic acid', but this paper's own Table 2 data
+          says 'Levulinic acid'. Leave it out unless you can tell which is which.
+```
+
+That is real — this paper defines `ChCl:Lactic acid (LA)` inline, yet its density section
+writes `TBAB:LA (1:4, 1.1031)`, which matches Table 2 row T2-0625 *Levulinic acid* exactly
+while TBAB+Lactic acid has zero rows. `LA` is therefore in the file with a `null` name,
+which keeps both readings out.
+
+Expect the graph to be conservative. On this paper only 1 of 138 prose rows is loaded: 84
+state no number, 28 restate Table 2, and 25 use an abbreviation the paper never defines.
+That is the intended trade — missing beats wrong — and later papers are expected to define
+the rest.
 
 A component named in prose but absent from Table 2 — `1,5-pentanediol` appears six times
 in the text and nowhere in the table — is accepted only if **PubChem** recognises it, and
@@ -166,6 +196,13 @@ which left too little room to generate.
 | `DES_OLLAMA_REPEAT_PENALTY` | `1.1` | qwen3 defaults to 1 (none) and degenerates while copying long quotes |
 | `DES_OLLAMA_KEEP_ALIVE` | `30m` | steps either side can run longer than ollama's 5-minute unload |
 
+Responses are cached in `raw_responses/cache/`, keyed on the prompt, model and sampling
+options — but deliberately **not** on the alias file, since resolution happens after the
+call. So a second `--steps text` costs seconds instead of 35 minutes, which is what makes
+re-assessing earlier papers practical. Editing `PROMPT` invalidates every entry; the run
+prints `cache: 6 hit, 0 fresh` so that is impossible to miss. `--refresh-llm` forces a
+re-call.
+
 ## The graph
 
 ```
@@ -182,6 +219,18 @@ which left too little room to generate.
 (:Density) -[:REPORTED_IN {ref_numbers}]-> (:Paper {role:'primary'})   where the data came from
 (:Density) -[:REVIEW_PAPER]-------------->  (:Paper {role:'review'})   where we read it
 (:Mixture) -[:REPORTED_IN]/[:REVIEW_PAPER]-> (:Paper)
+```
+
+**Every** reference becomes a `Paper`, whether or not Crossref matched it. Nodes merge on
+`key` — the DOI when there is one, otherwise `<review_doi>#refN` — because merging on a
+null DOI would silently collapse all the unmatched references into one node. Each carries
+`match_score`, `title_agreement` (XML title vs Crossref title overlap) and `raw`, so you
+can judge a match rather than having it silently dropped. Four references here have no
+DOI and are cited by 53 table rows between them.
+
+```cypher
+MATCH (p:Paper) WHERE p.doi IS NULL RETURN p.key, p.ref_number, p.raw;
+MATCH (p:Paper) WHERE p.title_agreement < 0.5 RETURN p.doi, p.match_score, p.title;
 ```
 
 Every measurement, mixture and component carries `origin` — `'table'` or `'prose'` — so

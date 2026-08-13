@@ -22,6 +22,7 @@ work very well":
 The backend is pluggable: ollama locally by default, Anthropic if you set
 DES_LLM_BACKEND=anthropic and ANTHROPIC_API_KEY.
 """
+import hashlib
 import json
 import math
 import re
@@ -31,7 +32,8 @@ from collections import Counter
 from pydantic import ValidationError
 
 from . import config, xml_utils
-from .enrich_components import _norm_key, component_index, resolve_components
+from .enrich_components import (_norm_key, component_index, resolve_components,
+                                resolve_phrase)
 from .extract_references import sources
 from .schema import STATUS_ORDER, LLMExtraction, LLMMeasurement
 
@@ -92,6 +94,16 @@ TEXT:
 
 
 # ---------- backends ----------
+def _ollama_options():
+    """The options that change the answer. Shared with cache_key so they cannot drift."""
+    return {
+        "temperature": 0,                          # deterministic
+        "num_ctx": config.OLLAMA_NUM_CTX,
+        "num_predict": config.OLLAMA_NUM_PREDICT,
+        "repeat_penalty": config.OLLAMA_REPEAT_PENALTY,
+    }
+
+
 def call_llm(prompt, schema_json, backend=None):
     """Send one prompt, return the raw JSON string. Backend chosen by config/env."""
     backend = backend or config.LLM_BACKEND
@@ -104,12 +116,7 @@ def call_llm(prompt, schema_json, backend=None):
             format=schema_json,                    # constrains the output to our schema
             think=config.OLLAMA_THINK,             # off: we discard reasoning, so skip it
             keep_alive=config.OLLAMA_KEEP_ALIVE,   # survive the slow steps either side
-            options={
-                "temperature": 0,                  # deterministic
-                "num_ctx": config.OLLAMA_NUM_CTX,
-                "num_predict": config.OLLAMA_NUM_PREDICT,
-                "repeat_penalty": config.OLLAMA_REPEAT_PENALTY,
-            },
+            options=_ollama_options(),
         )
         if response.done_reason == "length":
             print(f"    warning: hit num_predict ({config.OLLAMA_NUM_PREDICT}); "
@@ -137,6 +144,45 @@ def call_llm(prompt, schema_json, backend=None):
         return "{}"
 
     raise ValueError(f"unknown LLM backend {backend!r} (expected 'ollama' or 'anthropic')")
+
+
+# ---------- response cache ----------
+def cache_key(prompt, schema_json, backend=None):
+    """sha256 over everything that could change the model's answer.
+
+    Deliberately does NOT cover component_aliases.json: alias resolution happens
+    after the call, so editing the alias file and re-running must be free. That is
+    what makes "add a definition, then re-assess every earlier paper" practical.
+    """
+    backend = backend or config.LLM_BACKEND
+    payload = {
+        "backend": backend,
+        "prompt": prompt,
+        "schema": schema_json,
+        "model": config.OLLAMA_MODEL if backend == "ollama" else config.ANTHROPIC_MODEL,
+        "options": _ollama_options() if backend == "ollama" else {"max_tokens": 8000},
+        "think": config.OLLAMA_THINK if backend == "ollama" else None,
+    }
+    blob = json.dumps(payload, sort_keys=True, ensure_ascii=False)
+    return hashlib.sha256(blob.encode("utf-8")).hexdigest()
+
+
+def cached_call_llm(prompt, schema_json, section_id="", backend=None, refresh=False):
+    """call_llm with an on-disk cache. -> (raw JSON string, was_cached).
+
+    Note the key includes the prompt, so editing PROMPT discards every entry and the
+    next run pays the full 30-45 minutes. run() prints the hit/miss tally so that is
+    impossible to do by accident.
+    """
+    key = cache_key(prompt, schema_json, backend)
+    path = config.LLM_CACHE_DIR / f"{section_id or 'section'}-{key[:12]}.json"
+    if path.exists() and not refresh:
+        return path.read_text(encoding="utf-8"), True
+
+    raw = call_llm(prompt, schema_json, backend=backend)
+    config.LLM_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    path.write_text(raw, encoding="utf-8")
+    return raw, False
 
 
 # ---------- verification ----------
@@ -284,6 +330,98 @@ def mark_duplicates(rows, rel_tol=1e-3, long_csv=None, table_csv=None):
     return rows
 
 
+# ---------- read the DES formula the paper itself wrote ----------
+#
+# This exists because the model rewrites abbreviations, and its rewrites are often
+# wrong in a way nothing downstream can catch: it expanded ChAc ("choline acetate")
+# to "Choline chloride", TBAC ("...chloride") to "Tetrabutylammonium bromide", NaCl
+# to "Tetrabutylammonium bromide". Those are all real Table 2 names, so they resolve
+# cleanly and the alias file is never consulted. The paper's own wording has to win.
+
+_CITATION_REF = re.compile(r"\[\d[\d,\s–—-]*\]")
+_PARENS = re.compile(r"\([^()]*\)")
+_COMPARATOR = re.compile(r"\s*[<>≤≥≈~]\s*|\s+than\s+")
+# Split a clause into segments. The space after the comma is load-bearing: a bare
+# comma would break "1,3-pentanediol" and "N,N-dimethyl-N,N-didodecylammonium chloride".
+_SEGMENT = re.compile(
+    r",\s|;|\.{2,}|\s+(?:is|are|was|were|lie|lies|and|of|the|for|in|to|at|with|"
+    r"results?|values?|range|based)\s+", re.I)
+# A hyphen only separates components when the left side looks like an abbreviation
+# (two consecutive capitals). Without this guard "d-Fructose", "10-undecylenic" and
+# "amino acids-based" would all be split apart.
+_ABBR_DASH = re.compile(r"^([A-Za-z0-9\[\]]*[A-Z]{2}[A-Za-z0-9\[\]]*)-(?=[A-Za-z])")
+
+
+def formula_clauses(source_text):
+    """-> [(raw clause, [component tokens])] for every DES formula in the quote.
+
+    Comparison operators separate clauses, because one sentence often ranks several
+    DESs: "TEAB-Chloroacetic acid (1:2, -79.2 C) [1] < TBAB-Chloroacetic acid ...".
+    Getting the clause right is what stops a value being pinned to the wrong DES.
+    """
+    out = []
+    for raw in _COMPARATOR.split(str(source_text or "")):
+        if not raw.strip():
+            continue
+        # Strip citations and every parenthetical: that removes "(1:2, 23 C)" and
+        # "(molar ratio 1:1:1, density 1.7012)", so any colon left is a formula colon.
+        cleaned = _PARENS.sub(" ", _CITATION_REF.sub(" ", raw))
+        for segment in _SEGMENT.split(cleaned):
+            segment = segment.strip()
+            if not segment:
+                continue
+            if ":" in segment:
+                tokens = [t for t in segment.split(":") if t.strip()]
+            else:
+                dash = _ABBR_DASH.match(segment)
+                if not dash:
+                    continue
+                tokens = [dash.group(1), segment[dash.end():]]
+            tokens = [t.strip(" ,.;-") for t in tokens]
+            if len(tokens) >= 2 and all(re.search(r"[A-Za-z]{2}", t) for t in tokens):
+                out.append((raw, tokens[:3]))
+                break                              # one formula per clause is enough
+    return out
+
+
+def components_from_source_text(source_text, value, model_resolved, index):
+    """Resolve the DES formula the paper wrote. -> (resolved, unresolved, "source_text")
+
+    Returns None when the quote states no formula at all -- an ordinal sentence like
+    "[BF4]- (67 C) > acetate (18 C) > Cl- (12 C)" -- so the caller can tell "no
+    formula" from "a formula I could not resolve", which are opposite situations.
+
+    When a formula IS found it wins completely, unresolved tokens included. Falling
+    back to the model for a token we cannot resolve would reintroduce exactly the bug
+    this function exists to fix.
+    """
+    clauses = formula_clauses(source_text)
+    if not clauses:
+        return None
+
+    if len(clauses) > 1:
+        wanted = _normalize_number(f"{value}") if value is not None else None
+        model_set = {m.lower() for m in (model_resolved or [])}
+
+        def rank(item):
+            raw, tokens = item
+            resolved = [resolve_phrase(t, index) for t in tokens]
+            # 1. the clause that actually contains this row's number -- the strongest
+            #    signal, and independent of anything the model said
+            has_value = bool(wanted) and wanted in _numbers_in(raw)
+            overlap = sum(1 for r in resolved if r and r.lower() in model_set)
+            return (has_value, overlap, sum(1 for r in resolved if r))
+
+        clauses = [max(clauses, key=rank)]
+
+    _raw, tokens = clauses[0]
+    resolved, unresolved = [], []
+    for token in tokens:
+        found = resolve_phrase(token, index)
+        (resolved if found else unresolved).append(found or token.strip())
+    return resolved, unresolved, "source_text"
+
+
 # ---------- chemdataextractor hook ----------
 def normalize_components(names, section_text=""):
     """Placeholder for chemical named-entity recognition.
@@ -316,13 +454,15 @@ def _status_for(row):
 
 
 def extract_section(section_id, title, text, review_doi="", reference_map=None,
-                    index=None, backend=None, allow_lookup=False):
-    """-> (list[LLMMeasurement], elapsed_seconds) for one prose section."""
+                    index=None, backend=None, allow_lookup=False, refresh_llm=False):
+    """-> (list[LLMMeasurement], elapsed_seconds, was_cached) for one prose section."""
     hint = config.PROPERTY_SECTIONS.get(title, "any of the six properties")
     prompt = PROMPT.format(title=title, property_hint=hint, text=text)
 
     started = time.time()
-    raw = call_llm(prompt, LLMExtraction.model_json_schema(), backend=backend)
+    raw, was_cached = cached_call_llm(prompt, LLMExtraction.model_json_schema(),
+                                      section_id=section_id, backend=backend,
+                                      refresh=refresh_llm)
     elapsed = time.time() - started
 
     config.RAW_LLM_DIR.mkdir(parents=True, exist_ok=True)
@@ -336,14 +476,29 @@ def extract_section(section_id, title, text, review_doi="", reference_map=None,
             hint_text = f" -- output looks cut off; try a larger num_predict"
         print(f"    {section_id} {title!r}: output did not validate "
               f"({exc.errors()[0]['msg']}){hint_text}")
-        return [], elapsed
+        return [], elapsed, was_cached
 
     normalised_text = re.sub(r"\s+", " ", text)
     rows = []
     for draft in drafts:
         written = normalize_components(draft.components, text)
-        resolved, unresolved, component_status = resolve_components(
+        model_resolved, model_unresolved, _ = resolve_components(
             written, index, allow_lookup=allow_lookup)
+
+        # The paper's own formula beats the model's expansion. Only when the quote
+        # contains no formula at all do we fall back to what the model said.
+        from_text = components_from_source_text(draft.source_text, draft.value,
+                                                model_resolved, index)
+        if from_text:
+            resolved, unresolved, components_source = from_text
+            components_written = ";".join(
+                t for _raw, toks in formula_clauses(draft.source_text) for t in toks
+            )[:200]
+        else:
+            resolved, unresolved = model_resolved, model_unresolved
+            components_source, components_written = "model", ""
+        component_status = ("resolved" if resolved and not unresolved
+                            else "partial" if resolved else "unresolved")
 
         ratio = (draft.molar_ratio or "").strip() or None
         # Same naming convention as extract_table.parse_table2, which is what makes a
@@ -355,6 +510,8 @@ def extract_section(section_id, title, text, review_doi="", reference_map=None,
 
         row = LLMMeasurement(
             components=";".join(written),
+            components_written=components_written,
+            components_source=components_source,
             components_resolved=";".join(resolved),
             unresolved_components=";".join(unresolved),
             component_status=component_status,
@@ -372,6 +529,7 @@ def extract_section(section_id, title, text, review_doi="", reference_map=None,
             section_title=title,
             Source_ref_numbers=",".join(str(n) for n in ref_numbers),
             Source_DOIs=cited["doi"],
+            Source_paper_keys=cited["key"],
             ref_source=ref_source,
             Review_DOI=review_doi,
             verified=verified(draft.value, text) if draft.value is not None else False,
@@ -382,12 +540,12 @@ def extract_section(section_id, title, text, review_doi="", reference_map=None,
         value = f"{draft.value:g}" if draft.value is not None else "none"
         row.Measurement_key = f"P-{section_id}:{draft.property}:{stem}:{value}"
         rows.append(row)
-    return rows, elapsed
+    return rows, elapsed, was_cached
 
 
 # ---------- all sections ----------
 def run(sections, review_doi="", reference_map=None, only_property_sections=True,
-        backend=None, allow_lookup=True):
+        backend=None, allow_lookup=True, refresh_llm=False):
     """Extract from every routed prose section. -> list[LLMMeasurement]."""
     chosen = [
         (sid, title, text) for sid, title, text in sections
@@ -406,14 +564,16 @@ def run(sections, review_doi="", reference_map=None, only_property_sections=True
                   f"num_ctx={config.OLLAMA_NUM_CTX})")
     print(f"  {len(chosen)} section(s) via {backend_name}{detail}")
 
-    rows, total_seconds = [], 0.0
+    rows, total_seconds, hits = [], 0.0, 0
     for sid, title, text in chosen:
-        found, elapsed = extract_section(sid, title, text, review_doi,
-                                         reference_map=reference_map, index=index,
-                                         backend=backend, allow_lookup=allow_lookup)
+        found, elapsed, was_cached = extract_section(
+            sid, title, text, review_doi, reference_map=reference_map, index=index,
+            backend=backend, allow_lookup=allow_lookup, refresh_llm=refresh_llm)
         total_seconds += elapsed
+        hits += was_cached
         ok = sum(1 for r in found if r.verified)
-        print(f"    {sid} {title[:30]:<32} {elapsed:6.1f}s  "
+        timing = "  cached" if was_cached else f"{elapsed:6.1f}s"
+        print(f"    {sid} {title[:30]:<32} {timing}  "
               f"{len(found):>3} found, {ok:>3} verified")
         rows += found
 
@@ -423,7 +583,8 @@ def run(sections, review_doi="", reference_map=None, only_property_sections=True
         row.status = _status_for(row)
 
     counts = Counter(r.status for r in rows)
-    print(f"\n  {len(rows)} records in {total_seconds / 60:.1f} min")
+    print(f"\n  cache: {hits} hit, {len(chosen) - hits} fresh")
+    print(f"  {len(rows)} records in {total_seconds / 60:.1f} min")
     for status in STATUS_ORDER:
         if counts.get(status):
             note = " -> graph" if status == "ok" else ""
@@ -431,6 +592,9 @@ def run(sections, review_doi="", reference_map=None, only_property_sections=True
 
     refs = Counter(r.ref_source for r in rows)
     print(f"  references: " + ", ".join(f"{k} {v}" for k, v in refs.most_common()))
+
+    sources = Counter(r.components_source for r in rows)
+    print(f"  components read from: " + ", ".join(f"{k} {v}" for k, v in sources.most_common()))
 
     unresolved = sorted({n for r in rows for n in r.unresolved_components.split(";") if n})
     if unresolved:

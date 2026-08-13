@@ -34,8 +34,9 @@ CONSTRAINTS = [
     "FOR (c:Component) REQUIRE c.name IS UNIQUE",
     "CREATE CONSTRAINT mixture_name IF NOT EXISTS "
     "FOR (m:Mixture) REQUIRE m.name IS UNIQUE",
-    "CREATE CONSTRAINT paper_doi IF NOT EXISTS "
-    "FOR (p:Paper) REQUIRE p.doi IS UNIQUE",
+    "CREATE CONSTRAINT paper_key IF NOT EXISTS "
+    "FOR (p:Paper) REQUIRE p.key IS UNIQUE",
+    "CREATE INDEX paper_doi_index IF NOT EXISTS FOR (p:Paper) ON (p.doi)",
 ] + [
     f"CREATE CONSTRAINT {prop.lower()}_key IF NOT EXISTS "
     f"FOR (x:{prop}) REQUIRE x.key IS UNIQUE"
@@ -82,16 +83,25 @@ def _str(value):
 
 # ---------- turn the wide CSV into the nested shape Cypher wants ----------
 def _paper_rows(references):
-    """One record per unique primary DOI. Two references can share a DOI."""
+    """One record per unique paper key.
+
+    Keyed on `key`, not `doi`, so the references Crossref could not match still get
+    a node. Two references can legitimately share a DOI, so the count is lower than
+    the number of references.
+    """
     papers = []
     seen = set()
     for r in references:
-        doi = r.get("doi")
-        if not doi or doi in seen:
+        key = r.get("key")
+        if not key or key in seen:
             continue
-        seen.add(doi)
+        seen.add(key)
         papers.append({
-            "doi": doi,
+            "key": key,
+            "doi": r.get("doi"),
+            "match_score": r.get("match_score"),
+            "title_agreement": r.get("title_agreement"),
+            "raw": r.get("raw") or "",
             "ref_number": r.get("ref_number"),
             "authors": r.get("authors") or "",
             "title": r.get("title") or "",
@@ -136,7 +146,7 @@ def _mixture_rows(table, components_by_name):
             "component_flag": r.get("Component_flag") or "",
             "components": comps,
             "review_doi": r.get("Review_DOI") or config.REVIEW_DOI,
-            "source_dois": _split(r.get("Source_DOIs")),
+            "source_keys": _split(r.get("Source_paper_keys")),
             "ref_numbers": r.get("Source_ref_numbers") or "",
         })
     return rows
@@ -154,7 +164,7 @@ def _measurement_rows(long_rows):
         "origin": "table",
         "evidence": "",
         "review_doi": r.get("Review_DOI") or config.REVIEW_DOI,
-        "source_dois": _split(r.get("Source_DOIs")),
+        "source_keys": _split(r.get("Source_paper_keys")),
         "ref_numbers": r.get("Source_ref_numbers") or "",
     } for r in long_rows]
 
@@ -172,7 +182,7 @@ def _prose_measurement_rows(prose):
         "origin": "prose",
         "evidence": r.get("source_text") or "",     # the sentence it was read from
         "review_doi": r.get("Review_DOI") or config.REVIEW_DOI,
-        "source_dois": _split(r.get("Source_DOIs")),
+        "source_keys": _split(r.get("Source_paper_keys")),
         "ref_numbers": r.get("Source_ref_numbers") or "",
     } for r in prose]
 
@@ -207,7 +217,7 @@ def _prose_mixture_rows(prose, components_by_name):
             "ratio_raw": r.get("molar_ratio") or "",
             "components": comps,
             "review_doi": r.get("Review_DOI") or config.REVIEW_DOI,
-            "source_dois": _split(r.get("Source_DOIs")),
+            "source_keys": _split(r.get("Source_paper_keys")),
             "ref_numbers": r.get("Source_ref_numbers") or "",
         })
     return rows
@@ -216,16 +226,17 @@ def _prose_mixture_rows(prose, components_by_name):
 # ---------- Cypher ----------
 PAPERS_CYPHER = """
 UNWIND $papers AS p
-MERGE (paper:Paper {doi: p.doi})
-  SET paper.ref_number = p.ref_number, paper.authors = p.authors,
+MERGE (paper:Paper {key: p.key})
+  SET paper.doi = p.doi, paper.ref_number = p.ref_number, paper.authors = p.authors,
       paper.title = p.title, paper.journal = p.journal, paper.volume = p.volume,
       paper.issue = p.issue, paper.pages = p.pages, paper.year = p.year,
-      paper.role = 'primary'
+      paper.match_score = p.match_score, paper.title_agreement = p.title_agreement,
+      paper.raw = p.raw, paper.role = 'primary'
 """
 
 REVIEW_CYPHER = """
-MERGE (paper:Paper {doi: $review.doi})
-  SET paper.authors = $review.authors, paper.title = $review.title,
+MERGE (paper:Paper {key: $review.doi})
+  SET paper.doi = $review.doi, paper.authors = $review.authors, paper.title = $review.title,
       paper.journal = $review.journal, paper.volume = $review.volume,
       paper.issue = $review.issue, paper.year = $review.year,
       paper.role = 'review'
@@ -249,11 +260,12 @@ FOREACH (c IN row.components |
     SET part.molar_ratio = c.ratio, part.role = c.role
 )
 
-MERGE (review:Paper {doi: row.review_doi})
+MERGE (review:Paper {key: row.review_doi})
+  ON CREATE SET review.doi = row.review_doi
 MERGE (mix)-[:REVIEW_PAPER]->(review)
 
-FOREACH (d IN row.source_dois |
-  MERGE (src:Paper {doi: d})
+FOREACH (k IN row.source_keys |
+  MERGE (src:Paper {key: k})
   MERGE (mix)-[rep:REPORTED_IN]->(src)
     SET rep.ref_numbers = row.ref_numbers
 )
@@ -279,11 +291,12 @@ FOREACH (c IN row.components |
     SET part.molar_ratio = c.ratio, part.role = c.role
 )
 
-MERGE (review:Paper {doi: row.review_doi})
+MERGE (review:Paper {key: row.review_doi})
+  ON CREATE SET review.doi = row.review_doi
 MERGE (mix)-[:REVIEW_PAPER]->(review)
 
-FOREACH (d IN row.source_dois |
-  MERGE (src:Paper {doi: d})
+FOREACH (k IN row.source_keys |
+  MERGE (src:Paper {key: k})
   MERGE (mix)-[rep:REPORTED_IN]->(src)
     SET rep.ref_numbers = row.ref_numbers
 )
@@ -299,11 +312,12 @@ MERGE (m:{label} {{key: r.key}})
 MERGE (mix)-[has:HAS_{rel}]->(m)
   SET has.temperature_C = r.temperature_C
 
-MERGE (review:Paper {{doi: r.review_doi}})
+MERGE (review:Paper {{key: r.review_doi}})
+  ON CREATE SET review.doi = r.review_doi
 MERGE (m)-[:REVIEW_PAPER]->(review)
 
-FOREACH (d IN r.source_dois |
-  MERGE (src:Paper {{doi: d}})
+FOREACH (k IN r.source_keys |
+  MERGE (src:Paper {{key: k}})
   MERGE (m)-[rep:REPORTED_IN]->(src)
     SET rep.ref_numbers = r.ref_numbers
 )
@@ -336,11 +350,12 @@ def build(wipe=False, include_prose=True):
 
     # Every DOI a measurement points at must have a Paper node, or the MERGE below
     # would invent an empty one.
-    cited = {d for r in table for d in _split(r.get("Source_DOIs"))}
-    cited |= {d for r in prose for d in _split(r.get("Source_DOIs"))}
-    known = {r["doi"] for r in references if r.get("doi")}
+    cited = {k for r in table for k in _split(r.get("Source_paper_keys"))}
+    cited |= {k for r in prose for k in _split(r.get("Source_paper_keys"))}
+    known = {r["key"] for r in references if r.get("key")}
     missing = cited - known
-    assert not missing, f"{len(missing)} cited DOIs are absent from references.csv: {list(missing)[:3]}"
+    assert not missing, (f"{len(missing)} cited paper keys are absent from "
+                         f"references.csv: {list(missing)[:3]}")
 
     review_row = table[0] if table else {}
     review = {
@@ -364,6 +379,10 @@ def build(wipe=False, include_prose=True):
         if wipe:
             driver.execute_query("MATCH (n) DETACH DELETE n", database_=config.NEO4J_DATABASE)
             print("  wiped the database")
+        # Paper identity moved from doi to key; drop the old constraint or the new
+        # one cannot be created on a database built by an earlier version.
+        driver.execute_query("DROP CONSTRAINT paper_doi IF EXISTS",
+                             database_=config.NEO4J_DATABASE)
         for statement in CONSTRAINTS:
             driver.execute_query(statement, database_=config.NEO4J_DATABASE)
 
@@ -423,3 +442,7 @@ def _report(driver):
         summary = ", ".join(f"{k or 'unset'} {v}" for k, v in sorted(counts.items(),
                                                                     key=lambda kv: -kv[1]))
         print(f"    {label:<14} {summary}")
+
+    no_doi = query("MATCH (p:Paper) WHERE p.doi IS NULL RETURN count(p) AS n")[0]["n"]
+    print(f"    papers without a DOI: {no_doi} (Crossref found no match; "
+          f"they still carry match_score and raw)")

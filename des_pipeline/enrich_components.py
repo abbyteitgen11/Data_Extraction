@@ -280,14 +280,31 @@ def _alnum_key(name):
     return re.sub(r"[^a-z0-9]", "", str(name or "").lower())
 
 
-def load_aliases(path=None):
-    """The human-curated abbreviation map. Keys are matched case-insensitively."""
+def load_alias_records(path=None):
+    """abbreviation -> the full record, for the harvester and for auditing."""
     path = path or config.COMPONENT_ALIASES
     if not path.exists():
         return {}
     raw = json.loads(path.read_text())
-    return {k.strip().lower(): v for k, v in raw.items()
-            if not k.startswith("__") and v}
+    out = {}
+    for key, value in raw.items():
+        if key.startswith("__"):
+            continue
+        out[key.strip()] = value if isinstance(value, dict) else {"name": value}
+    return out
+
+
+def load_aliases(path=None):
+    """abbreviation -> full name, matched case-insensitively.
+
+    A value may be a plain string (quick hand-edit) or a record carrying its
+    provenance. A record whose name is null is skipped deliberately -- that is how an
+    abbreviation the paper uses for two different chemicals stays unresolved instead
+    of silently picking one.
+    """
+    return {abbr.lower(): record["name"]
+            for abbr, record in load_alias_records(path).items()
+            if record.get("name")}
 
 
 def component_index(path=None, alias_path=None):
@@ -409,6 +426,25 @@ def resolve_component(name, index, allow_lookup=False):
             return raw, "pubchem"
 
     return None, "unresolved"
+
+
+def resolve_phrase(phrase, index):
+    """Resolve a loose phrase by trying progressively shorter word windows.
+
+    Prose tokens arrive with connectives and trailing context attached -- "For ChCl",
+    "Benzilic acid (1:1", "amino acids-based DESs". Trying every suffix and prefix,
+    longest first, finds the component name inside without guessing at it.
+    """
+    phrase = str(phrase or "").strip(" ,.;:-")
+    if not phrase or not re.search(r"[A-Za-z]{2}", phrase) or phrase.lower() == "nan":
+        return None
+    words = phrase.split()
+    for length in range(len(words), 0, -1):
+        for start in (0, len(words) - length):
+            found, _how = resolve_component(" ".join(words[start:start + length]), index)
+            if found:
+                return found
+    return None
 
 
 def resolve_components(names, index, allow_lookup=False):
