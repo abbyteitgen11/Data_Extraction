@@ -57,7 +57,11 @@ Also return:
   footnote_markers       one entry per marker the legend defines, with its meaning and,
                          for a temperature marker, the temperature in Celsius.
                          Empty list when the table has no legend.
-  missing_value_tokens   the strings this table uses for "not reported".
+  missing_value_tokens   the strings this table PRINTS IN PLACE OF a value: "-", "n/a",
+                         "nd", or a legend-defined token like "DT" meaning the value was
+                         reported at several temperatures. These belong here, NOT in
+                         footnote_markers -- a footnote marker annotates a value that is
+                         present, a missing-value token replaces one that is not.
   default_temperature_C  the temperature unmarked values were measured at, if the
                          caption or legend says. null otherwise.
 

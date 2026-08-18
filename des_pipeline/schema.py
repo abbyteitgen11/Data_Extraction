@@ -274,7 +274,9 @@ class TableProfile(BaseModel):
     footnote_markers: list[FootnoteMarker] = Field(
         description="One entry per marker the legend defines. Empty when there is none.")
     missing_value_tokens: list[str] = Field(
-        description="The strings this table uses for 'not reported', e.g. '-', '---'.")
+        description="Strings printed in place of a value, e.g. '-', 'n/a', 'nd', or a "
+                    "legend-defined token such as 'DT'. Not footnote markers, which "
+                    "annotate a value that is present.")
     default_temperature_C: Optional[float] = Field(
         description="The temperature unmarked values were measured at, if the caption "
                     "or legend states one. null otherwise.")

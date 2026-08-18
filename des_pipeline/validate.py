@@ -1,7 +1,8 @@
 """
-Is the extracted data right? Four separate questions, deliberately kept apart.
+Is the extracted data right? Five separate questions, deliberately kept apart.
 
   fidelity      Did we transcribe what the paper prints?   -> ours to get right
+  skipped cells Did we miss anything the paper prints?     -> the other half of it
   plausibility  Is what the paper prints physically sane?  -> the source's problem
   invariants    Is the dataset internally consistent?      -> structural
   spot check    ...and a human confirms a sample of it.    -> the measured error rate
@@ -17,6 +18,12 @@ Fidelity is the valuable one, because it is exhaustive and needs no judgement: e
 measurement records the table, row and column it came from, so the source cell can be
 re-read and the value re-derived. That is what makes it safe to change the extractor.
 
+But fidelity only ever looks at values we did extract, so it cannot see a value we
+dropped. `skipped_cells` is the complement: it walks every property cell that had
+content and produced nothing, and says why. That is how the one genuinely lost value
+in this corpus -- a footnote marker trailing its number instead of leading it -- was
+found, after fidelity had reported 1648/1648.
+
     python run_pipeline.py --steps validate            # report card
     python run_pipeline.py --steps validate --review   # + interactive spot check
 """
@@ -27,6 +34,30 @@ import pandas as pd
 
 from . import config, dialects, paper as paper_mod, profile_table, store, xml_utils
 from .extract_table import read_value
+
+
+# ---------- re-reading the source ----------
+def _reread_context(paper_row):
+    """Everything needed to read a paper's tables again. -> (tables, profiles, columns).
+
+    Fidelity, the skipped-cell audit and the spot check all re-derive values from the
+    XML, so they all need the same four things. Built once here rather than three
+    times, and it is what guarantees they agree about what the source says.
+    """
+    from .schema import TableProfile
+
+    root = xml_utils.load_root(paper_row["path"])
+    dialect = dialects.detect(root)
+    pap = paper_mod.from_metadata(dialect.paper_metadata(root), paper_row["path"],
+                                  dialect.name)
+    tables = {t.id: t for t in dialect.tables(root)}
+
+    profiles, columns = {}, {}
+    for table_id, record in profile_table.load_overrides(pap).items():
+        profile = TableProfile(**record["profile"])
+        profiles[table_id] = profile
+        columns[table_id] = {c.index: c for c in profile.columns}
+    return tables, profiles, columns
 
 
 # ---------- (a) fidelity: re-read every value from its source cell ----------
@@ -41,19 +72,7 @@ def check_fidelity(paper_row, sample=None):
     if not rows:
         return 0, []
 
-    root = xml_utils.load_root(paper_row["path"])
-    dialect = dialects.detect(root)
-    pap = paper_mod.from_metadata(dialect.paper_metadata(root), paper_row["path"],
-                                  dialect.name)
-    tables = {t.id: t for t in dialect.tables(root)}
-    overrides = profile_table.load_overrides(pap)
-
-    profiles, columns = {}, {}
-    for table_id, record in overrides.items():
-        from .schema import TableProfile
-        profile = TableProfile(**record["profile"])
-        profiles[table_id] = profile
-        columns[table_id] = {c.index: c for c in profile.columns}
+    tables, profiles, columns = _reread_context(paper_row)
 
     if sample is not None and sample < len(rows):
         rows = random.Random(0).sample(rows, sample)
@@ -76,7 +95,7 @@ def check_fidelity(paper_row, sample=None):
 
         cell = table.rows[index][col]
         spec = columns[row["Table_id"]].get(col)
-        value, temperature, _marker = read_value(cell, spec, profile)
+        value, temperature, _marker, _note = read_value(cell, spec, profile)
         checked += 1
         if value is None or abs(float(value) - float(row["Value"])) > 1e-9:
             mismatches.append({**_ident(row), "problem": "value does not round-trip",
@@ -94,6 +113,46 @@ def _ident(row):
     return {"Paper_key": row.get("Paper_key"), "Measurement_key": row.get("Measurement_key"),
             "Table_id": row.get("Table_id"), "Source_row": row.get("Source_row"),
             "Source_col": row.get("Source_col"), "Property": row.get("Property")}
+
+
+# ---------- (a2) the other half of fidelity: what did we NOT extract? ----------
+def skipped_cells(paper_row, write=True):
+    """Every property cell that had content and yielded no value. -> list[dict].
+
+    Fidelity cannot see these, because a value that was never extracted has no row to
+    re-read. Most are correct refusals -- this paper's "DT" means "reported at
+    different temperatures", which is not a number -- but they are the only place a
+    silently lost value can show up, so all of them are written out.
+    """
+    tables, profiles, columns = _reread_context(paper_row)
+
+    out = []
+    for table_id, profile in profiles.items():
+        table = tables.get(table_id)
+        if table is None or not profile.relevant:
+            continue
+        property_cols = [c for c in profile.columns if c.role == "property"]
+        ragged = {index for index, _ in table.ragged}
+        for index, row in enumerate(table.rows):
+            if index in ragged:
+                continue
+            for column in property_cols:
+                if column.index >= len(row):
+                    continue
+                cell = row[column.index]
+                value, _temp, _marker, note = read_value(cell, column, profile)
+                if value is not None or not note or note == "not reported":
+                    continue
+                out.append({"Paper_key": paper_row["Paper_key"], "Table_id": table_id,
+                            "Source_row": index, "Source_col": column.index,
+                            "Property": column.property, "raw": cell.text.strip(),
+                            "note": note})
+    if write:
+        config.REVIEW_DIR.mkdir(parents=True, exist_ok=True)
+        path = config.REVIEW_DIR / f"{paper_row['slug']}_skipped_cells.csv"
+        pd.DataFrame(out, columns=["Paper_key", "Table_id", "Source_row", "Source_col",
+                                   "Property", "raw", "note"]).to_csv(path, index=False)
+    return out
 
 
 # ---------- (b) plausibility: is the printed number physically sane? ----------
@@ -244,53 +303,115 @@ def review_queue():
 
 
 # ---------- (e) the human spot check ----------
+def _render_row(table, profile, columns, index, measurements):
+    """One source row as the reviewer should see it. -> list of printable lines.
+
+    A table row usually carries several values -- 2.45 on average here, up to 6 -- so
+    showing one sampled measurement next to it invites the reader to mark a correct
+    row wrong for the values it appeared to omit. Every property column is printed,
+    including the ones that yielded nothing and why, so "nothing was missed" is
+    something the reviewer can see rather than assume.
+    """
+    row = table.rows[index]
+    by_property = {m.get("Property"): m for m in measurements}
+    lines = []
+
+    labels = []
+    for column in profile.columns:
+        if column.role in ("component", "ratio") and column.index < len(row):
+            text = row[column.index].text.strip()
+            if text:
+                labels.append(text)
+    lines.append("    " + " | ".join(labels))
+
+    for column in profile.columns:
+        if column.role != "property" or column.index >= len(row):
+            continue
+        raw = row[column.index].text.strip() or "(empty)"
+        value, temperature, _marker, note = read_value(row[column.index], column, profile)
+        if value is None:
+            shown = note
+        else:
+            got = by_property.get(column.property)
+            unit = (got or {}).get("Unit") or ""
+            shown = f"-> {value} {unit} @ {temperature}C"
+            if got is None:
+                shown += "   <-- re-read finds a value the data does not have!"
+        lines.append(f"      col {column.index}  {column.property or '':<18}"
+                     f"{raw[:14]:<16}{shown}")
+
+    for column in profile.columns:
+        if column.role == "reference" and column.index < len(row):
+            dois = str((measurements[0] if measurements else {}).get("Source_DOIs") or "")
+            lines.append(f"      {row[column.index].text.strip()} -> "
+                         f"{dois.replace(config.SOURCE_SEP, ', ') or '(unresolved)'}")
+    return lines
+
+
 def spot_check(paper_row, n=20, seed=0, interactive=False):
-    """Show sampled rows beside their source cells and record a human verdict.
+    """Show sampled source rows in full and record one human verdict per row.
 
     Verdicts persist in data/review/<slug>_spotcheck.csv and are read back, so a row
     is never asked about twice -- the same hand-edited-file-is-authoritative pattern
     as component_aliases.json.
+
+    Keyed on "<table>:<source row>" rather than on Measurement_key, because Row_id
+    embeds a sequential counter that shifts whenever an earlier row's handling
+    changes; the table and XML row index do not.
     """
     slug = paper_row["slug"]
     path = config.REVIEW_DIR / f"{slug}_spotcheck.csv"
     answered = {}
     if path.exists():
         for row in pd.read_csv(path).to_dict("records"):
-            answered[row["Measurement_key"]] = row
+            # rows from the older measurement-keyed format have no Review_key; drop
+            # them rather than crash, since their verdicts judged a different view
+            if row.get("Review_key") and not pd.isna(row["Review_key"]):
+                answered[row["Review_key"]] = row
 
     rows = [r for r in store.read_all("measurements")
             if r.get("Paper_key") == paper_row["Paper_key"]]
     if not rows:
         return answered
 
-    root = xml_utils.load_root(paper_row["path"])
-    dialect = dialects.detect(root)
-    tables = {t.id: t for t in dialect.tables(root)}
+    grouped = {}
+    for row in rows:
+        grouped.setdefault(f"{row['Table_id']}:{row['Source_row']}", []).append(row)
 
-    picked = random.Random(seed).sample(rows, min(n, len(rows)))
-    todo = [r for r in picked if r["Measurement_key"] not in answered]
+    keys = sorted(grouped)
+    picked = random.Random(seed).sample(keys, min(n, len(keys)))
+    todo = [k for k in picked if k not in answered]
     if not interactive:
         return answered
 
+    tables, profiles, columns = _reread_context(paper_row)
+
     print(f"\n  spot check: {len(todo)} of {len(picked)} sampled rows still unanswered")
-    for i, row in enumerate(todo, 1):
-        table = tables.get(row.get("Table_id"))
-        source = "?"
-        if table is not None and row.get("Source_row") is not None:
-            index = int(row["Source_row"])
-            if index < len(table.rows):
-                source = " | ".join(c.text for c in table.rows[index])
-        print(f"\n {i}/{len(todo)}  {slug}  {row['Table_id']} row {row['Source_row']}")
-        print(f"        source row:  {source[:150]}")
-        print(f"        extracted :  {row['Mixture']}   {row['Property']} = "
-              f"{row['Value']} {row['Unit'] or ''} @ {row['Temperature_C']}C")
-        answer = input("        correct? [y/n/?/q] ").strip().lower()
+    for i, key in enumerate(todo, 1):
+        members = grouped[key]
+        table_id, index = members[0]["Table_id"], int(members[0]["Source_row"])
+        table, profile = tables.get(table_id), profiles.get(table_id)
+
+        print(f"\n {i}/{len(todo)}  {slug}  {table_id} row {index}"
+              f"   ({len(members)} value(s))")
+        if table is None or profile is None or index >= len(table.rows):
+            print("    (source row unavailable)")
+        else:
+            for line in _render_row(table, profile, columns, index, members):
+                print(line)
+
+        answer = input("\n    all correct? [y/n/?/q] ").strip().lower()
         if answer == "q":
             break
-        answered[row["Measurement_key"]] = {
-            "Measurement_key": row["Measurement_key"], "Paper_key": row["Paper_key"],
-            "Mixture": row["Mixture"], "Property": row["Property"],
-            "Value": row["Value"], "source_row": source[:200],
+        answered[key] = {
+            "Review_key": key, "Paper_key": paper_row["Paper_key"],
+            "Table_id": table_id, "Source_row": index,
+            "Mixture": members[0].get("Mixture"),
+            "n_measurements": len(members),
+            "values": config.SOURCE_SEP.join(
+                f"{m['Property']}={m['Value']}" for m in members),
+            "source_row": " | ".join(c.text for c in table.rows[index])[:300]
+            if table is not None and index < len(table.rows) else "",
             "correct": {"y": "yes", "n": "no"}.get(answer, "unsure"),
         }
         config.REVIEW_DIR.mkdir(parents=True, exist_ok=True)
@@ -311,27 +432,34 @@ def report(interactive=False, sample=20):
 
     for paper_row in papers:
         rows = [r for r in measurements if r.get("Paper_key") == paper_row["Paper_key"]]
+        source_rows = {(r.get("Table_id"), r.get("Source_row")) for r in rows}
         checked, mismatches = check_fidelity(paper_row)
+        skipped = skipped_cells(paper_row)
         implausible = check_plausibility(rows)
         unhandled = [r for r in store.read_all("tables_unhandled")
                      if r.get("Paper_key") == paper_row["Paper_key"]]
         verdicts = spot_check(paper_row, n=sample, interactive=interactive)
         mine = [v for v in verdicts.values() if v["Paper_key"] == paper_row["Paper_key"]]
         wrong = sum(1 for v in mine if v["correct"] == "no")
+        values_seen = sum(int(v.get("n_measurements") or 0) for v in mine)
 
         share = (len(implausible) / len(rows) * 100) if rows else 0.0
+        reasons = Counter(s["note"] for s in skipped)
         print(f"\n  {paper_row['slug']}   {paper_row['Paper_key']}")
-        print(f"    measurements     {len(rows)}")
+        print(f"    measurements     {len(rows)} from {len(source_rows)} source row(s)")
         print(f"    fidelity         {checked - len(mismatches)}/{checked} re-read identically"
               f"{'   <-- BLOCKER' if mismatches else ''}")
+        print(f"    cells skipped    {len(skipped)}"
+              f"   ({', '.join(f'{n} {r}' for r, n in reasons.most_common()) or 'none'})")
         print(f"    plausible        {len(rows) - len(implausible)}/{len(rows)}"
               f"   ({len(implausible)} flagged, {share:.1f}%)")
         print(f"    tables skipped   {len(unhandled)}")
-        print(f"    spot check       {len(mine)} reviewed, {wrong} wrong"
+        print(f"    spot check       {len(mine)} row(s) reviewed covering {values_seen} "
+              f"value(s), {wrong} wrong"
               f"{'' if mine else '   (none yet -- run with --review)'}")
 
         accepted = (not mismatches and wrong == 0 and share < 2.0
-                    and len(mine) >= min(sample, len(rows)))
+                    and len(mine) >= min(sample, len(source_rows)))
         print(f"    accepted         {accepted}")
         all_ok &= accepted
         for m in mismatches[:5]:

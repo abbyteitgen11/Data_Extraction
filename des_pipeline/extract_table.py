@@ -71,25 +71,43 @@ def parse_components(names):
 
 
 def read_value(cell, column, profile):
-    """One property cell -> (value, temperature_C, marker).
+    """One property cell -> (value, temperature_C, marker, note).
 
     The marker lookup is the important part: a superscript is only a footnote marker
     if this table's legend says so, otherwise it is just part of the chemistry.
+
+    `note` says why a cell yielded nothing, so `validate.skipped_cells` can show a
+    human that "DT" was recognised and declined rather than quietly missed. It is
+    derived from the cell's own text and decides nothing.
     """
     raw = cell.text.strip()
     missing = set(profile.missing_value_tokens) | set(config.DASH)
     if not raw or raw in missing:
-        return None, None, ""
+        return None, None, "", "not reported"
 
     defined = {m.marker: m for m in profile.footnote_markers if m.marker}
     marker = next((m for m in cell.markers if m in defined), "")
     if not marker:                                   # some markers only appear in the text
         marker = next((k for k in defined if raw.startswith(k) and len(k) <= 2), "")
 
-    text = raw[len(marker):] if marker and raw.startswith(marker) else raw
+    # A marker usually leads the number ("d1.267") but occasionally trails it
+    # ("0.688a"), and the trailing form was silently unreadable. Only accept the
+    # trailing strip when what is left is actually a number, so a unit suffix or a
+    # word ending in a marker letter cannot be mistaken for one.
+    text = raw
+    if marker and raw.startswith(marker):
+        text = raw[len(marker):]
+    elif marker and raw.endswith(marker) and \
+            xml_utils.clean_number(raw[:-len(marker)]) is not None:
+        text = raw[:-len(marker)]
+
     value = xml_utils.clean_number(text)
     if value is None:
-        return None, None, marker
+        # No digits at all means the cell holds a token standing in for a value --
+        # this table's "DT" ("reported at different temperatures"). Digits that still
+        # will not parse are a source typo or two numbers in one cell.
+        note = "unparseable" if any(c.isdigit() for c in raw) else "no numeric value"
+        return None, None, marker, note
 
     spec = defined.get(marker)
     if spec is not None and spec.meaning == "temperature" and spec.temperature_C is not None:
@@ -98,7 +116,7 @@ def read_value(cell, column, profile):
         temperature = round(profile.default_temperature_C, 3)
     else:
         temperature = config.DEFAULT_TEMP
-    return value, temperature, marker
+    return value, temperature, marker, ""
 
 
 def _looks_like_header(row, profile):
@@ -183,7 +201,8 @@ def extract_property_table(table, profile, paper, reference_map):
         for column in property_cols:
             if column.index >= len(row):
                 continue
-            value, temperature, _marker = read_value(row[column.index], column, profile)
+            value, temperature, _marker, _note = read_value(row[column.index], column,
+                                                            profile)
             suffix = column.property.lower()
             record[column.property] = value
             record[f"Units_{suffix}"] = (

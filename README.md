@@ -106,7 +106,7 @@ Counts below are for the Sadeghi paper.
 | File | Rows | What it is |
 |---|---|---|
 | `papers/<slug>/mixtures.csv` | 1539 | **one row per DES mixture** — components, ratios, every property as a value/unit/temperature triple, plus the paper's and every primary source's bibliographic metadata |
-| `papers/<slug>/measurements.csv` | 1648 | one row per measurement; what the graph loads |
+| `papers/<slug>/measurements.csv` | 1649 | one row per measurement; what the graph loads |
 | `papers/<slug>/references.csv` | 343 | the bibliography, with Crossref DOIs, volume, issue, pages |
 | `papers/<slug>/figures.csv` | 11 | worklist for manual digitisation (WebPlotDigitizer) |
 | `papers/<slug>/sections_llm.csv` | 138 | prose measurements, `status` deciding which reach the graph |
@@ -177,19 +177,34 @@ python run_pipeline.py --steps validate            # report card
 python run_pipeline.py --steps validate --review   # + interactive spot check
 ```
 
-Four separate questions, deliberately kept apart:
+Five separate questions, deliberately kept apart:
 
 **Fidelity — did we transcribe what the paper prints?** Every measurement records its
 table, row and column, so the source cell is re-read and the value re-derived. Exhaustive,
 automatic, no judgement. A mismatch is always our bug and is a blocker.
 
 ```
-fidelity         1648/1648 re-read identically
+fidelity         1649/1649 re-read identically
 ```
 
 This is what makes it safe to change the extractor: the profile-driven rewrite was checked
 this way, and separately against the old extractor — 0 differing values across 1494 matched
 rows, plus 4 rows recovered that the old code silently dropped.
+
+**Skipped cells — did we miss anything the paper prints?** Fidelity only inspects values
+that *were* extracted, so it is blind to one that was dropped. This walks every property
+cell that had content and produced nothing, records why, and writes
+`data/review/<slug>_skipped_cells.csv`.
+
+```
+cells skipped    38   (36 no numeric value, 2 unparseable)
+```
+
+Most refusals are correct — this paper prints `DT` for "reported at several temperatures",
+which is not a number, and two cells hold a source typo (`1. 2201`) or two numbers at once
+(`b140 84.5`), where dropping beats guessing. But it is the only place a *silently* lost
+value can surface, and it is how one was found after fidelity had reported 1648/1648: a
+footnote marker trailing its number (`0.688a`) instead of leading it.
 
 **Plausibility — is what the paper prints physically sensible?** Bounds live in
 `config.PROPERTIES` beside each property. A violation is *flagged, not dropped*: checking
@@ -202,18 +217,32 @@ record of the literature and carries `plausible: false`; a training set can filt
 **Invariants.** Every row has a `Paper_key`; `Measurement_key` is unique across papers;
 every cited paper key has a reference row; no measurement dangles.
 
-**A human spot check** — the only way to get a real error rate. It samples rows
-deterministically and shows each beside its source row:
+**A human spot check** — the only way to get a real error rate. It samples **source rows**
+deterministically and shows everything the pipeline did with each one, column by column:
 
 ```
- 1/20  SadeghiDESReview  t0010 row 675
-        source row:  Tetrabutylammonium bromide | 1,5-Propanediol | 1:3 | – | DT | e183 | ...
-        extracted :  Tetrabutylammonium bromide:1,5-Propanediol (1:3)  Viscosity = 183.0 mPa*s @ 30.0C
-        correct? [y/n/?/q]
+ 1/20  SadeghiDESReview  t0010 row 675   (1 value(s))
+    Tetrabutylammonium bromide | 1,5-Propanediol | 1:3
+      col 3  Melting_point     –               not reported
+      col 4  Density           DT              no numeric value
+      col 5  Viscosity         e183            -> 183.0 mPa*s @ 30.0C
+      col 6  Conductivity      –               not reported
+      col 7  Surface_tension   –               not reported
+      col 8  Refractive_index  –               not reported
+      [212] -> 10.3390/molecules19068011
+
+    all correct? [y/n/?/q]
 ```
 
-Verdicts persist in `data/review/<slug>_spotcheck.csv` and are read back, so a row is never
-asked about twice. Quit with `q` and resume later.
+The row, not the value, is the unit of review, because a table row carries 2.45 values on
+average and up to 6. Showing one sampled measurement beside a row containing several
+invites the reviewer to mark a correct row wrong for the values it appeared to omit — that
+happened, and produced a 3/5 "error rate" on data that was entirely correct. Printing every
+column, including the ones that yielded nothing **and why**, makes "nothing was missed"
+something you can see rather than assume. 20 screens now cover ~49 values instead of 20.
+
+Verdicts persist in `data/review/<slug>_spotcheck.csv`, keyed on `<table>:<source row>`, and
+are read back so a row is never asked about twice. Quit with `q` and resume later.
 
 **The review queue** (`data/review/queue.csv`) is one prioritised worklist rather than six
 CSVs, ranked by how much data hangs on each decision: a table that failed profiling
