@@ -3,21 +3,32 @@
 Centralise the extraction of relevant scientific data from open-access published papers
 accessible from public repositories, and load it into a graph database.
 
-The current scope is deep eutectic solvents (DES), starting from one paper:
-`SadeghiDESReview.xml` (Omar & Sadeghi, *J. Mol. Liq.* **384** (2023) 121899), whose
-Table 2 lists ~1500 DES with their measured physical properties.
+The current scope is deep eutectic solvents (DES). Every XML file in `xml/` is processed;
+the first is `SadeghiDESReview.xml` (Omar & Sadeghi, *J. Mol. Liq.* **384** (2023) 121899),
+whose Table 2 lists ~1500 DES with their measured physical properties.
+
+Nothing is hard-coded to a particular paper. A table's layout is discovered rather than
+declared (see [Reading a table you have never seen](#reading-a-table-you-have-never-seen)),
+outputs are partitioned per paper under `data/papers/<slug>/`, and every row carries the
+`Paper_key` it came from.
 
 ## The pipeline
 
 ```
-                    ┌─ floats/table        → extract_table       → wide + long CSV
- XML ─→ router.py ──┼─ floats/figure       → extract_figures     → figures.csv  (human)
-                    ├─ tail/bibliography   → extract_references  → references.csv (Crossref)
-                    └─ body//section       → extract_text_llm    → sections_llm.csv (review)
+ xml/*.xml
+    │
+    ├─ dialects.detect ──→ one reader per publisher format (Elsevier today)
+    │
+    ├─ tables      → profile_table (LLM) → extract_table    → mixtures + measurements
+    ├─ figures     ─────────────────────→ extract_figures   → figures.csv     (human)
+    ├─ bibliography ────────────────────→ extract_references → references.csv (Crossref)
+    └─ sections    ─────────────────────→ extract_text_llm  → sections_llm.csv (review)
 
- component names ──────────────────────────→ enrich_components   → components.csv (PubChem)
+ component names ───────────────────────→ enrich_components → components.csv  (PubChem)
+                                          component_properties → every value + its source
 
- all CSVs ─────────────────────────────────→ build_graph         → Neo4j
+ data/papers/*/ ───────────────────────→ validate           → report card + review queue
+                 └────────────────────→ build_graph        → Neo4j
 ```
 
 Routing is by document *structure*, which is deterministic — the pipeline never asks an
@@ -54,9 +65,16 @@ python run_pipeline.py --steps refs                      # Crossref, ~1 min
 python run_pipeline.py --steps figures
 python run_pipeline.py --steps text                      # LLM, needs `ollama serve`
 python run_pipeline.py --steps aliases                   # abbreviation candidates
-python run_pipeline.py --steps components --limit 20     # PubChem; drop --limit for all 494
+python run_pipeline.py --steps components --limit 20     # PubChem; drop --limit for all
+python run_pipeline.py --steps validate                  # report card
+python run_pipeline.py --steps validate --review         # + interactive spot check
 python run_pipeline.py --steps graph --wipe
 ```
+
+`route,refs,table,figures,text` run **once per paper**, over every file in `xml/`.
+`components,aliases,validate,graph` run once across the whole corpus, reading
+`store.read_all()`. Restrict a run with `--papers <slug>,<slug>`, and use
+`--continue-on-error` so one bad paper does not stop the rest.
 
 Order matters in two places: `table` and `text` both read the reference cache, so run
 `refs` at least once first; and `text` runs before `components` so prose-only component
@@ -64,27 +82,158 @@ names exist by the time the PubChem lookup runs. `--steps all` already does both
 
 Prose measurements load into the graph by default; `--no-prose` skips them.
 
+### Getting a paper
+
+```bash
+python fetch_paper.py 10.1016/j.rechem.2024.101378 --name Yeow_2024
+```
+
+Tries the publisher's Crossref-declared text-mining link, then the Elsevier article API,
+then Unpaywall. **An Elsevier API key alone is not enough for full text** — the article
+endpoint returns `403 AUTHENTICATION_ERROR` for every article, open-access ones included,
+while the abstract and search endpoints work on the same key. You need an institutional
+token in `.env` as `ELSEVIER_INSTTOKEN` (ask your library) or a request from your
+institution's network. Until then, download the XML by hand and drop it in `xml/`; the
+pipeline only needs the file to exist.
+
 ## What comes out
 
 Everything lands in `data/` (gitignored).
 
+Per-paper files live under `data/papers/<slug>/`; corpus-wide ones sit in `data/`.
+Counts below are for the Sadeghi paper.
+
 | File | Rows | What it is |
 |---|---|---|
-| `table2_with_dois.csv` | 1535 | **one row per DES mixture** — components, ratios, the six properties as value/unit/temperature triples, plus the review's and every primary paper's bibliographic metadata |
-| `measurements_long.csv` | 1646 | one row per measurement; derived from the above, and what the graph loader reads |
-| `references.csv` | 343 | the bibliography, with Crossref DOIs, volume, issue and pages |
-| `components.csv` | 494 | PubChem identifiers and pure-component properties |
-| `figures.csv` | 11 | worklist for manual digitisation (WebPlotDigitizer) |
-| `tables_unhandled.csv` | 1 | tables with no parser yet (Table 1) |
-| `sections_llm.csv` | — | prose measurements, with `status` deciding which reach the graph |
-| `alias_suggestions.csv` | — | abbreviation candidates from `--steps aliases` |
+| `papers/<slug>/mixtures.csv` | 1539 | **one row per DES mixture** — components, ratios, every property as a value/unit/temperature triple, plus the paper's and every primary source's bibliographic metadata |
+| `papers/<slug>/measurements.csv` | 1648 | one row per measurement; what the graph loads |
+| `papers/<slug>/references.csv` | 343 | the bibliography, with Crossref DOIs, volume, issue, pages |
+| `papers/<slug>/figures.csv` | 11 | worklist for manual digitisation (WebPlotDigitizer) |
+| `papers/<slug>/sections_llm.csv` | 138 | prose measurements, `status` deciding which reach the graph |
+| `papers/<slug>/tables_unhandled.csv` | 1 | tables that produced no data, with the reason |
+| `papers/<slug>/table_profiles.json` | — | how each table was read; hand-overridable |
+| `papers.csv` | 1 | the corpus index, one row per paper |
+| `components.csv` | 497 | PubChem identifiers and descriptors |
+| `component_properties.csv` | 3369 | every reported component property value, with its source |
+| `duplicate_measurements.csv` | 15 | the same datum reported twice, with both values and `agree` |
+| `review/queue.csv` | 42 | the prioritised human worklist |
 
-In `table2_with_dois.csv` the `Source_*` columns are multi-valued and positionally
-aligned: the n-th DOI in `Source_DOIs` belongs to the n-th title in `Source_titles`.
-Papers are separated by `|`; authors within one paper by `; `.
+Partitioning per paper means re-running one paper of a thousand rewrites only its own
+directory, and it makes it structurally impossible for paper B to overwrite paper A.
+Every row also carries `Paper_key`, so a concatenation is self-describing.
+
+The `Source_*` columns are multi-valued and positionally aligned: the n-th DOI in
+`Source_DOIs` belongs to the n-th title in `Source_titles`. Papers are separated by `|`;
+authors within one paper by `; `.
 
 Don't open these in Excel — it silently rewrites the `Ratio_raw` column (`1:2` becomes
 a time value).
+
+## Reading a table you have never seen
+
+Nothing tells the pipeline that melting point is column 3. For each table an LLM is shown
+a *card* — the caption, the header rows with row-spans expanded, the legend, and five
+sample rows — and returns a column map. Deterministic code then reads all 1539 rows from
+that map. **No cell value is ever seen by the model**, so nothing can be hallucinated,
+rounded or unit-converted.
+
+```
+Table 2   des_properties   10 cols, 10 markers
+  col 3  property  Melting_point     (˚C)      col 6  property  Conductivity     (mS·cm−1)
+  col 4  property  Density           (g·cm−3)  col 7  property  Surface_tension  (mN·m−1)
+  col 5  property  Viscosity         (mPa·s)   col 8  property  Refractive_index  nD
+  markers a→40 °C  b→20 °C  c→60 °C  d→45 °C  e→30 °C  f→35 °C  g→50 °C  h→55 °C
+  default temperature 25 °C, missing values "–" and "-"
+```
+
+That output was checked against the hard-coded constants it replaced: it reproduced the
+column map and all eight temperature markers exactly.
+
+Two checks make it safe, both against data we already hold rather than anything the model
+asserts:
+
+1. **The model must echo each column's header verbatim**, and we compare it against the
+   printed header. A map shifted by one column announces itself.
+2. **A column labelled as a property must actually contain numbers.** This caught a real
+   error: asked about Table 1 ("Types of eutectics"), the model called the *Formula*
+   column — holding `Cat+X− zMClx` — a melting point, echoing the header correctly while
+   doing so.
+
+A table failing either check extracts nothing and is written to `tables_unhandled.csv`
+with the reason. Missing data is visible; a silently mislabelled column is not.
+
+The profile is cached, and `data/papers/<slug>/table_profiles.json` is hand-overridable:
+set `"source": "human"` and it is used verbatim, with a `card_sha256` so a re-downloaded
+XML cannot be read through a stale hand-written map.
+
+Because the legend is now the authority on footnote markers rather than a constant, a
+superscript only means a temperature if *that table* says so — which is what stops the
+charge sign in `[Br⁻]` being read as one.
+
+## Validating it
+
+```bash
+python run_pipeline.py --steps validate            # report card
+python run_pipeline.py --steps validate --review   # + interactive spot check
+```
+
+Four separate questions, deliberately kept apart:
+
+**Fidelity — did we transcribe what the paper prints?** Every measurement records its
+table, row and column, so the source cell is re-read and the value re-derived. Exhaustive,
+automatic, no judgement. A mismatch is always our bug and is a blocker.
+
+```
+fidelity         1648/1648 re-read identically
+```
+
+This is what makes it safe to change the extractor: the profile-driven rewrite was checked
+this way, and separately against the old extractor — 0 differing values across 1494 matched
+rows, plus 4 rows recovered that the old code silently dropped.
+
+**Plausibility — is what the paper prints physically sensible?** Bounds live in
+`config.PROPERTIES` beside each property. A violation is *flagged, not dropped*: checking
+the first paper's outliers against its table showed all of them were faithful
+transcriptions — the paper really does print a melting point of 2298 °C, a viscosity of
+325,000 mPa·s and a conductivity of 1548 mS/cm. So this catches the **source** being wrong
+or using a different unit, which only a human can adjudicate. The graph stays a faithful
+record of the literature and carries `plausible: false`; a training set can filter.
+
+**Invariants.** Every row has a `Paper_key`; `Measurement_key` is unique across papers;
+every cited paper key has a reference row; no measurement dangles.
+
+**A human spot check** — the only way to get a real error rate. It samples rows
+deterministically and shows each beside its source row:
+
+```
+ 1/20  SadeghiDESReview  t0010 row 675
+        source row:  Tetrabutylammonium bromide | 1,5-Propanediol | 1:3 | – | DT | e183 | ...
+        extracted :  Tetrabutylammonium bromide:1,5-Propanediol (1:3)  Viscosity = 183.0 mPa*s @ 30.0C
+        correct? [y/n/?/q]
+```
+
+Verdicts persist in `data/review/<slug>_spotcheck.csv` and are read back, so a row is never
+asked about twice. Quit with `q` and resume later.
+
+**The review queue** (`data/review/queue.csv`) is one prioritised worklist rather than six
+CSVs, ranked by how much data hangs on each decision: a table that failed profiling
+(affects the whole table) → an unresolved abbreviation (every row using it) → an
+implausible value → a doubtful Crossref match → an unverified prose value.
+
+A paper is **accepted** when fidelity is 100%, at least one table profiled or all were
+explicitly irrelevant, the spot check found nothing wrong, and under 2% of values are
+implausible.
+
+### Deduplication across papers
+
+Every measurement carries a `Dedup_key` over its resolved components, ratio, property,
+value and *primary source DOI* — so the same original measurement copied into two reviews
+is recognised as one datum. `duplicate_measurements.csv` records every group with both
+values and an `agree` column, because collapsing them silently would destroy the evidence
+that two sources concur, or hide that they do not.
+
+It already earns its keep on one paper: **15 groups**, where the review's own table lists
+the same datum twice.
 
 ### On the prose route
 
@@ -167,6 +316,43 @@ then flows into the enrichment step like any other component. A cheap word filte
 compound *classes* ("Amino acids", "Choline salt", "Tetraalkyl ammonium halides") and
 non-chemicals ("HBD", "RCl") from being looked up at all.
 
+### Component properties
+
+Each component is looked up in PubChem for identifiers and descriptors (SMILES, InChI,
+formula, MW, H-bond donor/acceptor counts, TPSA, rotatable bonds, formal charge, XLogP,
+complexity) and in the NIST WebBook for phase-change data. All of it lands on the
+`(:Component)` node.
+
+PubChem usually reports a property **more than once, from different sources** — 208 of the
+256 components with text do. The scalar on the node is just the first parseable value;
+`component_properties.csv` and the graph keep them all:
+
+```
+Ammonium thiocyanate
+  Melting Point: 320 °F (USCG, 1999)   CAMEO Chemicals                 -> 160.0 C
+  Melting Point: 149.6 °C              Hazardous Substances Data Bank  -> 149.6 C
+  Melting Point: 149.6 °C              PAC Chemical Database (DOE)     -> 149.6 C
+  Boiling Point: Solid decomposes      CAMEO Chemicals                 -> qualifier
+  Density: 1.3057 g/mL                 Hazardous Substances Data Bank  -> 1.3057
+```
+
+The LLM reads those lines, but **it returns a line number, never text and never a converted
+unit**. That keeps every claim checkable: attribution comes from PubChem's own `Reference`
+map rather than from the model, unit conversion happens in Python, and verification is
+exact — the number must occur character-for-character in the line *we* fetched. Records
+that fail land in the CSV with a `status` and stay out of the graph:
+
+| status | meaning |
+|---|---|
+| `qualitative` | the line hedges — "Solid decomposes", "Sublimes" |
+| `unverified` | the number is not on the line |
+| `different_substance` | the value is for PEG 400, not for this component |
+| `unhandled_unit` | a density in lb/gal or "relative density (water = 1)" |
+| `ok` | loaded |
+
+The pass is one call per component so the model never sees two substances at once, and it
+is cached like the prose route, so re-running is free.
+
 Component *attribution* is still where the model is weakest, so read `sections_llm.csv`
 before trusting it. For better quality set `DES_LLM_BACKEND=anthropic`.
 
@@ -233,9 +419,25 @@ MATCH (p:Paper) WHERE p.doi IS NULL RETURN p.key, p.ref_number, p.raw;
 MATCH (p:Paper) WHERE p.title_agreement < 0.5 RETURN p.doi, p.match_score, p.title;
 ```
 
-Every measurement, mixture and component carries `origin` — `'table'` or `'prose'` — so
-the two sources stay separable. Prose measurements also carry `evidence`, the sentence
-they were read from.
+Pure-component properties use the same labels, hanging off the `Component` rather than the
+`Mixture`, with one node per reported value and each pointing at whoever reported it:
+
+```
+(:Component)-[:HAS_MELTING_POINT {data_source}]->
+    (:Melting_point {origin:'component', value, unit, qualifier, pressure, raw_string})
+        -[:REPORTED_IN]-> (:Source {name:'CAMEO Chemicals', kind:'attribution'})
+        -[:REPORTED_IN]-> (:Source {name:'pubchem', kind:'database'})
+```
+
+Every measurement, mixture and component carries `origin` — `'table'`, `'prose'` or
+`'component'` — so the sources stay separable. Prose measurements also carry `evidence`,
+the sentence they were read from; component properties carry `raw_string`.
+
+**Adding a property** is one entry in `config.PROPERTIES`. It flows automatically into the
+pydantic `Literal`, the Neo4j label, the `HAS_<PROPERTY>` relationship and the uniqueness
+constraint. `table2_column` and `pugview` say where (if anywhere) that property shows up in
+the paper's table and in PubChem — boiling point has a PubChem heading but no table column,
+which is exactly why the two lists are separate.
 
 ```cypher
 MATCH (m:Mixture)-[:HAS_VISCOSITY]->(v) WHERE v.origin = 'table' RETURN v.value;

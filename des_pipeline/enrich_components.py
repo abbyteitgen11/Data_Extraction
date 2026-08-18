@@ -8,7 +8,7 @@ elsewhere. Sources, in the order they are tried:
     PubChem (pubchempy)   CID, SMILES, InChI, formula, MW, H-bond donor/acceptor counts
     chemicals            CAS registry number
     PubChem PUG-View     melting point, boiling point, density
-    NIST WebBook         same, opt-in via --nist (HTML scraping, fragile)
+    NIST WebBook         phase-change data, ON BY DEFAULT (--no-nist skips it)
 
 Lookup order matters. create_Sadeghi_graphdb.py went name -> CAS -> SMILES -> CID,
 but `CAS_from_any` misses many of these names ("Choline bromide", "Choline nitrate").
@@ -21,8 +21,11 @@ Two cautions:
     494 names include real typos ("1,2-proanediol", "CIEtMe3NCl") that will never
     resolve.
   * PUG-View property strings are messy -- "9 °F (NTP, 1992)", "4 - 10 °C", ranges,
-    and occasionally a value for a different substance. The raw string is kept in
-    `property_comments`; treat the parsed number as provisional.
+    and occasionally a value for a different substance. The scalar parsers here take
+    the FIRST parseable number and drop the rest, which is fine as a single best
+    guess but loses real data: 208 of the 256 components with text report the same
+    property more than once. component_properties.py reads the full set, with the
+    source PubChem attached to each; this module keeps the scalar it always had.
 
 Nothing here ever overwrites a value measured in the paper. Everything is cached in
 data/components_cache.json, keyed by the name exactly as the paper writes it.
@@ -67,6 +70,24 @@ def extract_values(node):
         if "Number" in value:
             values += value["Number"]
     return [v for v in values if v is not None]
+
+
+def extract_entries(node, references):
+    """Same strings, but keeping the provenance extract_values() throws away.
+
+    PubChem's Record carries a Reference list keyed by ReferenceNumber, in the very
+    JSON we already fetched, so "which database said this" is structural. Nothing
+    downstream ever has to guess at an attribution.
+    """
+    out = []
+    for info in node.get("Information", []):
+        data_source, source_record = references.get(info.get("ReferenceNumber"), ("", ""))
+        for item in info.get("Value", {}).get("StringWithMarkup", []):
+            if item.get("String"):
+                out.append({"string": item["String"],
+                            "data_source": data_source,
+                            "source_record": source_record})
+    return out
 
 
 # ---------- property strings -> numbers ----------
@@ -143,8 +164,14 @@ def _cas_number(name, compound):
 
 
 def _pugview_properties(cid, session):
-    """-> ({property: value}, [raw strings]) for melting point, boiling point, density."""
-    values, comments = {}, []
+    """-> ({property: value}, [comment strings], [entries]).
+
+    The first two are the original scalar path, unchanged. `entries` is the new one:
+    every string with its source attached, untruncated, for the LLM pass to read.
+    PubChem returns ~11.5 strings per component and the scalar path looks at the
+    first parseable one, so this is where the other ~80% finally goes.
+    """
+    values, comments, entries = {}, [], []
     for heading in HEADINGS:
         try:
             response = session.get(PUG_VIEW.format(cid=cid),
@@ -163,6 +190,14 @@ def _pugview_properties(cid, session):
         if node is None:
             continue
 
+        references = {r.get("ReferenceNumber"): (r.get("SourceName") or "",
+                                                 r.get("Name") or "")
+                      for r in record.get("Reference", [])}
+        record_title = record.get("RecordTitle", "")
+        entries += [{**e, "heading": heading, "property": config.PUGVIEW_PROPERTIES[heading],
+                     "record_title": record_title, "source_db": "pubchem"}
+                    for e in extract_entries(node, references)]
+
         strings = extract_values(node)
         comments += [f"{heading}: {s}" for s in strings[:2] if isinstance(s, str)]
         if heading == "Melting Point":
@@ -172,52 +207,82 @@ def _pugview_properties(cid, session):
         elif heading == "Density":
             values["density_g_cm3"] = parse_density(strings)
         time.sleep(0.2)                      # PubChem asks for <= 5 requests/second
-    return values, comments
+    return values, comments, entries
+
+
+# NIST WebBook phase-change data lives on the Mask=4 sub-page and is written
+# "T fus 261. +/- 2. K" / "T boil 470.5 K". The landing page carries neither, which
+# is why the previous "Normal melting point ... K" regex matched on 0 of 499
+# components -- the scrape has never once returned anything.
+_NIST_FUS = re.compile(r"T\s*fus\s+([0-9.]+)")
+_NIST_BOIL = re.compile(r"T\s*boil\s+([0-9.]+)")
 
 
 def _nist_webbook(cas, session):
-    """Scrape the NIST WebBook page for a CAS number. Opt-in; HTML is fragile."""
+    """Phase-change data from the NIST WebBook. -> ({property: C}, [entries]).
+
+    Values are returned as entries too, so a NIST/PubChem disagreement is visible in
+    the long CSV rather than being silently resolved by whichever ran first.
+    """
     from bs4 import BeautifulSoup
 
     try:
         response = session.get(
             "https://webbook.nist.gov/cgi/cbook.cgi",
-            params={"ID": "C" + cas.replace("-", ""), "Units": "SI"}, timeout=30)
+            params={"ID": "C" + cas.replace("-", ""), "Units": "SI", "Mask": "4"},
+            timeout=30)
         text = BeautifulSoup(response.text, "html.parser").get_text(" ", strip=True)
     except Exception:
-        return {}
+        return {}, []
 
-    out = {}
-    m = re.search(r"Normal melting point\s+([0-9.]+)\s*K", text)
-    if m:
-        out["melting_point_C"] = round(float(m.group(1)) - 273.15, 3)
-    m = re.search(r"Density\s+([0-9.]+)\s*g/cm3", text)
-    if m:
-        out["density_g_cm3"] = float(m.group(1))
-    return out
+    values, entries = {}, []
+    for pattern, prop, field in ((_NIST_FUS, "Melting_point", "melting_point_C"),
+                                 (_NIST_BOIL, "Boiling_point", "boiling_point_C")):
+        m = pattern.search(text)
+        if not m:
+            continue
+        kelvin = float(m.group(1))
+        values[field] = round(kelvin - 273.15, 3)
+        entries.append({
+            "string": m.group(0),
+            "data_source": "NIST WebBook",
+            "source_record": cas,
+            "heading": prop,
+            "property": prop,
+            "record_title": "",
+            "source_db": "nist",
+            "value_as_written": kelvin,
+            "unit_as_written": "K",
+        })
+    return values, entries
 
 
-def lookup(name, session, use_nist=False):
-    """Resolve one component name to a ComponentRow. Never raises."""
+def lookup(name, session, use_nist=True):
+    """Resolve one component name to a ComponentRow. Never raises.
+
+    -> (ComponentRow, entries) where entries are the raw source lines with their
+    provenance, for the LLM pass. The row itself stays scalar because it is a CSV.
+    """
     try:
         compound = _pubchem_compound(name)
     except Exception as exc:
-        return ComponentRow(name=name, lookup_status=f"error: {type(exc).__name__}")
+        return ComponentRow(name=name, lookup_status=f"error: {type(exc).__name__}"), []
     if compound is None:
-        return ComponentRow(name=name, lookup_status="not_found")
+        return ComponentRow(name=name, lookup_status="not_found"), []
 
     cas = _cas_number(name, compound)
-    properties, comments = _pugview_properties(compound.cid, session)
+    properties, comments, entries = _pugview_properties(compound.cid, session)
     sources = ["pubchem"]
 
     if use_nist and cas:
-        from_nist = _nist_webbook(cas, session)
+        from_nist, nist_entries = _nist_webbook(cas, session)
         for key, value in from_nist.items():
             properties.setdefault(key, value)      # PubChem wins where both have data
+        entries += nist_entries
         if from_nist:
             sources.append("nist")
 
-    return ComponentRow(
+    row = ComponentRow(
         name=name,
         cid=compound.cid,
         cas=cas,
@@ -228,6 +293,13 @@ def lookup(name, session, use_nist=False):
         molecular_weight=float(compound.molecular_weight) if compound.molecular_weight else None,
         h_bond_donor_count=compound.h_bond_donor_count,
         h_bond_acceptor_count=compound.h_bond_acceptor_count,
+        # Tabular descriptors, free on the Compound we already fetched. tpsa comes
+        # back as an int for some compounds, hence the cast.
+        tpsa=float(compound.tpsa) if compound.tpsa is not None else None,
+        rotatable_bond_count=compound.rotatable_bond_count,
+        formal_charge=compound.charge,
+        xlogp=float(compound.xlogp) if compound.xlogp is not None else None,
+        complexity=float(compound.complexity) if compound.complexity is not None else None,
         melting_point_C=properties.get("melting_point_C"),
         boiling_point_C=properties.get("boiling_point_C"),
         density_g_cm3=properties.get("density_g_cm3"),
@@ -235,16 +307,19 @@ def lookup(name, session, use_nist=False):
         sources=";".join(sources),
         lookup_status="ok",
     )
+    return row, entries
 
 
 # ---------- cache + driver ----------
 def distinct_components(path=None):
-    """Every component name in the table, in first-appearance order."""
-    df = pd.read_csv(path or config.TABLE_CSV)
+    """Every component name across every paper's tables, first-appearance order."""
+    from . import store
+
+    rows = store.read_all("mixtures")
     names, seen = [], set()
     for column in ("Component_1", "Component_2", "Component_3"):
-        for value in df[column].dropna():
-            name = str(value).strip()
+        for row in rows:
+            name = str(row.get(column) or "").strip()
             if name and name not in seen:
                 seen.add(name)
                 names.append(name)
@@ -315,7 +390,9 @@ def component_index(path=None, alias_path=None):
     way a resolved prose name lands on the Component node that already has the
     most edges, rather than creating a second variant.
     """
-    df = pd.read_csv(path or config.TABLE_CSV)
+    from . import store
+
+    df = pd.DataFrame(store.read_all("mixtures"))
     counts = Counter()
     for column in ("Component_1", "Component_2", "Component_3"):
         counts.update(str(v).strip() for v in df[column].dropna() if str(v).strip())
@@ -418,7 +495,8 @@ def resolve_component(name, index, allow_lookup=False):
         if row is None:
             import requests
 
-            row = lookup(raw, requests.Session()).model_dump()
+            row, _entries = lookup(raw, requests.Session())
+            row = row.model_dump()
             cache[raw] = row
             _save_cache(cache)
         if row.get("lookup_status") == "ok":
@@ -469,10 +547,12 @@ def prose_components(path=None, index=None):
     '1,5-pentanediol' appears six times in the prose and nowhere in the table -- and
     they are what the PubChem step has to cover beyond the table's own vocabulary.
     """
-    path = path or config.SECTIONS_LLM_CSV
-    if not path.exists():
+    from . import store
+
+    rows = store.read_all("sections_llm")
+    if not rows:
         return []
-    df = pd.read_csv(path)
+    df = pd.DataFrame(rows)
     if "components_resolved" not in df.columns:
         return []
     vocabulary = (index or component_index())["vocabulary"]
@@ -497,12 +577,22 @@ def _save_cache(cache):
     config.COMPONENT_CACHE.write_text(json.dumps(cache, indent=2, ensure_ascii=False))
 
 
-def enrich_all(names, limit=None, network=True, use_nist=False):
+def _stale(row):
+    """An entry cached before the tabular fields and raw source lines existed.
+
+    Re-fetching is needed for both, so it is one pass rather than two, and it means
+    an existing cache heals itself instead of needing to be deleted.
+    """
+    return row.get("lookup_status") == "ok" and (
+        "tpsa" not in row or "property_strings" not in row)
+
+
+def enrich_all(names, limit=None, network=True, use_nist=True):
     """Look up every name, resuming from the cache. -> list[ComponentRow]."""
     import requests
 
     cache = _load_cache()
-    todo = [n for n in names if n not in cache]
+    todo = [n for n in names if n not in cache or _stale(cache[n])]
     if limit is not None:
         todo = todo[:limit]
 
@@ -515,8 +605,11 @@ def enrich_all(names, limit=None, network=True, use_nist=False):
               f"{' (+NIST)' if use_nist else ''}")
         session = requests.Session()
         for i, name in enumerate(todo, 1):
-            row = lookup(name, session, use_nist=use_nist)
-            cache[name] = row.model_dump()
+            row, entries = lookup(name, session, use_nist=use_nist)
+            # The raw source lines ride alongside the row dump. They are far too long
+            # for a CSV column and only the LLM pass reads them; pydantic ignores the
+            # extra key on the way back out.
+            cache[name] = {**row.model_dump(), "property_strings": entries}
             if i % 25 == 0:
                 _save_cache(cache)
                 print(f"    {i}/{len(todo)} done (checkpointed)")

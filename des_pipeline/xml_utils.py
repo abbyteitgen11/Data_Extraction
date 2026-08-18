@@ -73,27 +73,6 @@ def clean_number(s):
         return None
 
 
-def value_and_temperature(entry):
-    """Read one Table 2 property cell -> (value, temperature_C).
-
-    Returns (None, None) when the cell is a dash, a footnote-only marker, or
-    otherwise not a single clean number (e.g. "DT", "140 84.5").
-    """
-    raw = text(entry)
-    if raw in config.DASH:
-        return None, None
-
-    marker = next((s for s in sups(entry) if s in config.TEMP_MAP), None)
-    temp = config.TEMP_MAP[marker] if marker else config.DEFAULT_TEMP
-
-    # The marker letter sometimes lands in the text too: "a1.24" -> "1.24".
-    if marker and raw[:1] == marker:
-        raw = raw[1:]
-
-    value = clean_number(raw)
-    return (value, temp) if value is not None else (None, None)
-
-
 def expand_ref_field(s):
     """'1,26-28' -> [1, 26, 27, 28]. Unparseable fragments are dropped."""
     out = []
@@ -119,10 +98,12 @@ def review_metadata(root):
     """
     core = root.find(".//coredata")
     if core is None:
-        return {"doi": config.REVIEW_DOI}
+        # No fallback on purpose. Returning a default DOI here is what previously
+        # attached one paper's identity to another paper's data.
+        return {}
     get = lambda tag: text(core.find(tag))          # noqa: E731 - reads better inline
     return {
-        "doi": get("doi") or config.REVIEW_DOI,
+        "doi": get("doi"),
         "title": get("title"),
         "authors": "; ".join(text(c) for c in core.findall("creator")),
         "journal": get("publicationName"),

@@ -275,12 +275,14 @@ def _table_index(long_csv=None, table_csv=None):
     """(property, frozenset(normalised components)) -> [(Measurement_key, value)]."""
     import pandas as pd
 
-    long_path = long_csv or config.LONG_CSV
-    table_path = table_csv or config.TABLE_CSV
-    if not long_path.exists() or not table_path.exists():
+    from . import store
+
+    table_rows = store.read_all("mixtures")
+    long_all = store.read_all("measurements")
+    if not table_rows or not long_all:
         return {}
 
-    table = pd.read_csv(table_path)
+    table = pd.DataFrame(table_rows)
     components_by_row = {}
     for r in table.to_dict("records"):
         names = [r.get(f"Component_{i}") for i in (1, 2, 3)]
@@ -288,7 +290,7 @@ def _table_index(long_csv=None, table_csv=None):
         components_by_row[r["Row_id"]] = frozenset(names)
 
     index = {}
-    for r in pd.read_csv(long_path).to_dict("records"):
+    for r in long_all:
         key = (r["Property"], components_by_row.get(r["Row_id"], frozenset()))
         index.setdefault(key, []).append((r["Measurement_key"], float(r["Value"])))
     return index
@@ -453,7 +455,7 @@ def _status_for(row):
     return "ok"
 
 
-def extract_section(section_id, title, text, review_doi="", reference_map=None,
+def extract_section(section_id, title, text, paper_doi="", reference_map=None,
                     index=None, backend=None, allow_lookup=False, refresh_llm=False):
     """-> (list[LLMMeasurement], elapsed_seconds, was_cached) for one prose section."""
     hint = config.PROPERTY_SECTIONS.get(title, "any of the six properties")
@@ -506,7 +508,7 @@ def extract_section(section_id, title, text, review_doi="", reference_map=None,
         mixture = f"{':'.join(resolved)} ({ratio})" if resolved and not unresolved and ratio else ""
 
         ref_numbers, ref_source = harvest_refs(draft, text)
-        cited = sources(ref_numbers, reference_map)
+        cited = sources(ref_numbers, reference_map, paper_doi)
 
         row = LLMMeasurement(
             components=";".join(written),
@@ -531,7 +533,7 @@ def extract_section(section_id, title, text, review_doi="", reference_map=None,
             Source_DOIs=cited["doi"],
             Source_paper_keys=cited["key"],
             ref_source=ref_source,
-            Review_DOI=review_doi,
+            Paper_DOI=paper_doi,
             verified=verified(draft.value, text) if draft.value is not None else False,
         )
         # Content-derived so re-loading is idempotent. Includes the components because
@@ -544,7 +546,7 @@ def extract_section(section_id, title, text, review_doi="", reference_map=None,
 
 
 # ---------- all sections ----------
-def run(sections, review_doi="", reference_map=None, only_property_sections=True,
+def run(sections, paper_doi="", reference_map=None, only_property_sections=True,
         backend=None, allow_lookup=True, refresh_llm=False):
     """Extract from every routed prose section. -> list[LLMMeasurement]."""
     chosen = [
@@ -567,7 +569,7 @@ def run(sections, review_doi="", reference_map=None, only_property_sections=True
     rows, total_seconds, hits = [], 0.0, 0
     for sid, title, text in chosen:
         found, elapsed, was_cached = extract_section(
-            sid, title, text, review_doi, reference_map=reference_map, index=index,
+            sid, title, text, paper_doi, reference_map=reference_map, index=index,
             backend=backend, allow_lookup=allow_lookup, refresh_llm=refresh_llm)
         total_seconds += elapsed
         hits += was_cached

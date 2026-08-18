@@ -154,7 +154,9 @@ def cross_check(candidates, index=None, prose_path=None):
 # ---------- what the paper's own data says (the value-matching cross-check) ----------
 def _table_rows(path=None):
     """Table 2 as (row id, components, ratio, {property: value}) tuples."""
-    df = pd.read_csv(path or config.TABLE_CSV)
+    from . import store
+
+    df = pd.DataFrame(store.read_all("mixtures"))
     rows = []
     for r in df.to_dict("records"):
         comps = [r.get(f"Component_{i}") for i in (1, 2, 3)]
@@ -191,11 +193,13 @@ def candidates_for(unresolved_name, prose_rows, table_rows, rel_tol=1e-3):
 
 def _table_candidates(prose_path=None, index=None):
     """{abbreviation: best Table 2 candidate} for names the prose could not resolve."""
-    path = prose_path or config.SECTIONS_LLM_CSV
-    if not path.exists():
-        return {}
+    from . import store
+
     index = index or component_index()
-    df = pd.read_csv(path)
+    rows_all = store.read_all("sections_llm")
+    if not rows_all:
+        return {}
+    df = pd.DataFrame(rows_all)
     column = "components_written" if "components_written" in df.columns else "components"
     table_rows = _table_rows()
 
@@ -217,11 +221,13 @@ def _table_candidates(prose_path=None, index=None):
 
 def suggest(path=None, index=None):
     """Table 2 candidates for every prose component name that still does not resolve."""
-    path = path or config.SECTIONS_LLM_CSV
-    if not path.exists():
-        return pd.DataFrame()
+    from . import store
+
     index = index or component_index()
-    df = pd.read_csv(path)
+    rows_all = store.read_all("sections_llm")
+    if not rows_all:
+        return pd.DataFrame()
+    df = pd.DataFrame(rows_all)
     column = "components_written" if "components_written" in df.columns else "components"
     table_rows = _table_rows()
 

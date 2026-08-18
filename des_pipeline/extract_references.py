@@ -261,7 +261,7 @@ def enrich_review(review, network=True, cache=None):
 
 
 # ---------- the shape everything downstream reads ----------
-def reference_fields(meta):
+def reference_fields(meta, owner_key):
     """Normalise one reference to flat strings, preferring Crossref over the XML.
 
     Crossref returns HTML-escaped text, so 34 of these journals arrive as
@@ -270,7 +270,7 @@ def reference_fields(meta):
     """
     authors = meta.get("cr_authors") or "; ".join(meta.get("authors") or [])
     fields = {
-        "key": paper_key(meta),
+        "key": paper_key(meta, owner_key),
         "doi": meta.get("doi") or "",
         "match_score": meta.get("match_score"),
         "title_agreement": meta.get("title_agreement"),
@@ -288,7 +288,7 @@ def reference_fields(meta):
     return fields
 
 
-def paper_key(meta, review_doi=None):
+def paper_key(meta, owner_key):
     """Stable node identity: the DOI when Crossref matched one, else '<review>#refN'.
 
     A reference Crossref could not resolve is still a real paper that real
@@ -296,10 +296,13 @@ def paper_key(meta, review_doi=None):
     `doi` cannot do that -- Neo4j uniqueness constraints ignore nulls, so every
     DOI-less reference would collapse into one another silently.
     """
-    return meta.get("doi") or f"{review_doi or config.REVIEW_DOI}#ref{meta['num']}"
+    if not owner_key:
+        raise ValueError("paper_key requires the owning paper's key; a reference must "
+                         "never inherit another paper's identity")
+    return meta.get("doi") or f"{owner_key}#ref{meta['num']}"
 
 
-def sources(ref_numbers, reference_map):
+def sources(ref_numbers, reference_map, owner_key):
     """Aligned per-source metadata for a set of cited reference numbers.
 
     EVERY cited reference is included, whether or not Crossref matched it: `key` is
@@ -315,17 +318,17 @@ def sources(ref_numbers, reference_map):
         meta = (reference_map or {}).get(n)
         if not meta:                        # a citation number with no bibliography entry
             continue
-        fields = reference_fields(meta)
+        fields = reference_fields(meta, owner_key)
         for k in keys:
             collected[k].append(str(fields[k]).replace(config.SOURCE_SEP, "/"))
     return {k: config.SOURCE_SEP.join(v) for k, v in collected.items()}
 
 
-def to_rows(reference_map):
+def to_rows(reference_map, owner_key):
     """-> list[ReferenceRow], ordered by reference number."""
     rows = []
     for meta in sorted(reference_map.values(), key=lambda m: m["num"]):
-        f = reference_fields(meta)
+        f = reference_fields(meta, owner_key)
         rows.append(ReferenceRow(
             ref_number=meta["num"],
             key=f["key"],

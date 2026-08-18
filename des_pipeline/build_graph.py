@@ -37,6 +37,8 @@ CONSTRAINTS = [
     "CREATE CONSTRAINT paper_key IF NOT EXISTS "
     "FOR (p:Paper) REQUIRE p.key IS UNIQUE",
     "CREATE INDEX paper_doi_index IF NOT EXISTS FOR (p:Paper) ON (p.doi)",
+    "CREATE CONSTRAINT source_name IF NOT EXISTS "
+    "FOR (s:Source) REQUIRE s.name IS UNIQUE",
 ] + [
     f"CREATE CONSTRAINT {prop.lower()}_key IF NOT EXISTS "
     f"FOR (x:{prop}) REQUIRE x.key IS UNIQUE"
@@ -145,7 +147,7 @@ def _mixture_rows(table, components_by_name):
             "ratio_flag": r.get("Ratio_flag") or "",
             "component_flag": r.get("Component_flag") or "",
             "components": comps,
-            "review_doi": r.get("Review_DOI") or config.REVIEW_DOI,
+            "paper_doi": r["Paper_DOI"],
             "source_keys": _split(r.get("Source_paper_keys")),
             "ref_numbers": r.get("Source_ref_numbers") or "",
         })
@@ -163,10 +165,66 @@ def _measurement_rows(long_rows):
         "locus": r.get("Locus") or "",
         "origin": "table",
         "evidence": "",
-        "review_doi": r.get("Review_DOI") or config.REVIEW_DOI,
+        "plausible": bool(r.get("plausible", True)),
+        "plausibility_note": r.get("plausibility_note") or "",
+        "dedup_key": r.get("Dedup_key") or "",
+        "paper_doi": r["Paper_DOI"],
         "source_keys": _split(r.get("Source_paper_keys")),
         "ref_numbers": r.get("Source_ref_numbers") or "",
     } for r in long_rows]
+
+
+def _int(value):
+    """CSV ints arrive as floats when the column has any NaN. 1.0 -> 1."""
+    if value is None:
+        return None
+    try:
+        return int(float(value))
+    except (TypeError, ValueError):
+        return None
+
+
+def _component_rows(components_by_name):
+    """components.csv -> the scalar properties that belong on (:Component).
+
+    Kept as its own pass rather than threaded through _mixture_rows and
+    _prose_mixture_rows: those build the nested component list for two different
+    Cypher statements, and eleven more keys in each is a lot of duplication for
+    values that depend only on the component's name.
+    """
+    return [{
+        "name": name,
+        "inchikey": c.get("inchikey"),
+        "molecular_weight": c.get("molecular_weight"),
+        "h_bond_donor_count": _int(c.get("h_bond_donor_count")),
+        "h_bond_acceptor_count": _int(c.get("h_bond_acceptor_count")),
+        "tpsa": c.get("tpsa"),
+        "rotatable_bond_count": _int(c.get("rotatable_bond_count")),
+        "formal_charge": _int(c.get("formal_charge")),
+        "xlogp": c.get("xlogp"),
+        "complexity": c.get("complexity"),
+        "melting_point_C": c.get("melting_point_C"),
+        "boiling_point_C": c.get("boiling_point_C"),
+        "density_g_cm3": c.get("density_g_cm3"),
+    } for name, c in components_by_name.items() if c.get("lookup_status") == "ok"]
+
+
+def _component_property_rows(properties):
+    """component_properties.csv -> one record per measurement, only the loadable ones."""
+    return [{
+        "key": r["key"],
+        "name": r["name"],
+        "property": r["property"],
+        "value": r["value"],
+        "unit": r.get("unit") or "",
+        "temperature_C": r.get("temperature_C"),
+        "pressure": r.get("pressure") or "",
+        "qualifier": r.get("qualifier") or "",
+        "data_source": r.get("data_source") or "",
+        "source_db": r.get("source_db") or "",
+        "raw_string": r.get("raw_string") or "",
+        "extractor": r.get("extractor") or "",
+    } for r in properties if r.get("status") == "ok"]
 
 
 def _prose_measurement_rows(prose):
@@ -180,8 +238,9 @@ def _prose_measurement_rows(prose):
         "temperature_C": r.get("temperature_C"),
         "locus": f"{r.get('section_id') or ''} {r.get('section_title') or ''}".strip(),
         "origin": "prose",
+        "plausible": True, "plausibility_note": "", "dedup_key": "",
         "evidence": r.get("source_text") or "",     # the sentence it was read from
-        "review_doi": r.get("Review_DOI") or config.REVIEW_DOI,
+        "paper_doi": r["Paper_DOI"],
         "source_keys": _split(r.get("Source_paper_keys")),
         "ref_numbers": r.get("Source_ref_numbers") or "",
     } for r in prose]
@@ -216,7 +275,7 @@ def _prose_mixture_rows(prose, components_by_name):
             "mixture": mixture,
             "ratio_raw": r.get("molar_ratio") or "",
             "components": comps,
-            "review_doi": r.get("Review_DOI") or config.REVIEW_DOI,
+            "paper_doi": r["Paper_DOI"],
             "source_keys": _split(r.get("Source_paper_keys")),
             "ref_numbers": r.get("Source_ref_numbers") or "",
         })
@@ -260,8 +319,8 @@ FOREACH (c IN row.components |
     SET part.molar_ratio = c.ratio, part.role = c.role
 )
 
-MERGE (review:Paper {key: row.review_doi})
-  ON CREATE SET review.doi = row.review_doi
+MERGE (review:Paper {key: row.paper_doi})
+  ON CREATE SET review.doi = row.paper_doi
 MERGE (mix)-[:REVIEW_PAPER]->(review)
 
 FOREACH (k IN row.source_keys |
@@ -291,8 +350,8 @@ FOREACH (c IN row.components |
     SET part.molar_ratio = c.ratio, part.role = c.role
 )
 
-MERGE (review:Paper {key: row.review_doi})
-  ON CREATE SET review.doi = row.review_doi
+MERGE (review:Paper {key: row.paper_doi})
+  ON CREATE SET review.doi = row.paper_doi
 MERGE (mix)-[:REVIEW_PAPER]->(review)
 
 FOREACH (k IN row.source_keys |
@@ -302,18 +361,63 @@ FOREACH (k IN row.source_keys |
 )
 """
 
+COMPONENTS_CYPHER = """
+UNWIND $rows AS r
+MATCH (c:Component {name: r.name})
+  SET c.inchikey = r.inchikey,
+      c.molecular_weight = r.molecular_weight,
+      c.h_bond_donor_count = r.h_bond_donor_count,
+      c.h_bond_acceptor_count = r.h_bond_acceptor_count,
+      c.tpsa = r.tpsa,
+      c.rotatable_bond_count = r.rotatable_bond_count,
+      c.formal_charge = r.formal_charge,
+      c.xlogp = r.xlogp,
+      c.complexity = r.complexity,
+      c.melting_point_C = r.melting_point_C,
+      c.boiling_point_C = r.boiling_point_C,
+      c.density_g_cm3 = r.density_g_cm3
+"""
+
+# One node per reported value, each reaching the source that reported it. Uses the
+# same property-as-label idiom and the same `origin` discriminator as the table and
+# prose routes, so a new property in config.PROPERTIES needs no new Cypher here.
+COMPONENT_PROPERTIES_CYPHER = """
+UNWIND $rows AS r
+MATCH (c:Component {{name: r.name}})
+MERGE (p:{label} {{key: r.key}})
+  SET p.value = r.value, p.unit = r.unit, p.temperature_C = r.temperature_C,
+      p.pressure = r.pressure, p.qualifier = r.qualifier,
+      p.property = r.property, p.component = r.name,
+      p.raw_string = r.raw_string, p.extractor = r.extractor,
+      p.origin = 'component'
+MERGE (c)-[has:HAS_{rel}]->(p)
+  SET has.data_source = r.data_source
+
+MERGE (db:Source {{name: r.source_db}})
+  ON CREATE SET db.kind = 'database'
+MERGE (p)-[:REPORTED_IN]->(db)
+
+FOREACH (_ IN CASE WHEN r.data_source <> '' THEN [1] ELSE [] END |
+  MERGE (s:Source {{name: r.data_source}})
+    ON CREATE SET s.kind = 'attribution'
+  MERGE (p)-[:REPORTED_IN]->(s)
+)
+"""
+
 MEASUREMENTS_CYPHER = """
 UNWIND $rows AS r
 MATCH (mix:Mixture {{name: r.mixture}})
 MERGE (m:{label} {{key: r.key}})
   SET m.value = r.value, m.unit = r.unit, m.temperature_C = r.temperature_C,
       m.property = r.property, m.mixture = r.mixture, m.locus = r.locus,
-      m.origin = r.origin, m.evidence = r.evidence
+      m.origin = r.origin, m.evidence = r.evidence,
+      m.plausible = r.plausible, m.plausibility_note = r.plausibility_note,
+      m.dedup_key = r.dedup_key
 MERGE (mix)-[has:HAS_{rel}]->(m)
   SET has.temperature_C = r.temperature_C
 
-MERGE (review:Paper {{key: r.review_doi}})
-  ON CREATE SET review.doi = r.review_doi
+MERGE (review:Paper {{key: r.paper_doi}})
+  ON CREATE SET review.doi = r.paper_doi
 MERGE (m)-[:REVIEW_PAPER]->(review)
 
 FOREACH (k IN r.source_keys |
@@ -325,18 +429,20 @@ FOREACH (k IN r.source_keys |
 
 
 def build(wipe=False, include_prose=True):
-    table = _read(config.TABLE_CSV).to_dict("records")
-    long_rows = _read(config.LONG_CSV).to_dict("records")
-    references = _read(config.REFERENCES_CSV).to_dict("records")
+    from . import store
+
+    table = store.read_all("mixtures")
+    long_rows = store.read_all("measurements")
+    references = store.read_all("references")
 
     # Only rows the prose route judged loadable: a real number, present in the
     # section text, not already in Table 2, and every component name resolved.
     prose = []
-    if include_prose and config.SECTIONS_LLM_CSV.exists():
-        prose_csv = _read(config.SECTIONS_LLM_CSV)
-        if not prose_csv.empty and "status" in prose_csv.columns:
-            prose = [r for r in prose_csv.to_dict("records") if r.get("status") == "ok"]
-            print(f"  {len(prose)} prose measurement(s) of {len(prose_csv)} rows "
+    if include_prose:
+        prose_all = store.read_all("sections_llm")
+        if prose_all:
+            prose = [r for r in prose_all if r.get("status") == "ok"]
+            print(f"  {len(prose)} prose measurement(s) of {len(prose_all)} rows "
                   f"passed the status checks")
 
     components_by_name = {}
@@ -357,22 +463,33 @@ def build(wipe=False, include_prose=True):
     assert not missing, (f"{len(missing)} cited paper keys are absent from "
                          f"references.csv: {list(missing)[:3]}")
 
-    review_row = table[0] if table else {}
+    paper_row = table[0] if table else {}
     review = {
-        "doi": review_row.get("Review_DOI") or config.REVIEW_DOI,
-        "authors": review_row.get("Review_authors") or "",
-        "title": review_row.get("Review_title") or "",
-        "journal": review_row.get("Review_journal") or "",
-        "volume": _str(review_row.get("Review_volume")),
-        "issue": _str(review_row.get("Review_issue")),
-        "year": _str(review_row.get("Review_year")),
+        "doi": paper_row["Paper_DOI"],
+        "authors": paper_row.get("Paper_authors") or "",
+        "title": paper_row.get("Paper_title") or "",
+        "journal": paper_row.get("Paper_journal") or "",
+        "volume": _str(paper_row.get("Paper_volume")),
+        "issue": _str(paper_row.get("Paper_issue")),
+        "year": _str(paper_row.get("Paper_year")),
     }
+
+    component_properties = []
+    if config.COMPONENT_PROPERTIES_CSV.exists():
+        raw = _read(config.COMPONENT_PROPERTIES_CSV)
+        if not raw.empty and "status" in raw.columns:
+            component_properties = raw.to_dict("records")
+            loadable = sum(1 for r in component_properties if r.get("status") == "ok")
+            print(f"  {loadable} component property records of {len(component_properties)} "
+                  f"passed the status checks")
 
     papers = _paper_rows(references)
     mixtures = _mixture_rows(table, components_by_name)
     measurements = _measurement_rows(long_rows)
     prose_mixtures = _prose_mixture_rows(prose, components_by_name)
     prose_measurements = _prose_measurement_rows(prose)
+    component_scalars = _component_rows(components_by_name)
+    property_records = _component_property_rows(component_properties)
 
     driver = _driver()
     try:
@@ -413,6 +530,22 @@ def build(wipe=False, include_prose=True):
             suffix = f"  (+{len(extra)} prose)" if extra else ""
             print(f"  {prop:<18} {len(rows):>5}{suffix}")
 
+        # Component data last: MATCH, not MERGE, so the 133 names that never resolved
+        # cannot become orphan Component nodes.
+        if component_scalars:
+            driver.execute_query(COMPONENTS_CYPHER, rows=component_scalars,
+                                 database_=config.NEO4J_DATABASE)
+            print(f"  component scalars: {len(component_scalars)}")
+
+        for prop in PROPERTY_NAMES:
+            rows = [r for r in property_records if r["property"] == prop]
+            if not rows:
+                continue
+            driver.execute_query(
+                COMPONENT_PROPERTIES_CYPHER.format(label=prop, rel=prop.upper()),
+                rows=rows, database_=config.NEO4J_DATABASE)
+            print(f"  component {prop:<18} {len(rows):>5}")
+
         _report(driver)
     finally:
         driver.close()
@@ -442,6 +575,14 @@ def _report(driver):
         summary = ", ".join(f"{k or 'unset'} {v}" for k, v in sorted(counts.items(),
                                                                     key=lambda kv: -kv[1]))
         print(f"    {label:<14} {summary}")
+
+    sources = query("MATCH (s:Source)<-[:REPORTED_IN]-() "
+                    "RETURN s.name AS name, s.kind AS kind, count(*) AS n "
+                    "ORDER BY n DESC LIMIT 6")
+    if sources:
+        print("  top property sources:")
+        for r in sources:
+            print(f"    {r['name'][:44]:<46}{r['kind']:<14}{r['n']:>6}")
 
     no_doi = query("MATCH (p:Paper) WHERE p.doi IS NULL RETURN count(p) AS n")[0]["n"]
     print(f"    papers without a DOI: {no_doi} (Crossref found no match; "

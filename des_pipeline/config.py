@@ -52,29 +52,62 @@ LLM_CACHE_DIR = RAW_LLM_DIR / "cache"
 COMPONENT_ALIASES = Path(__file__).resolve().parent / "component_aliases.json"
 ALIAS_SUGGESTIONS_CSV = DATA / "alias_suggestions.csv"
 ALIAS_CANDIDATES_CSV = DATA / "alias_candidates.csv"
+COMPONENT_PROPERTIES_CSV = DATA / "component_properties.csv"
 
-# ---------- the paper we are extracting from ----------
-REVIEW_DOI = "10.1016/j.molliq.2023.121899"
+# ---------- papers ----------
+# There is deliberately NO default paper DOI. A constant here was previously used as
+# a fallback whenever a paper's metadata could not be read, which silently stamped one
+# paper's identity onto another's data. Identity now comes from des_pipeline.paper.
+PAPERS_DIR = DATA / "papers"
+PAPERS_CSV = DATA / "papers.csv"
+CROSSREF_CACHE = DATA / "crossref_cache.json"     # shared across papers, keyed by DOI
+DUPLICATES_CSV = DATA / "duplicate_measurements.csv"
+XML_GLOB = "*.xml"
 
 # ---------- Crossref ----------
 MAILTO = os.environ.get("CROSSREF_MAILTO", "abigail.teitgen@csic.es")
 USER_AGENT = f"DES-KG/1.0 (mailto:{MAILTO})"
 MIN_MATCH_SCORE = 40          # Crossref confidence below this is treated as "no match"
 
-# ---------- Table 2 layout ----------
-# Each row of Table 2 has 10 <entry> cells:
-#   0 HBA | 1 HBD | 2 molar ratio | 3..8 the six properties | 9 references
-PROPERTIES = [
-    # (entry index, property name, unit)
-    (3, "Melting_point", "C"),
-    (4, "Density", "g*cm^-3"),
-    (5, "Viscosity", "mPa*s"),
-    (6, "Conductivity", "mS*cm^-1"),
-    (7, "Surface_tension", "mN*m^-1"),
-    (8, "Refractive_index", ""),
-]
-PROPERTY_NAMES = tuple(name for _, name, _ in PROPERTIES)
-PROPERTY_UNITS = {name: unit for _, name, unit in PROPERTIES}
+# ---------- the property vocabulary ----------
+#
+# THE place a property is declared. Add an entry here and it flows into the pydantic
+# Literal, the Neo4j node label and HAS_<PROPERTY> relationship, the uniqueness
+# constraints, and unit handling. Nothing else needs editing.
+#
+#   pugview          the PubChem PUG-View heading, or None if PubChem has no such heading
+#   plausible_range  physically sensible bounds. A value outside is FLAGGED, not
+#                    dropped -- checking the three outliers in the first paper against
+#                    the source showed all three were faithful transcriptions of what
+#                    the paper printed (Tm 2298 C, viscosity 325,000, conductivity
+#                    1548), so a bound violation usually means the SOURCE is wrong or
+#                    used a different unit, which is a judgement only a human makes.
+#                    Seeded from the observed 1st/99th percentiles with headroom.
+#                    Refractive index is the tight, well-behaved one, so a violation
+#                    there is a strong signal of an extraction bug rather than a typo.
+PROPERTIES = {
+    "Melting_point":    {"unit": "C",        "pugview": "Melting Point",
+                         "plausible_range": (-150, 400)},
+    "Boiling_point":    {"unit": "C",        "pugview": "Boiling Point",
+                         "plausible_range": (-100, 600)},
+    "Density":          {"unit": "g*cm^-3",  "pugview": "Density",
+                         "plausible_range": (0.6, 2.5)},
+    "Viscosity":        {"unit": "mPa*s",    "pugview": None,
+                         "plausible_range": (0.1, 200000)},
+    "Conductivity":     {"unit": "mS*cm^-1", "pugview": None,
+                         "plausible_range": (0, 200)},
+    "Surface_tension":  {"unit": "mN*m^-1",  "pugview": None,
+                         "plausible_range": (10, 100)},
+    "Refractive_index": {"unit": "",         "pugview": None,
+                         "plausible_range": (1.2, 1.8)},
+}
+PLAUSIBLE_RANGE = {n: s["plausible_range"] for n, s in PROPERTIES.items()}
+PROPERTY_NAMES = tuple(PROPERTIES)
+PROPERTY_UNITS = {name: spec["unit"] for name, spec in PROPERTIES.items()}
+
+# PUG-View heading -> our property name. Used by the component route.
+PUGVIEW_PROPERTIES = {spec["pugview"]: name for name, spec in PROPERTIES.items()
+                      if spec["pugview"]}
 
 # Prose writes units however the authors felt like it. Map the spellings we have
 # seen onto the table's, so the graph does not end up with g·cm-3, g⋅cm-3 and
@@ -84,6 +117,10 @@ UNIT_ALIASES = {
     "c": "C", "°c": "C", "˚c": "C", "oc": "C", "celsius": "C", "k": "K",
     "g·cm-3": "g*cm^-3", "g⋅cm-3": "g*cm^-3", "g cm-3": "g*cm^-3",
     "g/cm3": "g*cm^-3", "g/cm^3": "g*cm^-3", "g·cm−3": "g*cm^-3", "g/ml": "g*cm^-3",
+    # PubChem's own density spellings. NOTE "g/cu m" is a MILLION times smaller and
+    # is deliberately absent -- only cubic-centimetre forms belong here.
+    "g/cu cm": "g*cm^-3", "g/cm³": "g*cm^-3", "g/cm cu": "g*cm^-3",
+    "gm/cu cm": "g*cm^-3", "g/cc": "g*cm^-3", "kg/l": "g*cm^-3", "kg/dm3": "g*cm^-3",
     "mpa·s": "mPa*s", "mpa⋅s": "mPa*s", "mpa s": "mPa*s", "mpa.s": "mPa*s", "cp": "mPa*s",
     "ms·cm-1": "mS*cm^-1", "ms⋅cm-1": "mS*cm^-1", "ms/cm": "mS*cm^-1",
     "ms cm-1": "mS*cm^-1", "ms·cm−1": "mS*cm^-1",
@@ -91,10 +128,15 @@ UNIT_ALIASES = {
     "mn m-1": "mN*m^-1", "mn·m−1": "mN*m^-1",
 }
 
-# Table 2's footnote: "At a40 C, b20 C, c60 C, d45 C, e30 C, f35 C, g50 C, h55 C".
-# A superscript letter on a value means it was measured at that temperature.
-TEMP_MAP = {"a": 40, "b": 20, "c": 60, "d": 45, "e": 30, "f": 35, "g": 50, "h": 55}
-DEFAULT_TEMP = 25             # everything without a marker is at 25 C
+# Footnote markers used to be hard-coded here, copied from one paper's legend. They
+# now come from that paper's own legend via profile_table, so a second paper with a
+# different convention needs no code change. This is only the fallback for a table
+# whose caption states no measurement temperature at all.
+DEFAULT_TEMP = 25
+
+# Review directory: the queue and the spot-check verdicts a human fills in.
+REVIEW_DIR = DATA / "review"
+REVIEW_QUEUE_CSV = REVIEW_DIR / "queue.csv"
 
 # All the ways the table writes "not reported".
 DASH = {"–", "—", "-", "−", ""}
