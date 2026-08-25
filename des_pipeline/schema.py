@@ -203,6 +203,9 @@ class ComponentRow(BaseModel):
     property_comments: str = ""          # the raw PubChem strings, which are messy
     sources: str = ""                    # "pubchem;nist"
     lookup_status: str = ""              # ok | not_found | error
+    matched_name: str = ""               # the query PubChem actually matched, when it
+                                         # was not `name` verbatim -- e.g. a hydrate
+                                         # reached as "FERRIC CHLORIDE hexahydrate"
 
 
 class ColumnSpec(BaseModel):

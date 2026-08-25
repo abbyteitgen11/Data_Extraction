@@ -138,12 +138,151 @@ def parse_density(strings):
     return None
 
 
+# ---------- hydrates ----------
+# Reviews write hydrates the way a chemist does -- "FeCl3·6H2O" -- and PubChem's name
+# index does not accept that spelling, nor "FeCl3 hexahydrate". It only answers to the
+# fully spelled form, "iron(III) chloride hexahydrate". So every hydrate in the first
+# paper (15 of 18) resolved to nothing at all.
+#
+# The water is not incidental. ChCl:FeCl3·6H2O is a different solvent from ChCl:FeCl3
+# -- different melting point, different viscosity -- so silently substituting the
+# anhydrous salt would be worse than the gap it filled. Nothing here ever does that:
+# a hydrate resolves to that hydrate or to nothing.
+_HYDRATE = re.compile(r"^(.+?)\s*(?:[·⋅•]|\.{1,2})\s*(\d{0,2})\s*H2O$", re.I)
+
+HYDRATE_WORDS = {1: "monohydrate", 2: "dihydrate", 3: "trihydrate", 4: "tetrahydrate",
+                 5: "pentahydrate", 6: "hexahydrate", 7: "heptahydrate",
+                 8: "octahydrate", 9: "nonahydrate", 10: "decahydrate",
+                 11: "undecahydrate", 12: "dodecahydrate"}
+
+# Registry codes and database identifiers, which are synonyms but not names.
+_NOT_A_NAME = re.compile(r"^(ccris|hsdb|nsc|einecs|ec|unii|dtxsid|chebi|chembl|akos|"
+                         r"mfcd|schembl|refchem|cas|dsstox|q\d)\b|[:;]|\d{5,}", re.I)
+
+_ELEMENT = re.compile(r"([A-Z][a-z]?)(\d*)")
+
+
+def split_hydrate(name):
+    """'FeCl3·6H2O' -> ('FeCl3', 6). -> (name, 0) when it is not a hydrate.
+
+    The separator is whatever the paper printed. This one prints "MnCl2·4H2O" but
+    also "AlCl3..6H2O" four rows later -- both are accepted, which additionally
+    stops one compound becoming two nodes over a typographic accident.
+    """
+    match = _HYDRATE.match(str(name or "").strip())
+    if not match:
+        return name, 0
+    count = int(match.group(2)) if match.group(2) else 1
+    return match.group(1).strip(), count
+
+
+def _formula_counts(formula):
+    """'Cl3FeH12O6' -> {'Cl': 3, 'Fe': 1, 'H': 12, 'O': 6}. -> None if unparseable."""
+    text = str(formula or "").strip()
+    if not text or not re.fullmatch(r"(?:[A-Z][a-z]?\d*)+", text):
+        return None
+    counts = {}
+    for element, digits in _ELEMENT.findall(text):
+        counts[element] = counts.get(element, 0) + (int(digits) if digits else 1)
+    return counts
+
+
+def is_hydrate_of(hydrate_formula, anhydrous_formula, n):
+    """Is this formula exactly the anhydrous one plus n waters?
+
+    The check that makes the name search safe to use. Appending "hexahydrate" to a
+    synonym and trusting whatever comes back is how you end up recording chrome alum
+    dodecahydrate as the decahydrate the paper actually named; comparing formulae
+    catches that, and it costs nothing because PubChem already returned the formula.
+    """
+    hydrate = _formula_counts(hydrate_formula)
+    anhydrous = _formula_counts(anhydrous_formula)
+    if not hydrate or not anhydrous or n <= 0:
+        return False
+    expected = dict(anhydrous)
+    expected["H"] = expected.get("H", 0) + 2 * n
+    expected["O"] = expected.get("O", 0) + n
+    return hydrate == expected
+
+
+def _candidate_names(compound, base="", limit=12):
+    """Spelled-out names for a compound, best first, registry codes dropped.
+
+    The name as the paper wrote it goes first, because a paper that spells the salt
+    out ("Manganese chloride·4H2O") has already given the form PubChem wants. A
+    trailing qualifier is dropped -- "Manganese(II) chloride, anhydrous" is a real
+    synonym, and "...anhydrous tetrahydrate" is not a compound.
+    """
+    names, seen = [], set()
+    for candidate in [base, getattr(compound, "iupac_name", None)] + list(
+            getattr(compound, "synonyms", None) or []):
+        text = str(candidate or "").split(",")[0].strip()
+        text = re.sub(r"\s+", " ", text)
+        key = text.lower()
+        if not text or key in seen or _NOT_A_NAME.search(text):
+            continue
+        seen.add(key)
+        names.append(text)
+        if len(names) >= limit:
+            break
+    return names
+
+
 # ---------- the lookups ----------
 def _pubchem_compound(name):
+    """-> (Compound or None, the query that matched when it was not `name`)."""
     import pubchempy as pcp
 
     matches = pcp.get_compounds(name, "name")
-    return matches[0] if matches else None
+    if matches:
+        return matches[0], ""
+
+    base, waters = split_hydrate(name)
+    if waters and HYDRATE_WORDS.get(waters):
+        return _pubchem_hydrate(base, waters)
+    return None, ""
+
+
+def _pubchem_hydrate(base, n):
+    """Reach a hydrate through its anhydrous parent. -> (Compound or None, query).
+
+    Verified by formula, so a near-miss returns nothing rather than the wrong
+    hydration state. Chrome alum is the case that proves it: the paper writes
+    KCr(SO4)2·10H2O, PubChem only has the dodecahydrate, and this declines it.
+    """
+    import pubchempy as pcp
+
+    anhydrous = pcp.get_compounds(base, "name")
+    if not anhydrous:
+        return None, ""
+    parent = anhydrous[0]
+    word = HYDRATE_WORDS[n]
+
+    # Sometimes the "anhydrous" parent is not anhydrous. PubChem answers
+    # "Manganese chloride" with CID 26003, whose formula is Cl2H8MnO4 and whose IUPAC
+    # name ends "...;tetrahydrate" -- it already IS what the paper asked for. Accept it
+    # only when PubChem's own naming says the hydration state matches the one wanted,
+    # and the formula carries enough water to back that up.
+    # Read the IUPAC name directly rather than through _candidate_names: that filter
+    # exists to build *queries* and drops anything containing ";", which is exactly how
+    # PubChem writes a salt ("manganese(2+);dichloride;tetrahydrate").
+    counts = _formula_counts(parent.molecular_formula) or {}
+    named = [getattr(parent, "iupac_name", "") or ""] + list(
+        getattr(parent, "synonyms", None) or [])[:6]
+    if counts.get("H", 0) >= 2 * n and counts.get("O", 0) >= n and any(
+            word in str(name).lower() for name in named):
+        # Report the hydrate's name, not the bare base. CAS is looked up from this
+        # string and then drives the NIST query: "Manganese chloride" resolves to
+        # 7773-01-5, the ANHYDROUS salt, while "Manganese chloride tetrahydrate"
+        # gives 13446-34-9, which is the compound actually in hand.
+        return parent, f"{base} {word}"
+
+    for candidate in _candidate_names(parent, base=base):
+        query = f"{candidate} {word}"
+        for hit in pcp.get_compounds(query, "name") or []:
+            if is_hydrate_of(hit.molecular_formula, parent.molecular_formula, n):
+                return hit, query
+    return None, ""
 
 
 def _cas_number(name, compound):
@@ -264,13 +403,14 @@ def lookup(name, session, use_nist=True):
     provenance, for the LLM pass. The row itself stays scalar because it is a CSV.
     """
     try:
-        compound = _pubchem_compound(name)
+        compound, matched_name = _pubchem_compound(name)
     except Exception as exc:
         return ComponentRow(name=name, lookup_status=f"error: {type(exc).__name__}"), []
     if compound is None:
         return ComponentRow(name=name, lookup_status="not_found"), []
 
-    cas = _cas_number(name, compound)
+    # A hydrate's CAS belongs to the hydrate, so ask under the name that matched it.
+    cas = _cas_number(matched_name or name, compound)
     properties, comments, entries = _pugview_properties(compound.cid, session)
     sources = ["pubchem"]
 
@@ -306,6 +446,7 @@ def lookup(name, session, use_nist=True):
         property_comments=" | ".join(comments),
         sources=";".join(sources),
         lookup_status="ok",
+        matched_name=matched_name,
     )
     return row, entries
 
@@ -578,13 +719,20 @@ def _save_cache(cache):
 
 
 def _stale(row):
-    """An entry cached before the tabular fields and raw source lines existed.
+    """An entry cached before a lookup improvement that would change its answer.
 
-    Re-fetching is needed for both, so it is one pass rather than two, and it means
-    an existing cache heals itself instead of needing to be deleted.
+    Re-fetching heals the cache in place instead of needing it deleted. Two cases:
+
+      * an "ok" row from before the tabular fields and raw source lines existed
+      * a hydrate that failed before `_pubchem_hydrate` knew how to reach one.
+        Bounded by `matched_name`, which every row written since carries: the retry
+        happens once, and a hydrate PubChem genuinely lacks stays not_found without
+        being asked again on every run.
     """
-    return row.get("lookup_status") == "ok" and (
-        "tpsa" not in row or "property_strings" not in row)
+    if row.get("lookup_status") == "ok":
+        return "tpsa" not in row or "property_strings" not in row
+    return (row.get("lookup_status") == "not_found" and "matched_name" not in row
+            and split_hydrate(row.get("name") or "")[1] > 0)
 
 
 def enrich_all(names, limit=None, network=True, use_nist=True):

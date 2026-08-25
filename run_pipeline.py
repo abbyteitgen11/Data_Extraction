@@ -108,10 +108,10 @@ def _run_paper(path, steps, args, network):
 # has to have run at least once.
 # "aliases" is a human-review step -- it proposes abbreviation definitions for you to
 # confirm by hand -- so it is deliberately not part of an "all" run.
-#ALL_STEPS = ["route", "refs", "table", "figures", "text", "aliases",
-#             "components", "validate", "graph"]
+ALL_STEPS = ["route", "refs", "table", "figures", "text", "aliases",
+             "components", "validate", "graph"]
 
-ALL_STEPS = ["validate"]
+#ALL_STEPS = ["validate"]
 
 DEFAULT_STEPS = [s for s in ALL_STEPS if s != "aliases"]
 

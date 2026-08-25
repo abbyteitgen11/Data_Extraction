@@ -113,7 +113,7 @@ Counts below are for the Sadeghi paper.
 | `papers/<slug>/tables_unhandled.csv` | 1 | tables that produced no data, with the reason |
 | `papers/<slug>/table_profiles.json` | — | how each table was read; hand-overridable |
 | `papers.csv` | 1 | the corpus index, one row per paper |
-| `components.csv` | 497 | PubChem identifiers and descriptors |
+| `components.csv` | 498 | PubChem identifiers and descriptors |
 | `component_properties.csv` | 3369 | every reported component property value, with its source |
 | `duplicate_measurements.csv` | 15 | the same datum reported twice, with both values and `agree` |
 | `review/queue.csv` | 42 | the prioritised human worklist |
@@ -351,6 +351,26 @@ Each component is looked up in PubChem for identifiers and descriptors (SMILES, 
 formula, MW, H-bond donor/acceptor counts, TPSA, rotatable bonds, formal charge, XLogP,
 complexity) and in the NIST WebBook for phase-change data. All of it lands on the
 `(:Component)` node.
+
+**Hydrates** need their own route. Reviews write them the way a chemist does —
+`FeCl3·6H2O` — and PubChem's name index accepts neither that nor `FeCl3 hexahydrate`, only
+the fully spelled `iron(III) chloride hexahydrate`. So 15 of this paper's 18 hydrates
+resolved to nothing at all. `_pubchem_hydrate` splits the water off, resolves the anhydrous
+parent, and retries as `<synonym> hexahydrate`.
+
+The water is not incidental — ChCl:FeCl3·6H2O is a different solvent from ChCl:FeCl3 — so
+nothing here ever falls back to the anhydrous salt. Every hit is checked by **formula**:
+it is accepted only if it is the parent plus exactly *n* waters. That is what makes
+appending a word to a synonym safe, and it is why `KCr(SO4)2·10H2O` still resolves to
+nothing: PubChem has chrome alum only as the dodecahydrate, and recording the wrong
+hydration state would be worse than the gap. 16 of 18 now resolve; the two that do not are
+that one and `Lanthanide nitrate six hydrate`, which names a class of elements rather than
+a compound.
+
+`matched_name` records the query that actually matched whenever it was not the name as
+written, so a fuzzy PubChem hit stays auditable. It also drives the CAS lookup, which
+matters: `Manganese chloride` returns CAS 7773-01-5, the *anhydrous* salt, where
+`Manganese chloride tetrahydrate` returns 13446-34-9 — and CAS is what the NIST query uses.
 
 PubChem usually reports a property **more than once, from different sources** — 208 of the
 256 components with text do. The scalar on the node is just the first parseable value;

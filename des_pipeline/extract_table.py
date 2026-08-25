@@ -214,15 +214,25 @@ def extract_property_table(table, profile, paper, reference_map):
 
 
 def _unit_for(column):
-    """Canonicalise the unit the table printed, falling back to the property's own."""
+    """Canonicalise the unit the table printed, falling back to the property's own.
+
+    A property config declares dimensionless takes no unit from the header, whatever
+    the header says. Tables print "nD" over the refractive index column -- the symbol
+    for the quantity (at the sodium D line), not a unit -- and `canonical_unit` keeps
+    unrecognised strings verbatim by design, so it was landing in the data as one.
+
+    Unrecognised units on a property that DOES have one are still kept verbatim: a
+    table printing Pa·s should read as Pa·s, not be quietly relabelled mPa*s.
+    """
     from .extract_text_llm import canonical_unit
 
+    default = config.PROPERTY_UNITS[column.property]
     written = (column.unit_as_written or "").strip().strip("()")
-    if written:
+    if written and default:
         canonical = canonical_unit(written, column.property)
         if canonical:
             return canonical
-    return config.PROPERTY_UNITS[column.property]
+    return default
 
 
 def dedup_key(components, ratio, prop, value, temperature, primary_doi):
