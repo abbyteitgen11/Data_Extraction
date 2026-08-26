@@ -39,7 +39,12 @@ SECTIONS_LLM_CSV = DATA / "sections_llm.csv"
 TABLES_UNHANDLED_CSV = DATA / "tables_unhandled.csv"
 
 # Caches. Expensive to rebuild, so they are kept separate from the outputs.
-REFERENCE_CACHE = DATA / "reference_map.json"      # existing cache, kept in place
+# The pre-corpus cache, keyed by reference number ALONE. That is safe for exactly one
+# paper and catastrophic for two: paper B's reference 40 would read paper A's entry and
+# every REPORTED_IN edge would point at the wrong study. Caches now live per paper at
+# data/papers/<slug>/reference_map.json; this path survives only so the old file can be
+# migrated into the paper it actually belongs to. See extract_references._migrate_legacy.
+LEGACY_REFERENCE_CACHE = DATA / "reference_map.json"
 COMPONENT_CACHE = DATA / "components_cache.json"
 RAW_LLM_DIR = ROOT / "raw_responses"
 # Model responses keyed by content. A full prose run costs 30-45 minutes, so this is
@@ -94,14 +99,23 @@ PROPERTIES = {
                          "plausible_range": (0.6, 2.5)},
     "Viscosity":        {"unit": "mPa*s",    "pugview": None,
                          "plausible_range": (0.1, 200000)},
+    # Electrical conductivity. Kept distinct from Thermal_conductivity below: the names
+    # are close enough that a profiler will confuse them, so `unit_pattern` lets
+    # profile_table.validate reject a label the printed unit contradicts.
     "Conductivity":     {"unit": "mS*cm^-1", "pugview": None,
-                         "plausible_range": (0, 200)},
+                         "plausible_range": (0, 200),
+                         "unit_pattern": r"s\s*[·⋅*/]?\s*(cm|m)"},
+    "Thermal_conductivity": {"unit": "W*m^-1*K^-1", "pugview": None,
+                             "plausible_range": (0.05, 1.0),
+                             "unit_pattern": r"w\s*[·⋅*/]"},
     "Surface_tension":  {"unit": "mN*m^-1",  "pugview": None,
                          "plausible_range": (10, 100)},
     "Refractive_index": {"unit": "",         "pugview": None,
                          "plausible_range": (1.2, 1.8)},
 }
 PLAUSIBLE_RANGE = {n: s["plausible_range"] for n, s in PROPERTIES.items()}
+# Only the properties whose names are confusable need one; absent means "no constraint".
+UNIT_PATTERN = {n: s["unit_pattern"] for n, s in PROPERTIES.items() if s.get("unit_pattern")}
 PROPERTY_NAMES = tuple(PROPERTIES)
 PROPERTY_UNITS = {name: spec["unit"] for name, spec in PROPERTIES.items()}
 
@@ -126,6 +140,10 @@ UNIT_ALIASES = {
     "ms cm-1": "mS*cm^-1", "ms·cm−1": "mS*cm^-1",
     "mn·m-1": "mN*m^-1", "mn⋅m-1": "mN*m^-1", "mn/m": "mN*m^-1",
     "mn m-1": "mN*m^-1", "mn·m−1": "mN*m^-1",
+    # Thermal conductivity, as JATS papers print it (note the U+2212 minus).
+    "w·m−1·k−1": "W*m^-1*K^-1", "w·m-1·k-1": "W*m^-1*K^-1",
+    "w⋅m−1⋅k−1": "W*m^-1*K^-1", "w/(m·k)": "W*m^-1*K^-1", "w/(m k)": "W*m^-1*K^-1",
+    "w/m/k": "W*m^-1*K^-1", "w m-1 k-1": "W*m^-1*K^-1", "w·m−1k−1": "W*m^-1*K^-1",
 }
 
 # Footnote markers used to be hard-coded here, copied from one paper's legend. They

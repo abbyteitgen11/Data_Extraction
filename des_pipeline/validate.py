@@ -33,7 +33,7 @@ from collections import Counter
 import pandas as pd
 
 from . import config, dialects, paper as paper_mod, profile_table, store, xml_utils
-from .extract_table import read_value
+from .extract_table import read_measurement, read_value
 
 
 # ---------- re-reading the source ----------
@@ -95,7 +95,8 @@ def check_fidelity(paper_row, sample=None):
 
         cell = table.rows[index][col]
         spec = columns[row["Table_id"]].get(col)
-        value, temperature, _marker, _note = read_value(cell, spec, profile)
+        value, temperature, _marker, _note = read_measurement(
+            table.rows[index], spec, profile)
         checked += 1
         if value is None or abs(float(value) - float(row["Value"])) > 1e-9:
             mismatches.append({**_ident(row), "problem": "value does not round-trip",
@@ -134,13 +135,16 @@ def skipped_cells(paper_row, write=True):
         property_cols = [c for c in profile.columns if c.role == "property"]
         ragged = {index for index, _ in table.ragged}
         for index, row in enumerate(table.rows):
-            if index in ragged:
+            # A band row holds mixture names, not data, so its cells under a property
+            # column are not values we failed to read -- they are labels we correctly
+            # did not read. Counting them would report 24 phantom losses for Fan.
+            if index in ragged or profile_table._is_band_row(row):
                 continue
             for column in property_cols:
                 if column.index >= len(row):
                     continue
                 cell = row[column.index]
-                value, _temp, _marker, note = read_value(cell, column, profile)
+                value, _temp, _marker, note = read_measurement(row, column, profile)
                 if value is not None or not note or note == "not reported":
                     continue
                 out.append({"Paper_key": paper_row["Paper_key"], "Table_id": table_id,
@@ -313,7 +317,15 @@ def _render_row(table, profile, columns, index, measurements):
     something the reviewer can see rather than assume.
     """
     row = table.rows[index]
-    by_property = {m.get("Property"): m for m in measurements}
+    # A paneled table repeats one property across its panels, so keying the extracted
+    # values by property alone would show one panel's number against all three
+    # columns. Key by source column, which is unique either way.
+    by_column = {}
+    for m in measurements:
+        try:
+            by_column[int(m.get("Source_col"))] = m
+        except (TypeError, ValueError):
+            by_column.setdefault(m.get("Property"), m)
     lines = []
 
     labels = []
@@ -322,21 +334,28 @@ def _render_row(table, profile, columns, index, measurements):
             text = row[column.index].text.strip()
             if text:
                 labels.append(text)
-    lines.append("    " + " | ".join(labels))
+    if not labels:
+        # A paneled row names no components itself; the mixture came from the band row
+        # above it, and the reviewer needs to see which one each column belongs to.
+        labels = [str(m.get("Mixture") or "") for m in measurements]
+    lines.append("    " + " | ".join(dict.fromkeys(labels)))
 
     for column in profile.columns:
         if column.role != "property" or column.index >= len(row):
             continue
         raw = row[column.index].text.strip() or "(empty)"
-        value, temperature, _marker, note = read_value(row[column.index], column, profile)
+        value, temperature, _marker, note = read_measurement(row, column, profile)
+        got = by_column.get(column.index) or by_column.get(column.property)
         if value is None:
             shown = note
         else:
-            got = by_property.get(column.property)
             unit = (got or {}).get("Unit") or ""
             shown = f"-> {value} {unit} @ {temperature}C"
             if got is None:
                 shown += "   <-- re-read finds a value the data does not have!"
+            elif got.get("Mixture") and len(set(
+                    str(m.get("Mixture")) for m in measurements)) > 1:
+                shown += f"   [{got['Mixture']}]"
         lines.append(f"      col {column.index}  {column.property or '':<18}"
                      f"{raw[:14]:<16}{shown}")
 

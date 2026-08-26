@@ -10,9 +10,13 @@ Rather than sprinkling `findall(".//table") or findall(".//table-wrap")` through
 pipeline, everything downstream works with the two normalised structures below, and
 supporting a new publisher means writing one class here.
 
-Only Elsevier is implemented. `detect()` raises on anything else, loudly and by name,
-because the alternative -- guessing -- is what previously let one paper's data be
-filed under another paper's DOI.
+Elsevier and JATS/PMC are implemented. `detect()` raises on anything else, loudly and
+by name, because the alternative -- guessing -- is what previously let one paper's data
+be filed under another paper's DOI.
+
+A dialect answers seven questions about a document: what its tables, figures,
+references, bibliography, sections and glossary are, and what paper it is. Everything
+format-specific lives behind those; nothing downstream reads a publisher's tag names.
 """
 import re
 from dataclasses import dataclass, field
@@ -141,8 +145,13 @@ class Elsevier:
         return root.find(".//coredata") is not None
 
     @staticmethod
+    def article_type(root):
+        """Elsevier's full-text XML states no article type; the caller asks the model."""
+        return ""
+
+    @staticmethod
     def paper_metadata(root):
-        return xml_utils.review_metadata(root)
+        return {**xml_utils.review_metadata(root), "article_type": ""}
 
     @staticmethod
     def tables(root):
@@ -196,6 +205,33 @@ class Elsevier:
                 or root.findall(".//bib-reference"))
 
     @staticmethod
+    def bibliography(elements):
+        """-> {reference number: metadata}. Entries without a numeric label are skipped."""
+        refs = {}
+        for r in elements:
+            label = (r.findtext("label", "") or "").strip("[]")
+            if not label.isdigit():
+                continue
+            authors = []
+            for a in r.findall(".//author"):
+                given = a.findtext("given-name", "") or ""
+                surname = a.findtext("surname", "") or ""
+                authors.append(f"{given} {surname}".strip())
+            # Elsevier's struct-bib nests two <maintitle>s: the article, then the journal.
+            titles = [xml_utils.text(t) for t in r.findall(".//maintitle")]
+            refs[int(label)] = {
+                "num": int(label),
+                "id": r.get("id") or "",
+                "authors": authors,
+                "title": titles[0] if titles else "",
+                "journal": titles[1] if len(titles) > 1 else "",
+                "year": (r.findtext(".//date", "") or "").strip(),
+                "raw": xml_utils.text(r),
+                "doi": None,
+            }
+        return refs
+
+    @staticmethod
     def sections(root):
         """Leaf sections only -- a parent would repeat all of its children's text."""
         body = root.find(".//body")
@@ -213,7 +249,210 @@ class Elsevier:
         return []                                        # Elsevier has no glossary element
 
 
-DIALECTS = (Elsevier,)
+# ---------- JATS / PubMed Central ----------
+class JATS:
+    """NLM JATS as PMC serves it: XHTML tables, <front>/<article-meta>, <ref-list>.
+
+    Used by RSC, MDPI and most PMC-deposited publishers. Two things it gives us that
+    Elsevier does not, both of which remove guesswork rather than adding it:
+
+      * `article-type` states outright whether a paper is a review or primary research,
+        which decides whether its measurements attach to it as a source or as a review.
+      * references frequently carry their own DOI, which beats a fuzzy Crossref match.
+    """
+
+    name = "jats"
+
+    @staticmethod
+    def matches(root):
+        if root.tag == "pmc-articleset":
+            return True
+        meta = root.find(".//processing-meta")
+        return (meta is not None and meta.get("tagset-family") == "jats") or \
+            root.find(".//front/article-meta") is not None
+
+    @staticmethod
+    def _article(root):
+        return root.find(".//article") if root.tag == "pmc-articleset" else root
+
+    @staticmethod
+    def article_type(root):
+        """'review-article' | 'research-article' | ... -- the publisher's own label."""
+        article = JATS._article(root)
+        return (article.get("article-type") or "") if article is not None else ""
+
+    @staticmethod
+    def paper_metadata(root):
+        meta = root.find(".//front/article-meta")
+        if meta is None:
+            return {}
+        journal = root.find(".//front/journal-meta")
+
+        def by_type(tag, attr, value):
+            for el in meta.findall(tag):
+                if el.get(attr) == value:
+                    return xml_utils.text(el)
+            return ""
+
+        authors = []
+        for name in meta.findall('.//contrib[@contrib-type="author"]/name'):
+            given = xml_utils.text(name.find("given-names"))
+            surname = xml_utils.text(name.find("surname"))
+            if given or surname:
+                authors.append(f"{given} {surname}".strip())
+
+        # <pub-date> holds day/month/year as siblings, so text() on the parent fuses
+        # them into "392025". Only the <year> child is the year.
+        year = ""
+        for date in meta.findall("pub-date"):
+            year = xml_utils.text(date.find("year")) or year
+            if date.get("pub-type") in ("epub", "ppub", "collection") and year:
+                break
+
+        pages = ""
+        first, last = xml_utils.text(meta.find("fpage")), xml_utils.text(meta.find("lpage"))
+        if first:
+            pages = f"{first}-{last}" if last else first
+        else:
+            pages = xml_utils.text(meta.find("elocation-id"))
+
+        return {
+            "doi": by_type("article-id", "pub-id-type", "doi"),
+            "title": xml_utils.text(meta.find("title-group/article-title")),
+            "authors": "; ".join(authors),
+            # JATS nests this inside <journal-title-group>, so a direct child lookup
+            # silently returns nothing.
+            "journal": xml_utils.text(journal.find(".//journal-title"))
+            if journal is not None else "",
+            "volume": xml_utils.text(meta.find("volume")),
+            "issue": xml_utils.text(meta.find("issue")),
+            "pages": pages,
+            "year": year,
+            "article_type": JATS.article_type(root),
+        }
+
+    @staticmethod
+    def tables(root):
+        out = []
+        for wrap in root.findall(".//table-wrap"):
+            table = wrap.find(".//table")
+            if table is None:
+                continue
+            header_rows = table.findall(".//thead/tr")
+            body_rows = table.findall(".//tbody/tr")
+
+            def span_of(cell):
+                # XHTML spans say how many cells this one COVERS; _expand wants how many
+                # further rows it still owns, hence the -1.
+                down = int(cell.get("rowspan") or 1) - 1
+                across = int(cell.get("colspan") or 1)
+                return _cell(cell), down, across
+
+            def cells_of(tr):
+                return [c for c in tr if c.tag in ("td", "th")]
+
+            header, width_h, _ = _expand(header_rows, cells_of, span_of)
+            rows, width_b, ragged = _expand(body_rows, cells_of, span_of)
+            width = max(width_h, width_b)
+            for row in header + rows:
+                row += [Cell()] * (width - len(row))
+
+            foot = wrap.find(".//table-wrap-foot")
+            out.append(Table(
+                id=wrap.get("id", ""),
+                label=xml_utils.text(wrap.find("label")),
+                caption=xml_utils.text(wrap.find("caption")),
+                footnotes=xml_utils.text(foot) if foot is not None else "",
+                header=header, rows=rows, ragged=ragged, n_columns=width, element=wrap,
+            ))
+        return out
+
+    @staticmethod
+    def figures(root):
+        out = []
+        for el in root.findall(".//fig"):
+            graphic = el.find(".//graphic")
+            out.append({
+                "id": el.get("id", ""),
+                "label": xml_utils.text(el.find("label")),
+                "caption": xml_utils.text(el.find("caption")),
+                "image_link": (xml_utils.attr_endswith(graphic, "href") or "")
+                if graphic is not None else "",
+            })
+        return out
+
+    @staticmethod
+    def references(root):
+        return root.findall(".//ref-list//ref") or root.findall(".//ref")
+
+    @staticmethod
+    def bibliography(elements):
+        """-> {reference number: metadata}, numbered by position when unlabelled.
+
+        Neither new paper can use the Elsevier rule. Canela-Xandri's 203 <ref>s have no
+        <label> at all; Fan's read "1." which is not `.isdigit()`. JATS orders its
+        bibliography, so position IS the citation number -- and `id` is kept because an
+        in-text <xref rid="cit59"> is an exact link where a number is only a convention.
+        """
+        refs = {}
+        for position, r in enumerate(elements, 1):
+            label = re.sub(r"[^\d]", "", (r.findtext("label", "") or ""))
+            num = int(label) if label else position
+
+            citation = r.find("element-citation")
+            if citation is None:
+                citation = r.find("mixed-citation")
+            source = citation if citation is not None else r
+
+            authors = []
+            for name in source.findall(".//name"):
+                given = xml_utils.text(name.find("given-names"))
+                surname = xml_utils.text(name.find("surname"))
+                if given or surname:
+                    authors.append(f"{given} {surname}".strip())
+
+            doi = ""
+            for pid in source.findall(".//pub-id"):
+                if pid.get("pub-id-type") == "doi":
+                    doi = xml_utils.text(pid)
+                    break
+
+            refs[num] = {
+                "num": num,
+                "id": r.get("id") or "",
+                "authors": authors,
+                "title": xml_utils.text(source.find("article-title")),
+                "journal": xml_utils.text(source.find("source")),
+                "year": xml_utils.text(source.find("year")),
+                "raw": xml_utils.text(r),
+                "doi": doi or None,
+                "doi_source": "xml" if doi else "",
+            }
+        return refs
+
+    @staticmethod
+    def sections(root):
+        """Leaf sections only -- a parent would repeat all of its children's text."""
+        body = root.find(".//body")
+        out = []
+        for position, sec in enumerate(
+                (body if body is not None else root).findall(".//sec"), 1):
+            if sec.findall("sec") or sec.find(".//table-wrap") is not None:
+                continue
+            title = sec.find("title")
+            # RSC's JATS omits @id on every <sec>. An empty id would make several
+            # sections share one identifier downstream, so fall back to position.
+            out.append((sec.get("id") or f"sec{position:02d}",
+                        xml_utils.text(title) if title is not None else "",
+                        xml_utils.text(sec)))
+        return out
+
+    @staticmethod
+    def glossary(root):
+        return root.findall(".//glossary//def-item")
+
+
+DIALECTS = (Elsevier, JATS)
 
 
 def detect(root):

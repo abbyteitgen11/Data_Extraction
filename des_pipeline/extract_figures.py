@@ -24,20 +24,22 @@ def _cited_references(caption):
     return sorted(set(numbers))
 
 
-def parse_figures(figure_elements, review_doi=""):
-    """-> list[FigureRow], one per figure, all flagged for human review."""
+def parse_figures(figures, review_doi=""):
+    """-> list[FigureRow], one per figure, all flagged for human review.
+
+    Takes the dialect's normalised dicts rather than raw elements: Elsevier's
+    `<figure><link xlink:href>` and JATS's `<fig><graphic xlink:href>` differ only in
+    tag names, and resolving that is `dialects`' job, not this module's.
+    """
     rows = []
-    for fig in figure_elements:
-        caption = xml_utils.text(fig.find("caption"))
-        link = fig.find(".//link")
+    for fig in figures:
+        caption = fig.get("caption", "")
         rows.append(FigureRow(
             figure_id=fig.get("id", ""),
-            label=xml_utils.text(fig.find("label")),
+            label=fig.get("label", ""),
             caption=caption,
             cited_ref_numbers=",".join(str(n) for n in _cited_references(caption)),
-            # Namespaces are stripped from tags but not attributes, so the href is
-            # still called "{http://www.w3.org/1999/xlink}href".
-            image_link=xml_utils.attr_endswith(link, "href") or "" if link is not None else "",
+            image_link=fig.get("image_link", ""),
             review_doi=review_doi,
         ))
     return rows

@@ -19,7 +19,7 @@ from .config import PROPERTY_NAMES
 
 PropertyName = Literal[
     "Melting_point", "Boiling_point", "Density", "Viscosity",
-    "Conductivity", "Surface_tension", "Refractive_index",
+    "Conductivity", "Thermal_conductivity", "Surface_tension", "Refractive_index",
 ]
 
 # Guard against the two lists drifting apart — this is the bug that hid all 332
@@ -84,6 +84,10 @@ class MixtureRow(BaseModel):
     Units_refractive_index: Optional[str] = None
     Temperature_refractive_index: Optional[float] = None
     Source_col_refractive_index: Optional[int] = None
+    Thermal_conductivity: Optional[float] = None
+    Units_thermal_conductivity: Optional[str] = None
+    Temperature_thermal_conductivity: Optional[float] = None
+    Source_col_thermal_conductivity: Optional[int] = None
 
     # --- the review paper that contains the table ---
     Paper_DOI: str = ""
@@ -208,6 +212,55 @@ class ComponentRow(BaseModel):
                                          # reached as "FERRIC CHLORIDE hexahydrate"
 
 
+# The same drift guard as PropertyName, one level down. MixtureRow spells its property
+# triples out by hand for readability, so adding a property to config without adding
+# its four fields here would extract the values and then silently drop them on the way
+# into the row -- which is exactly how the melting points were lost before.
+_MISSING_TRIPLES = [
+    f"{prefix}{name if prefix == '' else name.lower()}"
+    for name in PROPERTY_NAMES
+    for prefix in ("", "Units_", "Temperature_", "Source_col_")
+    if f"{prefix}{name if prefix == '' else name.lower()}" not in MixtureRow.model_fields
+]
+assert not _MISSING_TRIPLES, (
+    f"MixtureRow is missing fields for properties in config.PROPERTIES: "
+    f"{_MISSING_TRIPLES}"
+)
+
+
+class ApplicationRow(BaseModel):
+    """One row of a table saying what a DES was USED FOR. -> applications.csv
+
+    `Detail` is deliberately a flat "key=value | key=value" string rather than typed
+    columns: the fields differ from table to table (alcohol/acid here, biomass source
+    and lignin yield there), and inventing a union of every column any paper might
+    print would be a schema nobody could read. The graph unpacks it onto the
+    relationship, where heterogeneity costs nothing.
+    """
+
+    Application_key: str
+    Paper_key: str = ""
+    Paper_DOI: str = ""
+    Table_id: str = ""
+    Source_row: Optional[int] = None
+    Domain: str = ""                     # esterification, biodiesel, ...
+    Table_caption: str = ""
+    Component_1: Optional[str] = None
+    Component_2: Optional[str] = None
+    Component_3: Optional[str] = None
+    Ratio_raw: str = ""
+    Mixture: str = ""
+    Component_flag: str = ""
+    Components_written: str = ""         # as the table printed them, before resolution
+    Implied_components: str = ""         # taken from the caption, not from a column
+    Detail: str = ""
+    Source_ref_numbers: str = ""
+    Source_DOIs: str = ""
+    Source_paper_keys: str = ""
+    Source_titles: str = ""
+    Source_years: str = ""
+
+
 class ColumnSpec(BaseModel):
     """What one column of a table means. The model labels; it never reads values."""
 
@@ -263,15 +316,31 @@ class TableProfile(BaseModel):
 
     relevant: bool = Field(
         description="False when the table carries no deep-eutectic-solvent data.")
-    record_type: Literal["des_properties", "des_application",
+    record_type: Literal["des_properties", "des_application", "des_definitions",
                          "component_properties", "other"] = Field(
         description="des_properties = measured physical properties of DES mixtures; "
                     "des_application = a DES used FOR something (source, target, "
-                    "technique); component_properties = properties of single pure "
-                    "compounds; other = anything else.")
+                    "technique, yield); des_definitions = a table that only NAMES DES, "
+                    "giving each an abbreviation or code, with no measurements; "
+                    "component_properties = properties of single pure compounds; "
+                    "other = anything else, including fitted equation parameters.")
+    layout: Literal["wide_per_mixture", "paneled_by_mixture"] = Field(
+        description="wide_per_mixture = one data row per DES, properties in fixed "
+                    "columns. paneled_by_mixture = the SAME column pattern repeats "
+                    "across the table (e.g. T, value, T, value, T, value) and the DES "
+                    "each group belongs to is named in a spanning row above its data, "
+                    "not in a column.")
     reason: str = Field(description="One sentence on why, for a human reading the log.")
     header_row_count: int = Field(
         description="How many of the leading rows are header rather than data.")
+    implied_components: list[str] = Field(
+        description="Components every row contains that NO column lists, stated in the "
+                    "caption instead -- a caption reading 'PTSA based DES' with only an "
+                    "HBA column means PTSA is in every mixture. Empty unless the caption "
+                    "actually says so. Never guess from the paper's subject.")
+    implied_from: str = Field(
+        description="The exact caption words that justify implied_components, so a human "
+                    "can check the inference. Empty when there are none.")
     columns: list[ColumnSpec] = Field(
         description="Exactly one entry per column index, in order, 0..N-1.")
     footnote_markers: list[FootnoteMarker] = Field(

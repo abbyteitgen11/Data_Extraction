@@ -44,14 +44,20 @@ def _run_paper(path, steps, args, network):
     """Everything that happens to one paper. -> the Paper."""
     root = xml_utils.load_root(path)
     dialect = dialects.detect(root)
-    pap = paper_mod.from_metadata(dialect.paper_metadata(root), path, dialect.name)
+    meta = {**dialect.paper_metadata(root), "_path": str(path)}
+    # Review or primary research decides whether this paper's own measurements cite it
+    # as a source or as a review of someone else's. JATS states it; Elsevier does not,
+    # so that falls back to the title and then to the model.
+    is_review = paper_mod.classify_is_review(meta, allow_llm=network)
+    pap = paper_mod.from_metadata(meta, path, dialect.name, is_review=is_review)
     if not pap.has_doi:
         raise ValueError(f"{path.name}: no DOI in its metadata; refusing to file its "
                          f"data under a guessed identity")
 
     print(f"\n=== {pap.slug}  {pap.key}  [{dialect.name}] ===")
     print(f"    {pap.title[:78]}")
-    routed = router.route(root)
+    print(f"    {pap.article_type or 'article type not stated'} -> {pap.role}")
+    routed = router.route(root, dialect)
 
     if "route" in steps:
         print()
@@ -63,10 +69,10 @@ def _run_paper(path, steps, args, network):
         from des_pipeline import extract_references as refs
 
         print("references:")
-        reference_map = refs.parse_bibliography(routed.references)
-        reference_map = refs.resolve_all(reference_map, network=network)
-        reference_map = refs.enrich_all(reference_map, network=network)
-        routed.review = refs.enrich_review(routed.review, network=network)
+        reference_map = refs.parse_bibliography(routed.references, dialect)
+        reference_map = refs.resolve_all(reference_map, pap, network=network)
+        reference_map = refs.enrich_all(reference_map, pap, network=network)
+        routed.review = refs.enrich_review(routed.review, pap, network=network)
         if "refs" in steps:
             store.write(refs.to_rows(reference_map, pap.key), "references", pap)
 
@@ -75,14 +81,27 @@ def _run_paper(path, steps, args, network):
 
         print("tables:")
         profiles, problems = profile_table.profile_tables(
-            dialect.tables(root), pap, refresh=args.refresh_profiles)
-        mixtures, measurements, skipped = tables.extract_tables(
-            dialect.tables(root), profiles, pap, reference_map)
+            routed.tables, pap, refresh=args.refresh_profiles)
+        mixtures, measurements, skipped, definitions = tables.extract_tables(
+            routed.tables, profiles, pap, reference_map)
         store.write(mixtures, "mixtures", pap, model=tables.MixtureRow)
         store.write(measurements, "measurements", pap, model=tables.MeasurementRow)
         if skipped:
             store.write(skipped, "skipped_rows", pap)
-        store.write(tables.unhandled(dialect.tables(root), profiles, problems),
+        if definitions:
+            store.write([{"Paper_key": pap.key, "abbreviation": d["label"],
+                          "components": ";".join(d["components"]),
+                          "ratio_raw": d["ratio_raw"]}
+                         for d in definitions.values()], "des_definitions", pap)
+
+        from des_pipeline import extract_applications as applications
+        from des_pipeline.schema import ApplicationRow
+
+        used_for = applications.extract_applications(routed.tables, profiles, pap,
+                                                     reference_map)
+        if used_for:
+            store.write(used_for, "applications", pap, model=ApplicationRow)
+        store.write(tables.unhandled(routed.tables, profiles, problems),
                     "tables_unhandled", pap)
 
     if "figures" in steps:
@@ -180,9 +199,13 @@ def main(argv=None):
         print("components:")
         names = components.distinct_components()
         extra = components.prose_components()          # names seen only in the prose
+        used = components.application_components()     # names seen only in applications
         if extra:
             print(f"  {len(extra)} prose-only component(s): {', '.join(extra)}")
-        rows = components.enrich_all(names + extra, limit=args.limit,
+        if used:
+            print(f"  {len(used)} application-only component(s): {', '.join(used[:8])}"
+                  f"{'...' if len(used) > 8 else ''}")
+        rows = components.enrich_all(names + extra + used, limit=args.limit,
                                      network=network, use_nist=not args.no_nist)
         xml_utils.write_csv(rows, config.COMPONENTS_CSV)
 
@@ -201,7 +224,7 @@ def main(argv=None):
         from des_pipeline import validate
 
         print("validate:")
-        ok = validate.report(interactive=not args.review, sample=args.sample)
+        ok = validate.report(interactive=args.review, sample=args.sample)
         print(f"\n  overall: {'PASS' if ok else 'needs attention'}")
 
     # --- graph ------------------------------------------------------------

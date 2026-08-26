@@ -707,6 +707,34 @@ def prose_components(path=None, index=None):
     return names
 
 
+def application_components(index=None):
+    """Component names that appear only in application tables. -> list[str].
+
+    The applications route was invisible to enrichment, which reads the property
+    tables. That left 61 of 557 Component nodes with no CID, no descriptors and -- the
+    part that actually matters -- no alias resolution, so `ChCl` sat in the graph as a
+    node of its own instead of joining `Choline chloride`. A PTSA-based solvent used
+    for esterification and the same solvent measured in another paper's table were two
+    unconnected things.
+    """
+    from . import store
+
+    rows = store.read_all("applications")
+    if not rows:
+        return []
+    vocabulary = (index or component_index())["vocabulary"]
+    names, seen = [], set()
+    for row in rows:
+        for i in (1, 2, 3):
+            name = str(row.get(f"Component_{i}") or "").strip()
+            if not name or name.lower() == "nan":
+                continue
+            if name not in vocabulary and name not in seen:
+                seen.add(name)
+                names.append(name)
+    return names
+
+
 def _load_cache():
     if config.COMPONENT_CACHE.exists():
         return json.loads(config.COMPONENT_CACHE.read_text())

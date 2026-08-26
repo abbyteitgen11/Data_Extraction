@@ -22,7 +22,9 @@ and any ML training want.
 import re
 
 from . import config, xml_utils
-from .extract_references import sources
+from . import profile_table
+from .extract_references import numbers_for_ids as ref_numbers_for_ids, sources
+from .profile_table import _is_band_row, panel_period
 from .schema import MeasurementRow, MixtureRow, TableRow  # re-exported for the driver
 
 
@@ -40,32 +42,42 @@ def parse_ratio(text, markers=()):
     return raw, xml_utils.split_ratio(stripped), flag
 
 
-def splittable(text):
-    """Is a "/" in this cell separating two components, or part of one name?
+# Separators a paper uses to pack more than one component into a single cell.
+# ":" needs surrounding spaces: "ChCl : PTSA" is two components, but a bare "1:2" is a
+# ratio and "N,N:2" would be part of a name.
+_SEPARATORS = ("/", " : ", " + ")
 
-    Reviews pack ternary mixtures into one cell as "Caffeic acid/Ethylene glycol",
-    but "/" also appears inside a single name as a stereodescriptor -- "D/L-Proline"
-    is racemic proline, not proline plus something called D. Requiring every piece to
-    carry at least three letters distinguishes them: on the real table this splits all
-    176 genuine ternary cells and none of the 14 racemates.
+
+def splittable(text, separator="/"):
+    """Is this separator dividing two components, or part of one name?
+
+    Reviews pack mixtures into one cell as "Caffeic acid/Ethylene glycol" or
+    "ChCl : PTSA", but "/" also appears inside a single name as a stereodescriptor --
+    "D/L-Proline" is racemic proline, not proline plus something called D. Requiring
+    every piece to carry at least three letters distinguishes them: on the first
+    paper's table this splits all 176 genuine ternary cells and none of the 14
+    racemates.
     """
-    parts = [p.strip() for p in str(text or "").split("/")]
+    parts = [p.strip() for p in str(text or "").split(separator)]
     if len(parts) < 2:
         return False
     return all(len(re.findall(r"[A-Za-z]", p)) >= 3 for p in parts)
 
 
+def split_component_cell(text):
+    """One component cell -> the components it names."""
+    text = str(text or "").strip()
+    for separator in _SEPARATORS:
+        if splittable(text, separator):
+            return [p.strip() for p in text.split(separator) if p.strip()]
+    return [text] if text else []
+
+
 def parse_components(names):
-    """-> ([up to 3 names], flag). A cell may pack several components with "/"."""
+    """-> ([up to 3 names], flag). A cell may pack several components."""
     comps = []
     for name in names:
-        text = str(name or "").strip()
-        if not text:
-            continue
-        if splittable(text):
-            comps += [c.strip() for c in text.split("/") if c.strip()]
-        else:
-            comps.append(text)
+        comps += split_component_cell(name)
     flag = "quaternary+" if len(comps) > 3 else ""
     return (comps + [None, None, None])[:3], flag
 
@@ -119,11 +131,274 @@ def read_value(cell, column, profile):
     return value, temperature, marker, ""
 
 
+def read_measurement(row, column, profile):
+    """One property cell in its row -> (value, temperature_C, marker, note).
+
+    The single entry point for re-reading a value, so `validate` cannot disagree with
+    the extractor about what a cell says. It exists because temperature reaches a
+    measurement two different ways: from a footnote marker in a wide table, and from a
+    sibling column in a paneled one. Reading only the marker would have re-derived
+    every one of Fan's 144 measurements at the default 25 C and reported them all as
+    fidelity failures.
+    """
+    value, temperature, marker, note = read_value(row[column.index], column, profile)
+    if value is None:
+        return value, temperature, marker, note
+
+    condition = _condition_for(column, profile)
+    if condition is not None and condition.index < len(row):
+        from_column = read_condition(row[condition.index], condition)
+        if from_column is not None:
+            temperature = from_column
+    return value, temperature, marker, note
+
+
+def _condition_for(column, profile):
+    """The condition column governing this property column, within its panel.
+
+    Only paneled tables take temperature from a column; a wide table encodes it in
+    footnote markers, and reaching for a stray `condition` column there is actively
+    dangerous. A profiler once labelled Sadeghi's melting-point column `condition`,
+    and without this guard every one of that table's other properties was re-stamped
+    with the melting point as its measurement temperature.
+    """
+    period = panel_period([c.role for c in profile.columns])
+    if period < 2 or "component" in [c.role for c in profile.columns]:
+        return None
+    start = (column.index // period) * period
+    return next((c for c in profile.columns[start:start + period]
+                 if c.role == "condition"), None)
+
+
+def read_references(cell, reference_map):
+    """Which references a citation cell points at. -> list[int].
+
+    The cell's own `<xref rid>` links win where the format has them, because they are
+    what the publisher asserted rather than what the cell happens to print. Elsevier's
+    tables carry no rids, so those fall back to parsing "[40,42-44]" as before.
+    """
+    linked = ref_numbers_for_ids(cell.ref_ids, reference_map)
+    if linked:
+        return linked
+    return xml_utils.expand_ref_field(cell.text.strip("[]").replace("–", "-"))
+
+
 def _looks_like_header(row, profile):
     """A repeated header row inside the body: its cells echo the header text."""
     printed = {c.header.strip().lower() for c in profile.columns if c.header.strip()}
     cells = [c.text.strip().lower() for c in row if c.text.strip()]
     return bool(cells) and sum(c in printed for c in cells) >= max(2, len(cells) // 2)
+
+
+def mixture_record(paper, table, index, ordinal, components, ratios, ratio_raw="",
+                   ratio_flag="", component_flag="", ref_text="", ref_numbers=(),
+                   cited=None, context=""):
+    """The provenance-carrying half of a MixtureRow, shared by both layouts.
+
+    Every mixture row records the same thing about where it came from, whatever the
+    table looked like; only *finding* the components differs between a wide table and
+    a paneled one.
+    """
+    cited = cited or {k: "" for k in ("doi", "key", "authors", "title", "journal",
+                                      "volume", "issue", "pages", "year")}
+    c1, c2, c3 = components
+    r1, r2, r3 = ratios
+    names = ":".join(n for n in (c1, c2, c3) if n)
+    record = {
+        "Row_id": f"{paper.slug}:{table.id}:{ordinal:04d}",
+        "Paper_key": paper.key, "Paper_DOI": paper.doi,
+        "Paper_authors": paper.authors, "Paper_title": paper.title,
+        "Paper_journal": paper.journal, "Paper_volume": paper.volume,
+        "Paper_issue": paper.issue, "Paper_year": paper.year,
+        "Table_id": table.id, "Source_row": index,
+        "Component_1": c1, "Component_2": c2, "Component_3": c3,
+        "Ratio_component_1": r1, "Ratio_component_2": r2, "Ratio_component_3": r3,
+        "Ratio_raw": ratio_raw,
+        "Mixture": f"{names} ({ratio_raw})" if ratio_raw else names,
+        "Ratio_flag": ratio_flag, "Component_flag": component_flag,
+        "DOI": paper.doi, "Ref": ref_text,
+        "Source_ref_numbers": ",".join(str(n) for n in ref_numbers),
+        "Source_DOIs": cited["doi"], "Source_paper_keys": cited["key"],
+        "Source_authors": cited["authors"], "Source_titles": cited["title"],
+        "Source_journals": cited["journal"], "Source_volumes": cited["volume"],
+        "Source_issues": cited["issue"], "Source_pages": cited["pages"],
+        "Source_years": cited["year"],
+        "Context": context,
+    }
+    for name in config.PROPERTY_NAMES:
+        suffix = name.lower()
+        record[name] = None
+        record[f"Units_{suffix}"] = None
+        record[f"Temperature_{suffix}"] = None
+        record[f"Source_col_{suffix}"] = None
+    return record
+
+
+def with_implied(names, profile):
+    """Add components the caption states but no column lists. -> list[str].
+
+    Canela-Xandri's Tables 1 and 7 print only the HBA because the caption already says
+    every mixture is "PTSA based"; Tables 4 and 5 spell "ChCl : PTSA" out in full. Not
+    adding it would leave the same solvent as two unrelated one-component mixtures.
+
+    The cells are split BEFORE the check, or "ChCl : PTSA" reads as one unfamiliar
+    string and PTSA gets appended to a mixture that already contains it.
+    """
+    split = [c for name in names for c in split_component_cell(name)]
+    implied = [n for n in (profile.implied_components or []) if n and n.strip()]
+    if not implied:
+        return split
+    present = {_component_key(n) for n in split if n}
+    return split + [n for n in implied if _component_key(n) not in present]
+
+
+def _component_key(name):
+    """Normalise a component name for identity comparison.
+
+    Drops a leading stoichiometric coefficient: this paper writes "ChCl : 2PTSA" for
+    two equivalents of PTSA, which is the same compound as "PTSA" and must not have a
+    second PTSA implied alongside it.
+    """
+    return re.sub(r"^\d+", "", re.sub(r"\W+", "", str(name or "")).lower())
+
+
+def read_condition(cell, column):
+    """A temperature printed in its own column -> Celsius.
+
+    Fan tabulates T/K alongside every value instead of encoding it in a footnote
+    marker, so the conversion the marker path did by lookup has to happen by unit here.
+    """
+    value = xml_utils.clean_number(cell.text)
+    if value is None:
+        return None
+    unit = str(column.unit_as_written or "").strip().strip("()/ ").lower()
+    if unit.startswith("k"):
+        return round(value - 273.15, 3)
+    if unit.startswith("f"):
+        return round((value - 32) * 5 / 9, 3)
+    return round(value, 3)
+
+
+def extract_paneled_table(table, profile, paper, reference_map, definitions=None):
+    """A table whose column pattern repeats, one panel per DES. -> (rows, skipped).
+
+    Fan's thermal-conductivity table is 3 panels of (T, lambda) with the DES named in a
+    row spanning each panel. `_expand` has already broadcast those spanning cells
+    across their columns, so the mixture for a panel is just the band row's text at
+    that panel's first column -- no span arithmetic is needed here.
+    """
+    period = panel_period([c.role for c in profile.columns])
+    if period < 2:
+        return [], [{"Table_id": table.id, "Source_row": -1,
+                     "reason": "paneled layout with no repeating column group",
+                     "raw": ""}]
+
+    panels = [profile.columns[start:start + period]
+              for start in range(0, len(profile.columns), period)]
+    rows, skipped = [], []
+    ragged = {index for index, _ in table.ragged}
+    current = {}                       # panel number -> the label naming its mixture
+
+    for index, row in enumerate(table.rows):
+        if index in ragged or _looks_like_header(row, profile):
+            continue
+        if _is_band_row(row):
+            for n, panel in enumerate(panels):
+                first = panel[0].index
+                if first < len(row) and row[first].text.strip():
+                    current[n] = row[first].text.strip()
+            continue
+
+        for n, panel in enumerate(panels):
+            label = current.get(n)
+            if not label:
+                continue
+            property_col = next((c for c in panel if c.role == "property"), None)
+            condition_col = next((c for c in panel if c.role == "condition"), None)
+            if property_col is None or property_col.index >= len(row):
+                continue
+
+            value, marker_temp, _marker, note = read_value(
+                row[property_col.index], property_col, profile)
+            if value is None:
+                if note and note not in ("not reported",):
+                    skipped.append({"Table_id": table.id, "Source_row": index,
+                                    "reason": note,
+                                    "raw": row[property_col.index].text[:120]})
+                continue
+
+            temperature = marker_temp
+            if condition_col is not None and condition_col.index < len(row):
+                from_column = read_condition(row[condition_col.index], condition_col)
+                if from_column is not None:
+                    temperature = from_column
+
+            defined = (definitions or {}).get(_definition_key(label))
+            if defined:
+                names, ratio_raw = defined["components"], defined["ratio_raw"]
+            else:
+                names, ratio_raw = [label], ""
+            (c1, c2, c3), component_flag = parse_components(with_implied(names, profile))
+
+            record = mixture_record(
+                paper, table, index, len(rows) + 1,
+                components=(c1, c2, c3),
+                ratios=xml_utils.split_ratio(ratio_raw),
+                ratio_raw=ratio_raw, component_flag=component_flag,
+                cited=sources([], reference_map, paper.key),
+                context=f"panel={label}")
+            suffix = property_col.property.lower()
+            record[property_col.property] = value
+            record[f"Units_{suffix}"] = _unit_for(property_col)
+            record[f"Temperature_{suffix}"] = temperature
+            record[f"Source_col_{suffix}"] = property_col.index
+            rows.append(MixtureRow(**record))
+    return rows, skipped
+
+
+def _definition_key(text):
+    return re.sub(r"\W+", "", str(text or "")).lower()
+
+
+def extract_definitions(table, profile, paper):
+    """A table that only NAMES mixtures. -> {key: {components, ratio_raw, label}}.
+
+    Fan's Table 2 is the only thing that says what "[ChCl][Gl]3" means, and its data
+    tables label their panels with nothing else. This is the same
+    abbreviation-is-authoritative idea as component_aliases.json, except the paper
+    defines it in its own table so nobody has to write it out by hand.
+    """
+    by_role = {}
+    for column in profile.columns:
+        by_role.setdefault(column.role, []).append(column)
+    component_cols = by_role.get("component", [])
+    ratio_cols = by_role.get("ratio", [])
+    # Find the naming column by what its header SAYS, across every role. Fan's
+    # "Abbreviation" column was labelled `reference` -- understandable, since
+    # "[ChCl][Gl]3" looks like a citation key -- and restricting the search by role
+    # would have lost the one column the whole table exists to provide.
+    label_cols = [c for c in profile.columns
+                  if c.role != "component"
+                  and re.search(r"abbrev|acronym|code|symbol|short|label|des\b|name",
+                                c.header or "", re.I)]
+
+    out = {}
+    for row in table.rows:
+        if _looks_like_header(row, profile) or _is_band_row(row):
+            continue
+        label = next((row[c.index].text.strip() for c in label_cols
+                      if c.index < len(row) and row[c.index].text.strip()), "")
+        names = [row[c.index].text for c in component_cols if c.index < len(row)]
+        names = [n for n in names if n and n.strip()]
+        if not label or not names:
+            continue
+        # A split ratio ("1 | 3") is two ratio columns, one number each.
+        parts = [row[c.index].text.strip() for c in ratio_cols if c.index < len(row)]
+        parts = [p for p in parts if p]
+        ratio_raw = ":".join(parts) if len(parts) > 1 else (parts[0] if parts else "")
+        out[_definition_key(label)] = {"label": label, "components": names,
+                                       "ratio_raw": ratio_raw}
+    return out
 
 
 def extract_property_table(table, profile, paper, reference_map):
@@ -162,34 +437,19 @@ def extract_property_table(table, profile, paper, reference_map):
 
         ref_text, ref_numbers = "", []
         if ref_col is not None and ref_col.index < len(row):
-            ref_text = row[ref_col.index].text.strip("[]").replace("–", "-")
-            ref_numbers = xml_utils.expand_ref_field(ref_text)
+            cell = row[ref_col.index]
+            ref_text = cell.text.strip("[]").replace("–", "-")
+            ref_numbers = read_references(cell, reference_map)
         cited = sources(ref_numbers, reference_map, paper.key)
 
-        mixture_names = ":".join(n for n in (c1, c2, c3) if n)
-        record = {
-            "Row_id": f"{paper.slug}:{table.id}:{len(rows) + 1:04d}",
-            "Paper_key": paper.key, "Paper_DOI": paper.doi,
-            "Paper_authors": paper.authors, "Paper_title": paper.title,
-            "Paper_journal": paper.journal, "Paper_volume": paper.volume,
-            "Paper_issue": paper.issue, "Paper_year": paper.year,
-            "Table_id": table.id, "Source_row": index,
-            "Component_1": c1, "Component_2": c2, "Component_3": c3,
-            "Ratio_component_1": r1, "Ratio_component_2": r2, "Ratio_component_3": r3,
-            "Ratio_raw": ratio_raw,
-            "Mixture": f"{mixture_names} ({ratio_raw})" if ratio_raw else mixture_names,
-            "Ratio_flag": ratio_flag, "Component_flag": component_flag,
-            "DOI": paper.doi, "Ref": ref_text,
-            "Source_ref_numbers": ",".join(str(n) for n in ref_numbers),
-            "Source_DOIs": cited["doi"], "Source_paper_keys": cited["key"],
-            "Source_authors": cited["authors"], "Source_titles": cited["title"],
-            "Source_journals": cited["journal"], "Source_volumes": cited["volume"],
-            "Source_issues": cited["issue"], "Source_pages": cited["pages"],
-            "Source_years": cited["year"],
-            "Context": " | ".join(f"{c.context_field or c.header}={row[c.index].text}"
-                                  for c in context_cols if c.index < len(row)
-                                  and row[c.index].text)[:300],
-        }
+        record = mixture_record(
+            paper, table, index, len(rows) + 1,
+            components=(c1, c2, c3), ratios=(r1, r2, r3), ratio_raw=ratio_raw,
+            ratio_flag=ratio_flag, component_flag=component_flag,
+            ref_text=ref_text, ref_numbers=ref_numbers, cited=cited,
+            context=" | ".join(f"{c.context_field or c.header}={row[c.index].text}"
+                               for c in context_cols if c.index < len(row)
+                               and row[c.index].text)[:300])
 
         # Every declared property gets its triple; the ones this table lacks stay null.
         for name in config.PROPERTY_NAMES:
@@ -301,22 +561,41 @@ def _plausibility(prop, value):
 
 
 def extract_tables(tables, profiles, paper, reference_map):
-    """Every profiled property table in one paper. -> (mixtures, measurements, skipped)."""
+    """Every profiled table in one paper. -> (mixtures, measurements, skipped).
+
+    Definition tables are read first, because a paneled table's panels are labelled
+    with abbreviations that only a definition table explains.
+    """
+    definitions = {}
+    for table in tables:
+        profile = profiles.get(table.id)
+        if profile is not None and profile.relevant \
+                and profile.record_type == "des_definitions":
+            found = extract_definitions(table, profile, paper)
+            definitions.update(found)
+            print(f"    {table.label or table.id}: {len(found)} DES definition(s)")
+
     mixtures, skipped = [], []
     for table in tables:
         profile = profiles.get(table.id)
         if profile is None or not profile.relevant:
             continue
         if profile.record_type != "des_properties":
-            print(f"    {table.label or table.id}: {profile.record_type} -- no extractor "
-                  f"for that record type yet, skipping")
-            continue
-        rows, bad = extract_property_table(table, profile, paper, reference_map)
+            continue                              # applications and definitions elsewhere
+        if profile_table.detected_layout(profile, table) == "paneled_by_mixture":
+            rows, bad = extract_paneled_table(table, profile, paper, reference_map,
+                                              definitions)
+        else:
+            rows, bad = extract_property_table(table, profile, paper, reference_map)
         mixtures += rows
         skipped += [{**b, "Paper_key": paper.key} for b in bad]
         print(f"    {table.label or table.id}: {len(rows)} rows"
+              f"{f' [{profile.layout}]' if profile.layout != 'wide_per_mixture' else ''}"
               f"{f', {len(bad)} unreadable' if bad else ''}")
-    return mixtures, to_measurements(mixtures, paper), skipped
+    return mixtures, to_measurements(mixtures, paper), skipped, definitions
+
+
+EXTRACTED_TYPES = ("des_properties", "des_application", "des_definitions")
 
 
 def unhandled(tables, profiles, problems):
@@ -324,7 +603,8 @@ def unhandled(tables, profiles, problems):
     out = []
     for table in tables:
         profile = profiles.get(table.id)
-        if profile is not None and profile.relevant and profile.record_type == "des_properties":
+        if profile is not None and profile.relevant \
+                and profile.record_type in EXTRACTED_TYPES:
             continue
         if profile is None:
             reason = "; ".join(problems.get(table.id, ["no usable profile"]))[:300]

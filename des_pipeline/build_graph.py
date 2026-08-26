@@ -116,7 +116,7 @@ def _paper_rows(references):
     return papers
 
 
-def _mixture_rows(table, components_by_name):
+def _mixture_rows(table, components_by_name, roles=None):
     """One record per mixture, with components pre-filtered into a nested list.
 
     Doing the null-filtering in Python (rather than three FOREACH blocks in Cypher)
@@ -148,30 +148,91 @@ def _mixture_rows(table, components_by_name):
             "component_flag": r.get("Component_flag") or "",
             "components": comps,
             "paper_doi": r["Paper_DOI"],
-            "source_keys": _split(r.get("Source_paper_keys")),
+            # A research paper is its own source, so its mixtures get REPORTED_IN
+            # rather than REVIEW_PAPER; the Cypher branches on these two lists.
+            "review_papers": ([] if (roles or {}).get(r.get("Paper_key")) == "primary"
+                              else [r.get("Paper_key") or r["Paper_DOI"]]),
+            "source_keys": (_split(r.get("Source_paper_keys")) or
+                            ([r["Paper_key"]]
+                             if (roles or {}).get(r.get("Paper_key")) == "primary"
+                             else [])),
             "ref_numbers": r.get("Source_ref_numbers") or "",
         })
     return rows
 
 
-def _measurement_rows(long_rows):
-    return [{
-        "key": r["Measurement_key"],
-        "mixture": r["Mixture"],
-        "property": r["Property"],
-        "value": r["Value"],
-        "unit": r.get("Unit"),
-        "temperature_C": r.get("Temperature_C"),
-        "locus": r.get("Locus") or "",
+def _measurement_rows(long_rows, roles=None):
+    """One row per DISTINCT datum, not per report of it. -> list[dict].
+
+    Two reviews tabulating the same primary measurement are reporting one fact, and
+    the graph should hold one node for it with an edge to each paper -- otherwise
+    counting measurements counts publications. `Dedup_key` already identifies them:
+    same component set, ratio, property, value, temperature and originating study.
+
+    Merging is refused when the values disagree. Two papers printing different numbers
+    for what should be the same datum is a finding, not noise, so both nodes stay and
+    `validate.duplicate_report` puts the pair in front of a human.
+    """
+    roles = roles or {}
+    groups = {}
+    for r in long_rows:
+        # Rows with no dedup key are their own group, keyed uniquely so they never merge.
+        key = r.get("Dedup_key") or f"__{r['Measurement_key']}"
+        groups.setdefault(key, []).append(r)
+
+    rows = []
+    for dedup_key, members in groups.items():
+        values = {round(float(m["Value"]), 6) for m in members if m.get("Value") is not None}
+        if len(members) > 1 and len(values) > 1:
+            # A real disagreement: keep every report separate and let review decide.
+            for m in members:
+                rows.append(_one_measurement(m, [m], roles, m["Measurement_key"]))
+            continue
+        node_key = (f"dedup:{dedup_key}" if len(members) > 1
+                    else members[0]["Measurement_key"])
+        rows.append(_one_measurement(members[0], members, roles, node_key))
+    return rows
+
+
+def _one_measurement(first, members, roles, node_key):
+    """Assemble one property node from every row that reports the same value."""
+    review_papers, primary_papers, refs, mixtures, member_keys = [], [], [], [], []
+    for m in members:
+        member_keys.append(m["Measurement_key"])
+        if m.get("Mixture") and m["Mixture"] not in mixtures:
+            mixtures.append(m["Mixture"])
+        containing = m.get("Paper_key") or m.get("Paper_DOI") or ""
+        # A review reports someone else's measurement; a research paper reports its
+        # own, so it is the primary source rather than a review of nobody.
+        target = primary_papers if roles.get(containing) == "primary" else review_papers
+        if containing and containing not in target:
+            target.append(containing)
+        for k in _split(m.get("Source_paper_keys")):
+            if k not in primary_papers:
+                primary_papers.append(k)
+        if m.get("Source_ref_numbers"):
+            refs.append(str(m["Source_ref_numbers"]))
+
+    return {
+        "key": node_key,
+        "mixture": first["Mixture"],
+        "mixtures": mixtures,
+        "property": first["Property"],
+        "value": first["Value"],
+        "unit": first.get("Unit"),
+        "temperature_C": first.get("Temperature_C"),
+        "locus": first.get("Locus") or "",
         "origin": "table",
         "evidence": "",
-        "plausible": bool(r.get("plausible", True)),
-        "plausibility_note": r.get("plausibility_note") or "",
-        "dedup_key": r.get("Dedup_key") or "",
-        "paper_doi": r["Paper_DOI"],
-        "source_keys": _split(r.get("Source_paper_keys")),
-        "ref_numbers": r.get("Source_ref_numbers") or "",
-    } for r in long_rows]
+        "plausible": bool(first.get("plausible", True)),
+        "plausibility_note": first.get("plausibility_note") or "",
+        "dedup_key": first.get("Dedup_key") or "",
+        "member_keys": member_keys,
+        "n_reports": len(members),
+        "review_papers": review_papers,
+        "source_keys": primary_papers,
+        "ref_numbers": ",".join(refs),
+    }
 
 
 def _int(value):
@@ -194,6 +255,11 @@ def _component_rows(components_by_name):
     """
     return [{
         "name": name,
+        # How PubChem was actually reached, when it was not by this name -- a hydrate
+        # resolved as "FERRIC CHLORIDE hexahydrate". Without it on the node, the only
+        # record of a fuzzy match lives in a CSV and the graph looks more certain than
+        # it is.
+        "matched_name": c.get("matched_name") or "",
         "inchikey": c.get("inchikey"),
         "molecular_weight": c.get("molecular_weight"),
         "h_bond_donor_count": _int(c.get("h_bond_donor_count")),
@@ -293,12 +359,16 @@ MERGE (paper:Paper {key: p.key})
       paper.raw = p.raw, paper.role = 'primary'
 """
 
-REVIEW_CYPHER = """
-MERGE (paper:Paper {key: $review.doi})
-  SET paper.doi = $review.doi, paper.authors = $review.authors, paper.title = $review.title,
-      paper.journal = $review.journal, paper.volume = $review.volume,
-      paper.issue = $review.issue, paper.year = $review.year,
-      paper.role = 'review'
+# The papers we extracted FROM. Written after PAPERS_CYPHER so that a paper which is
+# both cited by one review and extracted by us keeps its own role and metadata rather
+# than the thinner reference-list version.
+CORPUS_CYPHER = """
+UNWIND $corpus AS p
+MERGE (paper:Paper {key: p.key})
+  SET paper.doi = p.doi, paper.authors = p.authors, paper.title = p.title,
+      paper.journal = p.journal, paper.volume = p.volume, paper.issue = p.issue,
+      paper.pages = p.pages, paper.year = p.year, paper.role = p.role,
+      paper.extracted = true
 """
 
 MIXTURES_CYPHER = """
@@ -319,9 +389,11 @@ FOREACH (c IN row.components |
     SET part.molar_ratio = c.ratio, part.role = c.role
 )
 
-MERGE (review:Paper {key: row.paper_doi})
-  ON CREATE SET review.doi = row.paper_doi
-MERGE (mix)-[:REVIEW_PAPER]->(review)
+FOREACH (k IN row.review_papers |
+  MERGE (review:Paper {key: k})
+    ON CREATE SET review.doi = k
+  MERGE (mix)-[:REVIEW_PAPER]->(review)
+)
 
 FOREACH (k IN row.source_keys |
   MERGE (src:Paper {key: k})
@@ -329,6 +401,75 @@ FOREACH (k IN row.source_keys |
     SET rep.ref_numbers = row.ref_numbers
 )
 """
+
+# What a DES was used FOR. The domain is a node so "which solvents do esterification"
+# is one hop; the row's own columns -- alcohol, acid, biomass source, yield -- ride on
+# the relationship, because they differ from table to table and would otherwise force
+# an Application node per row with nothing shared between them.
+APPLICATIONS_CYPHER = """
+UNWIND $rows AS row
+MERGE (app:Application {domain: row.domain})
+  ON CREATE SET app.example_caption = row.caption
+
+MERGE (mix:Mixture {name: row.mixture})
+  ON CREATE SET mix.ratio_raw = row.ratio_raw, mix.origin = 'application'
+
+FOREACH (c IN row.components |
+  MERGE (comp:Component {name: c.name})
+    ON CREATE SET comp.origin = 'application'
+  MERGE (comp)-[part:PART_OF]->(mix)
+    SET part.role = c.role
+)
+
+MERGE (mix)-[used:USED_IN {key: row.key}]->(app)
+  SET used.detail = row.detail, used.paper_key = row.paper_key,
+      used.table_id = row.table_id, used.source_row = row.source_row,
+      used.implied_components = row.implied_components
+
+FOREACH (k IN row.review_papers |
+  MERGE (review:Paper {key: k})
+  MERGE (app)-[:REVIEW_PAPER]->(review)
+)
+
+FOREACH (k IN row.source_keys |
+  MERGE (src:Paper {key: k})
+  MERGE (app)-[:REPORTED_IN]->(src)
+)
+"""
+
+
+def _application_rows(applications, roles=None):
+    """applications.csv -> the shape APPLICATIONS_CYPHER wants."""
+    roles = roles or {}
+    rows = []
+    for r in applications:
+        comps = []
+        for i, role in ((1, "HBA"), (2, "HBD"), (3, "HBD")):
+            name = r.get(f"Component_{i}")
+            if name and str(name).strip() and str(name) != "nan":
+                comps.append({"name": str(name).strip(), "role": role})
+        if not comps or not r.get("Mixture"):
+            continue
+        containing = r.get("Paper_key") or ""
+        is_primary = roles.get(containing) == "primary"
+        rows.append({
+            "key": r["Application_key"],
+            "domain": r.get("Domain") or "unspecified",
+            "caption": r.get("Table_caption") or "",
+            "mixture": r["Mixture"],
+            "ratio_raw": r.get("Ratio_raw") or "",
+            "components": comps,
+            "detail": r.get("Detail") or "",
+            "implied_components": r.get("Implied_components") or "",
+            "paper_key": containing,
+            "table_id": r.get("Table_id") or "",
+            "source_row": _int(r.get("Source_row")),
+            "review_papers": [] if is_primary else ([containing] if containing else []),
+            "source_keys": (_split(r.get("Source_paper_keys")) or
+                            ([containing] if is_primary and containing else [])),
+        })
+    return rows
+
 
 # One block per property. The label cannot be parameterised in Cypher without
 # APOC, so it is substituted from config.PROPERTY_NAMES — our own constant, never
@@ -364,7 +505,8 @@ FOREACH (k IN row.source_keys |
 COMPONENTS_CYPHER = """
 UNWIND $rows AS r
 MATCH (c:Component {name: r.name})
-  SET c.inchikey = r.inchikey,
+  SET c.matched_name = r.matched_name,
+      c.inchikey = r.inchikey,
       c.molecular_weight = r.molecular_weight,
       c.h_bond_donor_count = r.h_bond_donor_count,
       c.h_bond_acceptor_count = r.h_bond_acceptor_count,
@@ -406,19 +548,27 @@ FOREACH (_ IN CASE WHEN r.data_source <> '' THEN [1] ELSE [] END |
 
 MEASUREMENTS_CYPHER = """
 UNWIND $rows AS r
-MATCH (mix:Mixture {{name: r.mixture}})
 MERGE (m:{label} {{key: r.key}})
   SET m.value = r.value, m.unit = r.unit, m.temperature_C = r.temperature_C,
       m.property = r.property, m.mixture = r.mixture, m.locus = r.locus,
       m.origin = r.origin, m.evidence = r.evidence,
       m.plausible = r.plausible, m.plausibility_note = r.plausibility_note,
-      m.dedup_key = r.dedup_key
-MERGE (mix)-[has:HAS_{rel}]->(m)
-  SET has.temperature_C = r.temperature_C
+      m.dedup_key = r.dedup_key,
+      m.member_keys = r.member_keys, m.n_reports = r.n_reports
 
-MERGE (review:Paper {{key: r.paper_doi}})
-  ON CREATE SET review.doi = r.paper_doi
-MERGE (m)-[:REVIEW_PAPER]->(review)
+// A merged datum attaches to every naming of the mixture, since two papers can order
+// the components differently while meaning the same solvent.
+FOREACH (name IN r.mixtures |
+  MERGE (mix:Mixture {{name: name}})
+  MERGE (mix)-[has:HAS_{rel}]->(m)
+    SET has.temperature_C = r.temperature_C
+)
+
+FOREACH (k IN r.review_papers |
+  MERGE (review:Paper {{key: k}})
+    ON CREATE SET review.doi = k
+  MERGE (m)-[:REVIEW_PAPER]->(review)
+)
 
 FOREACH (k IN r.source_keys |
   MERGE (src:Paper {{key: k}})
@@ -463,17 +613,6 @@ def build(wipe=False, include_prose=True):
     assert not missing, (f"{len(missing)} cited paper keys are absent from "
                          f"references.csv: {list(missing)[:3]}")
 
-    paper_row = table[0] if table else {}
-    review = {
-        "doi": paper_row["Paper_DOI"],
-        "authors": paper_row.get("Paper_authors") or "",
-        "title": paper_row.get("Paper_title") or "",
-        "journal": paper_row.get("Paper_journal") or "",
-        "volume": _str(paper_row.get("Paper_volume")),
-        "issue": _str(paper_row.get("Paper_issue")),
-        "year": _str(paper_row.get("Paper_year")),
-    }
-
     component_properties = []
     if config.COMPONENT_PROPERTIES_CSV.exists():
         raw = _read(config.COMPONENT_PROPERTIES_CSV)
@@ -483,9 +622,20 @@ def build(wipe=False, include_prose=True):
             print(f"  {loadable} component property records of {len(component_properties)} "
                   f"passed the status checks")
 
+    # Which of the papers we extracted from report their own measurements. A research
+    # article is the primary source for its data; a review is not.
+    roles = {p["Paper_key"]: p.get("role", "review") for p in store.papers()}
+    corpus = [{"key": p["Paper_key"], "doi": p.get("Paper_DOI") or "",
+               "authors": p.get("authors") or "", "title": p.get("title") or "",
+               "journal": p.get("journal") or "", "volume": str(p.get("volume") or ""),
+               "issue": str(p.get("issue") or ""), "pages": str(p.get("pages") or ""),
+               "year": str(p.get("year") or ""), "role": p.get("role", "review")}
+              for p in store.papers()]
+
     papers = _paper_rows(references)
-    mixtures = _mixture_rows(table, components_by_name)
-    measurements = _measurement_rows(long_rows)
+    applications = _application_rows(store.read_all("applications"), roles)
+    mixtures = _mixture_rows(table, components_by_name, roles)
+    measurements = _measurement_rows(long_rows, roles)
     prose_mixtures = _prose_mixture_rows(prose, components_by_name)
     prose_measurements = _prose_measurement_rows(prose)
     component_scalars = _component_rows(components_by_name)
@@ -504,11 +654,20 @@ def build(wipe=False, include_prose=True):
             driver.execute_query(statement, database_=config.NEO4J_DATABASE)
 
         driver.execute_query(PAPERS_CYPHER, papers=papers, database_=config.NEO4J_DATABASE)
-        driver.execute_query(REVIEW_CYPHER, review=review, database_=config.NEO4J_DATABASE)
-        print(f"  papers: {len(papers)} primary + 1 review")
+        driver.execute_query(CORPUS_CYPHER, corpus=corpus, database_=config.NEO4J_DATABASE)
+        extracted_reviews = sum(1 for p in corpus if p["role"] == "review")
+        print(f"  papers: {len(papers)} cited + {len(corpus)} extracted "
+              f"({extracted_reviews} review, {len(corpus) - extracted_reviews} primary)")
 
         driver.execute_query(MIXTURES_CYPHER, rows=mixtures, database_=config.NEO4J_DATABASE)
         print(f"  mixtures: {len(mixtures)} rows")
+
+        if applications:
+            driver.execute_query(APPLICATIONS_CYPHER, rows=applications,
+                                 database_=config.NEO4J_DATABASE)
+            domains = sorted({a["domain"] for a in applications})
+            print(f"  applications: {len(applications)} rows across "
+                  f"{len(domains)} domain(s) -- {', '.join(domains)}")
 
         if prose_mixtures:
             # Separate statement using ON CREATE SET, so a prose row can never

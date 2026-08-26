@@ -20,47 +20,76 @@ import time
 
 import requests
 
-from . import config, xml_utils
+from . import config, paper as paper_mod
 from .schema import ReferenceRow
 
 
 # ---------- 1. read the bibliography out of the XML ----------
-def parse_bibliography(reference_elements):
-    """-> {reference number: metadata dict}. Entries without a numeric label are skipped."""
-    refs = {}
-    for r in reference_elements:
-        label = (r.findtext("label", "") or "").strip("[]")
-        if not label.isdigit():
-            continue
-        authors = []
-        for a in r.findall(".//author"):
-            given = a.findtext("given-name", "") or ""
-            surname = a.findtext("surname", "") or ""
-            authors.append(f"{given} {surname}".strip())
-        # Elsevier's struct-bib nests two <maintitle>s: the article, then the journal.
-        titles = [xml_utils.text(t) for t in r.findall(".//maintitle")]
-        refs[int(label)] = {
-            "num": int(label),
-            "authors": authors,
-            "title": titles[0] if titles else "",
-            "journal": titles[1] if len(titles) > 1 else "",
-            "year": (r.findtext(".//date", "") or "").strip(),
-            "raw": xml_utils.text(r),
-            "doi": None,
-        }
-    return refs
+def parse_bibliography(reference_elements, dialect):
+    """-> {reference number: metadata dict}, via the format's own reader.
+
+    Bibliographies differ more than tables do. Elsevier labels every entry `[40]`;
+    Canela-Xandri's JATS has no <label> at all and Fan's are "1." -- neither of which
+    is `.isdigit()`, so the old Elsevier-only parser silently returned {} for both.
+    Each dialect now reads its own, and numbering falls back to list position.
+    """
+    return dialect.bibliography(reference_elements)
 
 
 # ---------- cache ----------
-def load_cache(path=None):
-    path = path or config.REFERENCE_CACHE
-    if not path.exists():
+# Reference numbers are meaningful only inside one paper: Sadeghi's [40] and
+# Canela-Xandri's [40] are different studies. The cache is therefore per paper, and
+# `paper` is a required argument everywhere -- a default would be an invitation to
+# reintroduce exactly the cross-paper bleed this replaced.
+def cache_path(paper):
+    return config.PAPERS_DIR / paper.slug / "reference_map.json"
+
+
+def _migrate_legacy(paper, refs):
+    """Adopt data/reference_map.json for the paper it actually belongs to. -> dict.
+
+    The old global cache holds one paper's 343 resolved references and it would be
+    wasteful to re-query them. But it carries no record of whose they are, so it is
+    adopted only when its entries demonstrably match this paper's own bibliography:
+    the `raw` citation strings have to agree. A mismatch means the file belongs to a
+    different paper, and it is ignored rather than trusted.
+    """
+    legacy = config.LEGACY_REFERENCE_CACHE
+    if not legacy.exists() or not refs:
         return {}
-    return {int(k): v for k, v in json.loads(path.read_text()).items()}
+    try:
+        cached = {int(k): v for k, v in json.loads(legacy.read_text()).items()}
+    except (ValueError, TypeError):
+        return {}
+
+    shared = [n for n in cached if n in refs and cached[n].get("raw")]
+    if not shared:
+        return {}
+    agree = sum(1 for n in shared
+                if str(cached[n].get("raw", ""))[:60] == str(refs[n].get("raw", ""))[:60])
+    if agree < 0.9 * len(shared):
+        print(f"    legacy reference cache does not match {paper.slug} "
+              f"({agree}/{len(shared)} citations agree) -- ignoring it")
+        return {}
+    print(f"    migrated {len(cached)} cached references from "
+          f"{legacy.name} ({agree}/{len(shared)} citations agree)")
+    return cached
 
 
-def save_cache(cache, path=None):
-    path = path or config.REFERENCE_CACHE
+def load_cache(paper, refs=None):
+    """The paper's own resolved references, migrating the legacy file once if needed."""
+    path = cache_path(paper)
+    if path.exists():
+        return {int(k): v for k, v in json.loads(path.read_text()).items()}
+    migrated = _migrate_legacy(paper, refs or {})
+    if migrated:
+        save_cache(migrated, paper)
+    return migrated
+
+
+def save_cache(cache, paper):
+    path = cache_path(paper)
+    path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(cache, indent=2, ensure_ascii=False))
 
 
@@ -70,6 +99,23 @@ def apply_cache(reference_map, cache):
         if num in reference_map:
             reference_map[num] = {**reference_map[num], **cached}
     return reference_map
+
+
+# ---------- the shared, DOI-keyed Crossref cache ----------
+# Unlike a reference number, a DOI means the same thing in every paper, so this one IS
+# corpus-wide. Two reviews citing the same study then cost one lookup, not two.
+def load_crossref_cache():
+    if not config.CROSSREF_CACHE.exists():
+        return {}
+    try:
+        return json.loads(config.CROSSREF_CACHE.read_text())
+    except (ValueError, TypeError):
+        return {}
+
+
+def save_crossref_cache(cache):
+    config.CROSSREF_CACHE.parent.mkdir(parents=True, exist_ok=True)
+    config.CROSSREF_CACHE.write_text(json.dumps(cache, indent=2, ensure_ascii=False))
 
 
 # ---------- 2. Crossref: find the DOI ----------
@@ -107,8 +153,15 @@ def crossref_search(meta, session, max_retries=5):
 
 
 # ---------- 3. Crossref: full metadata for a known DOI ----------
-def crossref_metadata(doi, session, max_retries=3):
-    """GET works/{doi} -> the cr_* fields. Exact lookup, so no scoring needed."""
+def crossref_metadata(doi, session, max_retries=3, shared=None):
+    """GET works/{doi} -> the cr_* fields. Exact lookup, so no scoring needed.
+
+    `shared` is the corpus-wide DOI-keyed cache. Because the lookup is keyed by DOI it
+    is paper-independent, so the second review to cite a study pays nothing for it.
+    """
+    key = paper_mod.normalise_doi(doi)
+    if shared is not None and key in shared:
+        return shared[key]
     wait = 2.0
     for attempt in range(max_retries):
         try:
@@ -132,7 +185,7 @@ def crossref_metadata(doi, session, max_retries=3):
             continue
 
         parts = (m.get("published") or m.get("issued") or {}).get("date-parts") or [[None]]
-        return {
+        fields = {
             "cr_authors": "; ".join(
                 f"{a.get('given', '')} {a.get('family', '')}".strip()
                 for a in m.get("author", [])
@@ -144,6 +197,9 @@ def crossref_metadata(doi, session, max_retries=3):
             "pages": m.get("page") or m.get("article-number") or "",
             "cr_year": str(parts[0][0] or ""),
         }
+        if shared is not None:
+            shared[key] = fields
+        return fields
     return None
 
 
@@ -160,10 +216,23 @@ def _title_agreement(a, b):
     return round(len(wa & wb) / len(wa), 3)
 
 
-def resolve_all(reference_map, cache=None, network=True):
-    """Fill in DOIs. Entries already flagged _resolved are never re-requested."""
-    cache = cache if cache is not None else load_cache()
+def resolve_all(reference_map, paper, cache=None, network=True):
+    """Fill in DOIs. Entries already flagged _resolved are never re-requested.
+
+    A reference that states its own DOI -- JATS `<pub-id pub-id-type="doi">`, which
+    76/203 and 33/34 of the two new papers carry -- needs no search at all. The
+    publisher's own assertion beats a fuzzy bibliographic match, so those are marked
+    resolved with a perfect score before Crossref is ever asked.
+    """
+    cache = cache if cache is not None else load_cache(paper, reference_map)
     reference_map = apply_cache(reference_map, cache)
+
+    for meta in reference_map.values():
+        if meta.get("doi") and not meta.get("_resolved"):
+            meta["match_score"] = meta.get("match_score", 100.0)
+            meta["doi_source"] = meta.get("doi_source") or "xml"
+            meta["_resolved"] = True
+
     todo = [n for n, m in reference_map.items() if not m.get("_resolved")]
 
     if not network:
@@ -181,22 +250,23 @@ def resolve_all(reference_map, cache=None, network=True):
         doi, score = crossref_search(meta, session)
         meta["doi"] = doi if score >= config.MIN_MATCH_SCORE else None
         meta["match_score"] = score
+        meta["doi_source"] = "crossref_search" if meta["doi"] else ""
         meta["_resolved"] = True
         cache[num] = meta
         time.sleep(0.05)
         if i % 25 == 0:
-            save_cache(cache)
+            save_cache(cache, paper)
             print(f"    {i}/{len(todo)} resolved (checkpointed)")
 
-    save_cache({**cache, **reference_map})
+    save_cache({**cache, **reference_map}, paper)
     have = sum(1 for m in reference_map.values() if m.get("doi"))
     print(f"  resolve: {have}/{len(reference_map)} have a DOI (score >= {config.MIN_MATCH_SCORE})")
     return reference_map
 
 
-def enrich_all(reference_map, cache=None, network=True):
+def enrich_all(reference_map, paper, cache=None, network=True):
     """Add volume/issue/pages/authoritative authors for every resolved DOI."""
-    cache = cache if cache is not None else load_cache()
+    cache = cache if cache is not None else load_cache(paper, reference_map)
     reference_map = apply_cache(reference_map, cache)
     todo = [n for n, m in reference_map.items() if m.get("doi") and not m.get("_enriched")]
 
@@ -210,9 +280,13 @@ def enrich_all(reference_map, cache=None, network=True):
 
     print(f"  enrich:  {len(todo)} DOIs via Crossref works/{{doi}}")
     session = requests.Session()
+    shared = load_crossref_cache()
+    reused = 0
     for i, num in enumerate(sorted(todo), 1):
         meta = reference_map[num]
-        extra = crossref_metadata(meta["doi"], session)
+        before = len(shared)
+        extra = crossref_metadata(meta["doi"], session, shared=shared)
+        reused += int(len(shared) == before and extra is not None)
         if extra:
             meta.update(extra)
             meta["title_agreement"] = _title_agreement(meta.get("title", ""), extra["cr_title"])
@@ -220,30 +294,36 @@ def enrich_all(reference_map, cache=None, network=True):
         cache[num] = meta
         time.sleep(0.05)
         if i % 25 == 0:
-            save_cache(cache)
+            save_cache(cache, paper)
+            save_crossref_cache(shared)
             print(f"    {i}/{len(todo)} enriched (checkpointed)")
 
-    save_cache({**cache, **reference_map})
+    save_cache({**cache, **reference_map}, paper)
+    save_crossref_cache(shared)
+    if reused:
+        print(f"  enrich:  {reused} DOI(s) already known from another paper")
     with_vol = sum(1 for m in reference_map.values() if m.get("volume"))
     print(f"  enrich:  {with_vol}/{len(reference_map)} now have a volume")
     return reference_map
 
 
-def enrich_review(review, network=True, cache=None):
-    """Top up the review's own metadata from Crossref.
+def enrich_review(review, paper, network=True, cache=None):
+    """Top up the paper's own metadata from Crossref.
 
     Elsevier's <coredata> carries no issue number, so the paper we are extracting
     from goes through the same lookup as every paper it cites. Cached under key 0,
     which no real reference number uses.
     """
-    cache = cache if cache is not None else load_cache()
+    cache = cache if cache is not None else load_cache(paper)
     cached = cache.get(0)
     if cached:
         return {**review, **cached}
     if not network or not review.get("doi"):
         return review
 
-    extra = crossref_metadata(review["doi"], requests.Session())
+    shared = load_crossref_cache()
+    extra = crossref_metadata(review["doi"], requests.Session(), shared=shared)
+    save_crossref_cache(shared)
     if not extra:
         return review
     merged = {
@@ -256,7 +336,7 @@ def enrich_review(review, network=True, cache=None):
         "year": extra["cr_year"] or review.get("year", ""),
     }
     cache[0] = merged
-    save_cache(cache)
+    save_cache(cache, paper)
     return {**review, **merged}
 
 
@@ -300,6 +380,18 @@ def paper_key(meta, owner_key):
         raise ValueError("paper_key requires the owning paper's key; a reference must "
                          "never inherit another paper's identity")
     return meta.get("doi") or f"{owner_key}#ref{meta['num']}"
+
+
+def numbers_for_ids(ref_ids, reference_map):
+    """Resolve <xref rid="cit59"> to reference numbers. -> list[int].
+
+    Preferred over parsing the printed text wherever the format provides it. The
+    printed "59" is a convention; the rid is a link the publisher asserted, so it
+    survives superscripts, ranges written with en-dashes, and bibliographies whose
+    numbering does not start at one.
+    """
+    by_id = {m.get("id"): n for n, m in (reference_map or {}).items() if m.get("id")}
+    return [by_id[rid] for rid in ref_ids if rid in by_id]
 
 
 def sources(ref_numbers, reference_map, owner_key):

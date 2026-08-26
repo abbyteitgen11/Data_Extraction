@@ -28,6 +28,8 @@ KINDS = (
     "sections_llm",        # prose measurements
     "skipped_rows",        # table rows we could not read
     "tables_unhandled",    # tables with no usable profile
+    "des_definitions",     # abbreviation -> components, from the paper's own table
+    "applications",        # what a DES was used FOR
 )
 
 
@@ -70,10 +72,25 @@ def write(records, kind, paper, model=None):
 
 def read_paper(kind, paper):
     path = path_for(kind, paper)
-    if not path.exists():
+    df = _read_csv(path)
+    if df is None or df.empty:
         return []
-    df = pd.read_csv(path)
     return df.astype(object).where(pd.notna(df), None).to_dict("records")
+
+
+def _read_csv(path):
+    """-> DataFrame, or None when there is nothing to read.
+
+    A step that produced no rows and had no model to take column names from leaves a
+    zero-byte file, which pandas raises EmptyDataError on. That is a legitimate
+    outcome -- "this paper had no unreadable tables" -- not a failure.
+    """
+    if not path.exists() or path.stat().st_size == 0:
+        return None
+    try:
+        return pd.read_csv(path)
+    except pd.errors.EmptyDataError:
+        return None
 
 
 def read_all(kind):
@@ -86,8 +103,8 @@ def read_all(kind):
         raise ValueError(f"unknown output kind {kind!r}; expected one of {KINDS}")
     rows = []
     for path in sorted(config.PAPERS_DIR.glob(f"*/{kind}.csv")):
-        df = pd.read_csv(path)
-        if df.empty:
+        df = _read_csv(path)
+        if df is None or df.empty:
             continue
         if "Paper_key" not in df.columns:
             raise ValueError(f"{path} has no Paper_key column")
