@@ -206,6 +206,7 @@ def mixture_record(paper, table, index, ordinal, components, ratios, ratio_raw="
     names = ":".join(n for n in (c1, c2, c3) if n)
     record = {
         "Row_id": f"{paper.slug}:{table.id}:{ordinal:04d}",
+        "Mixture_key": mixture_key((c1, c2, c3), ratio_raw),
         "Paper_key": paper.key, "Paper_DOI": paper.doi,
         "Paper_authors": paper.authors, "Paper_title": paper.title,
         "Paper_journal": paper.journal, "Paper_volume": paper.volume,
@@ -495,6 +496,38 @@ def _unit_for(column):
     return default
 
 
+def _hash(parts):
+    import hashlib
+
+    return hashlib.sha1("|".join(parts).encode("utf-8")).hexdigest()[:16]
+
+
+def _component_set(components):
+    """The components as an order-independent string. The basis of both keys below."""
+    return "+".join(sorted(c.lower() for c in components if c))
+
+
+def _ratio_key(ratio):
+    """The ratio with spacing removed, so "1 : 1" and "1:1" are the same mixture.
+
+    Application tables print "1 : 1" where property tables print "1:2"; without this
+    the same solvent from the two routes would key differently and stay two nodes.
+    """
+    return re.sub(r"\s+", "", str(ratio or ""))
+
+
+def mixture_key(components, ratio):
+    """Identify a DES by what it IS, not by how a table happened to spell it.
+
+    Merging mixtures on their printed name made the same solvent two nodes whenever two
+    tables listed its components in a different order -- ten times in this corpus, e.g.
+    "Choline chloride:Proline:Malic acid (1:1:1)" and
+    "Malic acid:Proline:Choline chloride (1:1:1)". Sorting the component set removes the
+    ordering; the name stays on the node for display.
+    """
+    return _hash([_component_set(components), _ratio_key(ratio)])
+
+
 def dedup_key(components, ratio, prop, value, temperature, primary_doi):
     """Identify the same underlying datum reported by two different papers.
 
@@ -502,16 +535,13 @@ def dedup_key(components, ratio, prop, value, temperature, primary_doi):
     primary DOI is what makes it one: same original study, same mixture, same number.
     Keyed on the resolved component SET so component order cannot split a pair.
     """
-    import hashlib
-
-    parts = [
-        "+".join(sorted(c.lower() for c in components if c)),
+    return _hash([
+        _component_set(components),
         str(ratio or ""), prop,
         f"{float(value):.6g}" if value is not None else "",
         f"{float(temperature):.6g}" if temperature is not None else "",
         (primary_doi or "").split(config.SOURCE_SEP)[0].lower(),
-    ]
-    return hashlib.sha1("|".join(parts).encode("utf-8")).hexdigest()[:16]
+    ])
 
 
 def to_measurements(rows, paper):
@@ -526,6 +556,7 @@ def to_measurements(rows, paper):
             out.append(MeasurementRow(
                 Measurement_key=f"{mixture.Row_id}:{name}",
                 Row_id=mixture.Row_id,
+                Mixture_key=mixture.Mixture_key,
                 Paper_key=paper.key, Paper_DOI=paper.doi,
                 Table_id=mixture.Table_id, Source_row=mixture.Source_row,
                 Source_col=getattr(mixture, f"Source_col_{suffix}", None),
@@ -535,7 +566,6 @@ def to_measurements(rows, paper):
                 Unit=getattr(mixture, f"Units_{suffix}"),
                 Temperature_C=getattr(mixture, f"Temperature_{suffix}"),
                 Source=f"{mixture.Table_id} row {mixture.Source_row}",
-                Locus=f"row {mixture.Source_row}",
                 Source_ref_numbers=mixture.Source_ref_numbers,
                 Source_DOIs=mixture.Source_DOIs,
                 Source_paper_keys=mixture.Source_paper_keys,

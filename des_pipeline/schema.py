@@ -34,6 +34,8 @@ class MixtureRow(BaseModel):
 
     Row_id: str                          # "<slug>:<table>:0001" -- scoped, so a second
                                          # paper's table cannot overwrite this one
+    Mixture_key: str = ""                # hash(component set + ratio): what the DES IS,
+                                         # independent of the order a table printed it in
     Paper_key: str = ""
     Table_id: str = ""                   # provenance: which table
     Source_row: Optional[int] = None     # provenance: which row of it
@@ -120,6 +122,7 @@ class MeasurementRow(BaseModel):
 
     Measurement_key: str                 # "<Row_id>:<Property>" -- unique across papers
     Row_id: str
+    Mixture_key: str = ""                # which Mixture node this hangs off
     Paper_key: str = ""
     Paper_DOI: str = ""
     Table_id: str = ""                   # provenance, so validate can re-read the cell
@@ -131,7 +134,6 @@ class MeasurementRow(BaseModel):
     Unit: Optional[str] = None
     Temperature_C: Optional[float] = None
     Source: str = "Table 2"              # provenance: where in the paper
-    Locus: str = ""                      # provenance: "row 7"
     Source_ref_numbers: str = ""
     Source_DOIs: str = ""
     Source_paper_keys: str = ""
@@ -363,7 +365,8 @@ class ComponentPropertyRow(BaseModel):
     CAMEO and 149.6 C from elsewhere -- and the scalar path keeps only the first.
     """
 
-    key: str                             # content-derived, so graph loads are idempotent
+    key: str                             # hash(member_key); one shape across all routes
+    member_key: str = ""                 # the source record: "<component>:<property>:<value>:<data_source>"
     name: str                            # joins to ComponentRow.name
     cid: Optional[int] = None
     property: PropertyName
@@ -376,7 +379,10 @@ class ComponentPropertyRow(BaseModel):
 
     # --- the conditions it was measured under ---
     temperature_C: Optional[float] = None   # a CONDITION ("1.3057 @ 25 C"), not the value
-    pressure: str = ""                      # "760 mm Hg"
+    pressure_kPa: Optional[float] = None    # normalised, like temperature_C
+    pressure_raw: str = ""                  # "760 mm Hg", as the source wrote it
+    condition_note: str = ""                # anything in the pressure slot that is NOT a
+                                            # pressure: "closed capillary, rapid heating"
     qualifier: str = ""                     # approximate|greater_than|less_than|decomposes|sublimes
     applies_to: str = ""                    # "PEG 400", "dl-Form" -- a DIFFERENT substance
 
@@ -386,9 +392,9 @@ class ComponentPropertyRow(BaseModel):
     source_record_matches: bool = True   # ...and does it name THIS component? (advisory)
     source_db: str = "pubchem"           # pubchem | nist
     extractor: str = "llm"               # llm | regex
-    raw_string: str = ""                 # the source line, verbatim
+    source_text: str = ""                # the source line, verbatim
 
-    verified: bool = False               # does value_as_written occur in raw_string?
+    verified: bool = False               # does value_as_written occur in source_text?
     status: str = "ok"
 
 

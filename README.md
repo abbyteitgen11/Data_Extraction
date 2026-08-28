@@ -111,7 +111,7 @@ Counts below are for the Sadeghi paper.
 | File | Rows | What it is |
 |---|---|---|
 | `papers/<slug>/mixtures.csv` | 1539 | **one row per DES mixture** — components, ratios, every property as a value/unit/temperature triple, plus the paper's and every primary source's bibliographic metadata |
-| `papers/<slug>/measurements.csv` | 1649 | one row per measurement; what the graph loads |
+| `papers/<slug>/measurements.csv` | 1649 | one row per measurement; what the graph loads. `Dedup_key` decides what merges, `Mixture_key` which mixture it hangs off |
 | `papers/<slug>/references.csv` | 343 | the bibliography, with Crossref DOIs, volume, issue, pages |
 | `papers/<slug>/figures.csv` | 11 | worklist for manual digitisation (WebPlotDigitizer) |
 | `papers/<slug>/sections_llm.csv` | 138 | prose measurements, `status` deciding which reach the graph |
@@ -122,7 +122,7 @@ Counts below are for the Sadeghi paper.
 | `papers/<slug>/applications.csv` | 91 | what a DES was used FOR, with the row's own detail columns |
 | `papers/<slug>/des_definitions.csv` | 12 | abbreviation → components, from the paper's own table |
 | `papers/<slug>/reference_map.json` | — | that paper's resolved references; **per paper, never shared** |
-| `component_properties.csv` | 3369 | every reported component property value, with its source |
+| `component_properties.csv` | 3369 | every reported component property value, with its source, `pressure_kPa` and `source_text` |
 | `duplicate_measurements.csv` | 15 | the same datum reported twice, with both values and `agree` |
 | `review/queue.csv` | 42 | the prioritised human worklist |
 
@@ -369,7 +369,7 @@ It already earns its keep on one paper: **15 groups**, where the review's own ta
 the same datum twice.
 
 **The graph holds one node per datum, not per report of it.** Property nodes key on
-`Dedup_key`, with a `REVIEW_PAPER`/`REPORTED_IN` edge to every paper that reports it and
+`Dedup_key`, with a `REPORTED_IN` edge to every paper that reports it and
 the contributing `Measurement_key`s kept in `member_keys`, so a merged node is still
 traceable to the exact cells it came from. 1793 measurement rows load as 1778 nodes.
 Otherwise counting measurements would count publications.
@@ -381,7 +381,7 @@ finding, not noise.
 ### On the prose route
 
 Prose measurements are first-class: they attach to the same `Mixture` and `Component`
-nodes as table data and carry the same `REPORTED_IN` / `REVIEW_PAPER` provenance. But
+nodes as table data and carry the same `REPORTED_IN` provenance. But
 they only get there if they survive five checks, applied in order — the first failure
 wins and sets `status`:
 
@@ -567,16 +567,17 @@ re-call.
 
            -[:HAS_THERMAL_CONDUCTIVITY]->(:Thermal_conductivity ...)
 
-(:Mixture) -[:USED_IN {detail, paper_key}]-> (:Application {domain})
+(:Mixture) -[:HAS_APPLICATION]-> (:ApplicationRecord {key, member_keys, source_text})
+                                     -[:IN_DOMAIN]-> (:Application {domain})
 
-(:Density) -[:REPORTED_IN {ref_numbers}]-> (:Paper {role:'primary'})   where the data came from
-(:Density) -[:REVIEW_PAPER]-------------->  (:Paper {role:'review'})   where we read it
-(:Mixture) -[:REPORTED_IN]/[:REVIEW_PAPER]-> (:Paper)
+(:Density) -[:REPORTED_IN {role:'primary', ref_numbers}]-> (:Paper)   where the data came from
+(:Density) -[:REPORTED_IN {role:'review'}]--------------->  (:Paper)   where we read it
+(:Mixture) -[:REPORTED_IN {role}]------------------------>  (:Paper)
 ```
 
 **A research paper is its own source.** A review's measurements point at the studies it
 cites; Fan reports its own, so its 144 measurements carry `REPORTED_IN → Fan` and no
-`REVIEW_PAPER` edge at all. Every `role` used to be hard-coded to `review`, which for a
+`role:'review'` edge at all. Every `role` used to be hard-coded to `review`, which for a
 primary paper records a review of nobody and loses the citation entirely.
 
 ### Schema reference
@@ -597,59 +598,101 @@ a query — all three have caught me out:
    `(:Refractive_index)` has **no `unit` property at all**, because it is dimensionless —
    `RETURN n.unit` on it returns null, correctly.
 
+**Identity — one rule per node type**
+
+Every node type has exactly one thing that decides whether two of them are the same:
+
+| node | merges on | why |
+|---|---|---|
+| `Component`, `Source` | `name` | the name genuinely is the identity |
+| `Application` | `domain` | a controlled vocabulary of seven |
+| `Paper` | `key` | the DOI — or `<paper>#refN` when Crossref found none. 129 papers have no DOI, and merging on a null would collapse them all into one node, because Neo4j uniqueness ignores nulls |
+| `Mixture` | `key` = hash(component set + ratio) | the printed `name` depends on the order a table listed its components, so `Choline chloride:Proline:Malic acid` and `Malic acid:Proline:Choline chloride` were two nodes for one solvent. `name` is now display only |
+| property nodes | `key` = `dedup:<hash>` | a hash of components + ratio + property + value + temperature + originating study, so the same datum reported by two papers is one node |
+
+`Paper` deliberately keeps a readable DOI rather than a hash: a DOI is already a global
+identifier, `MATCH (p:Paper {key:'10.1016/…'})` should work, and a content hash would
+change whenever Crossref revised a title.
+
+**The keys, and which are not keys**
+
+Only `key` identifies a node. The other `*_key` fields do different jobs:
+
+| field | what it is |
+|---|---|
+| `key` | the node's unique ID — what Neo4j merges on. Exactly one per node |
+| `Dedup_key` (CSV) | a fingerprint of the **fact**, used to decide what merges. Becomes the node's `key`, prefixed `dedup:` |
+| `Measurement_key` (CSV) | the ID of one **cell in one paper's table**. Survives in the graph only inside `member_keys` |
+| `member_keys` | after merging, which source cells went in. The only remaining trace from a merged node back to the paper rows |
+| `Mixture_key` (CSV) | which Mixture the row belongs to |
+
+`n_reports` and `locus` used to exist and were dropped: the first is `size(member_keys)`,
+the second repeated a row number already inside it.
+
 **Field meanings**
 
 | field | on | what it is |
 |---|---|---|
-| `key` | property, Paper | the merge key. For a property node, `Dedup_key` when the datum is reported more than once, else `<slug>:<table>:<row>:<Property>`. For a Paper, the DOI, or `<paper>#refN` when Crossref found none |
-| `name` | Component, Mixture | the merge key. `Mixture.name` is `"Choline chloride:Urea (1:2)"`, built from resolved component names so the same solvent from two papers is one node |
 | `origin` | all | which route produced it: `table`, `prose`, `component` (a database lookup) or `application` |
-| `value`, `unit`, `temperature_C` | property | the measurement. `unit` is canonicalised (`g*cm^-3`, `mPa*s`, `W*m^-1*K^-1`), not as the paper printed it |
-| `dedup_key`, `member_keys`, `n_reports` | property | deduplication. `n_reports > 1` means several papers report this datum; `member_keys` lists the source cells it was merged from |
+| `extractor` | property (component-origin) | which parser read the number out of PubChem's text — `llm` or `regex`. A quality signal, so you can filter on the parser if one turns out to misread |
+| `subject` | property | the display name of whatever the node hangs off — a mixture, or a component on the database route. `origin` says which. A convenience copy; the edges are authoritative |
+| `property` | property | the node's own label as a string. Redundant on purpose: it lets one query span all eight property types without enumerating labels |
+| `value`, `unit`, `temperature_C` | property | the measurement. `unit` is canonicalised (`g*cm^-3`, `mPa*s`, `W*m^-1*K^-1`), not as the paper printed it. Refractive index is dimensionless and has no `unit` |
+| `pressure_kPa`, `pressure_raw` | property | the pressure, normalised, plus the text it came from — the same shape as `temperature_C`. Both live on the node only, never on the relationship |
+| `condition_note` | property | something that was in the source's pressure slot but is not a pressure: a method (`closed capillary, rapid heating`), a basis (`air = 1`), a stray temperature. Kept rather than dropped, and sent to review |
+| `source_text` | property | the text the value was read from — a PubChem line for a database value, the quoted sentence for a prose one. Lets you check the parse |
 | `plausible`, `plausibility_note` | property | outside the physical range in `config.PROPERTIES`. Flagged, never dropped — usually the *source* is wrong, which only a human can adjudicate |
-| `locus`, `evidence` | property | where in the paper. `locus` is the table row; `evidence` is the quoted sentence, for prose-route values |
-| `role`, `extracted` | Paper | `review` or `primary`, and whether we extracted from it (3) or only cite it (567) |
+| `qualifier` | property | `approximate`, `decomposes`, `sublimes`, … as the source hedged it |
+| `role`, `extracted` | Paper | `review` or `primary`, and whether we parsed its XML (3) or only cite it (567) |
 | `match_score`, `title_agreement`, `raw` | Paper | how much to trust the Crossref match: its score, the XML-vs-Crossref title overlap, and the original citation string |
-| `matched_name` | Component | the query PubChem actually matched, when it was not the name as written — `FeCl3·6H2O` → `FERRIC CHLORIDE hexahydrate` |
-| `cid`, `cas`, `smiles`, `inchikey`, `formula` | Component | identifiers from PubChem; `377` of 565 components resolved |
+| `matched_name` | Component | the query PubChem actually matched when it was not the name as written — `FeCl3·6H2O` → `FERRIC CHLORIDE hexahydrate` |
+| `cid`, `cas`, `smiles`, `inchikey`, `formula` | Component | identifiers from PubChem |
 | `tpsa`, `xlogp`, `complexity`, `h_bond_*`, `rotatable_bond_count`, `formal_charge` | Component | descriptors, for ML features |
 | `melting_point_C`, `boiling_point_C`, `density_g_cm3` | Component | a convenience scalar — the *first* parseable value. The full multi-source set is on the property nodes |
-| `molar_ratio`, `role` | `PART_OF` | the component's share of the mixture, and whether it is the HBA or HBD |
-| `data_source` | `HAS_*` | which database within PubChem asserted a component property |
-| `domain`, `detail` | Application, `USED_IN` | the use (`esterification`, `biodiesel`, …) and the row's own columns flattened as `alcohol=MeOH \| acid=Lauric`, since they differ per table |
+| `molar_ratio`, `role` | `PART_OF` | the component's share of the mixture, and whether it is the HBA or HBD. Not derivable from `Mixture.ratio_raw`, which is `"1:2"` for the whole mixture and says nothing about which component is the 1 |
+| `inferred` | `PART_OF` | true when the caption implied this component and no column listed it — the one place the pipeline asserts chemistry no column states, kept visible |
+| `role` | `REPORTED_IN` | `primary` (this paper measured it) or `review` (this paper tabulated it). On the edge, not only on `(:Paper)`, because a review that also publishes original measurements needs both answers about itself. Absent on edges to `(:Source)`, which is a database and has no such role |
+| `ref_numbers` | `REPORTED_IN` | which citation numbers *this datum* used; 1397 edges list more than one |
+| `domain` | Application, ApplicationRecord | the use — `esterification`, `biodiesel`, … |
+
+`HAS_*` relationships carry **no** `temperature_C`. It used to be on both the node and the
+relationship — identical wherever both existed, but absent from 383 relationships whose
+node had one, so a query on the relationship silently lost data. Each fact is now written
+once, on the node.
 
 **Inventory**
 
 | label | n | properties |
 |---|---|---|
-| `:Mixture` | 1546 | `component_flag`, `n_components`, `name`, `origin`, `ratio_flag`, `ratio_raw`, `row_id` |
-| `:Melting_point` | 1510 | `component`, `dedup_key`, `evidence`, `extractor`, `key`, `locus`, `member_keys`, `mixture`, `n_reports`, `origin`, `plausibility_note`, `plausible`, `pressure`, `property`, `qualifier`, `raw_string`, `temperature_C`, `unit`, `value` |
-| `:Density` | 1116 | `component`, `dedup_key`, `evidence`, `extractor`, `key`, `locus`, `member_keys`, `mixture`, `n_reports`, `origin`, `plausibility_note`, `plausible`, `pressure`, `property`, `qualifier`, `raw_string`, `temperature_C`, `unit`, `value` |
-| `:Boiling_point` | 976 | `component`, `extractor`, `key`, `origin`, `pressure`, `property`, `qualifier`, `raw_string`, `temperature_C`, `unit`, `value` |
-| `:Paper` | 570 | `authors`, `doi`, `extracted`, `issue`, `journal`, `key`, `match_score`, `pages`, `raw`, `ref_number`, `role`, `title`, `title_agreement`, `volume`, `year` |
+| `:Mixture` | 1533 | `component_flag`, `key`, `member_keys`, `n_components`, `name`, `origin`, `ratio_flag`, `ratio_raw` |
+| `:Melting_point` | 1510 | `condition_note`, `dedup_key`, `extractor`, `key`, `member_keys`, `origin`, `plausibility_note`, `plausible`, `pressure_kPa`, `pressure_raw`, `property`, `qualifier`, `source_text`, `subject`, `temperature_C`, `unit`, `value` |
+| `:Density` | 1116 | `condition_note`, `dedup_key`, `extractor`, `key`, `member_keys`, `origin`, `plausibility_note`, `plausible`, `pressure_kPa`, `pressure_raw`, `property`, `qualifier`, `source_text`, `subject`, `temperature_C`, `unit`, `value` |
+| `:Boiling_point` | 976 | `condition_note`, `extractor`, `key`, `member_keys`, `origin`, `pressure_kPa`, `pressure_raw`, `property`, `qualifier`, `source_text`, `subject`, `temperature_C`, `unit`, `value` |
+| `:Paper` | 570 | `authors`, `doi`, `extracted`, `issue`, `journal`, `key`, `match_score`, `pages`, `raw`, `role`, `title`, `title_agreement`, `volume`, `year` |
 | `:Component` | 565 | `boiling_point_C`, `cas`, `cid`, `complexity`, `density_g_cm3`, `formal_charge`, `formula`, `h_bond_acceptor_count`, `h_bond_donor_count`, `inchikey`, `matched_name`, `melting_point_C`, `molecular_weight`, `name`, `origin`, `rotatable_bond_count`, `smiles`, `tpsa`, `xlogp` |
-| `:Viscosity` | 505 | `dedup_key`, `evidence`, `key`, `locus`, `member_keys`, `mixture`, `n_reports`, `origin`, `plausibility_note`, `plausible`, `property`, `temperature_C`, `unit`, `value` |
-| `:Conductivity` | 208 | `dedup_key`, `evidence`, `key`, `locus`, `member_keys`, `mixture`, `n_reports`, `origin`, `plausibility_note`, `plausible`, `property`, `temperature_C`, `unit`, `value` |
-| `:Refractive_index` | 169 | `dedup_key`, `evidence`, `key`, `locus`, `member_keys`, `mixture`, `n_reports`, `origin`, `plausibility_note`, `plausible`, `property`, `temperature_C`, `value` |
-| `:Surface_tension` | 115 | `dedup_key`, `evidence`, `key`, `locus`, `member_keys`, `mixture`, `n_reports`, `origin`, `plausibility_note`, `plausible`, `property`, `temperature_C`, `unit`, `value` |
-| `:Thermal_conductivity` | 60 | `dedup_key`, `evidence`, `key`, `locus`, `member_keys`, `mixture`, `n_reports`, `origin`, `plausibility_note`, `plausible`, `property`, `temperature_C`, `unit`, `value` |
+| `:Viscosity` | 505 | `dedup_key`, `key`, `member_keys`, `origin`, `plausibility_note`, `plausible`, `property`, `source_text`, `subject`, `temperature_C`, `unit`, `value` |
+| `:Conductivity` | 208 | `dedup_key`, `key`, `member_keys`, `origin`, `plausibility_note`, `plausible`, `property`, `source_text`, `subject`, `temperature_C`, `unit`, `value` |
+| `:Refractive_index` | 169 | `dedup_key`, `key`, `member_keys`, `origin`, `plausibility_note`, `plausible`, `property`, `source_text`, `subject`, `temperature_C`, `value` |
+| `:ApplicationRecord` | 118 | `domain`, `key`, `member_keys`, `origin`, `source_text`, `subject` |
+| `:Surface_tension` | 115 | `dedup_key`, `key`, `member_keys`, `origin`, `plausibility_note`, `plausible`, `property`, `source_text`, `subject`, `temperature_C`, `unit`, `value` |
+| `:Thermal_conductivity` | 60 | `dedup_key`, `key`, `member_keys`, `origin`, `plausibility_note`, `plausible`, `property`, `source_text`, `subject`, `temperature_C`, `unit`, `value` |
 | `:Source` | 14 | `kind`, `name` |
 | `:Application` | 7 | `domain`, `example_caption` |
 
 | relationship | n | endpoints | properties |
 |---|---|---|---|
-| `REPORTED_IN` | 9973 | `(:Melting_point)`→`(:Source)` 2364<br>`(:Boiling_point)`→`(:Source)` 1952<br>`(:Mixture)`→`(:Paper)` 1697<br>`(:Density)`→`(:Source)` 1444<br>…8 more | `ref_numbers` |
-| `PART_OF` | 3310 | `(:Component)`→`(:Mixture)` 3310 | `molar_ratio`, `role` |
-| `REVIEW_PAPER` | 3104 | `(:Mixture)`→`(:Paper)` 1463<br>`(:Viscosity)`→`(:Paper)` 420<br>`(:Density)`→`(:Paper)` 394<br>`(:Melting_point)`→`(:Paper)` 328<br>…4 more | — |
-| `HAS_MELTING_POINT` | 1510 | `(:Component)`→`(:Melting_point)` 1182<br>`(:Mixture)`→`(:Melting_point)` 328 | `data_source`, `temperature_C` |
-| `HAS_DENSITY` | 1116 | `(:Component)`→`(:Density)` 722<br>`(:Mixture)`→`(:Density)` 394 | `data_source`, `temperature_C` |
-| `HAS_BOILING_POINT` | 976 | `(:Component)`→`(:Boiling_point)` 976 | `data_source` |
-| `HAS_VISCOSITY` | 504 | `(:Mixture)`→`(:Viscosity)` 504 | `temperature_C` |
-| `HAS_CONDUCTIVITY` | 208 | `(:Mixture)`→`(:Conductivity)` 208 | `temperature_C` |
-| `HAS_REFRACTIVE_INDEX` | 169 | `(:Mixture)`→`(:Refractive_index)` 169 | `temperature_C` |
-| `USED_IN` | 118 | `(:Mixture)`→`(:Application)` 118 | `detail`, `implied_components`, `key`, `paper_key`, `source_row`, `table_id` |
-| `HAS_SURFACE_TENSION` | 115 | `(:Mixture)`→`(:Surface_tension)` 115 | `temperature_C` |
-| `HAS_THERMAL_CONDUCTIVITY` | 60 | `(:Mixture)`→`(:Thermal_conductivity)` 60 | `temperature_C` |
+| `REPORTED_IN` | 13214 | `(:Mixture)`→`(:Paper)` 3144<br>`(:Melting_point)`→`(:Source)` 2364<br>`(:Boiling_point)`→`(:Source)` 1952<br>`(:Density)`→`(:Source)` 1444<br>…8 more | `ref_numbers`, `role` |
+| `PART_OF` | 3284 | `(:Component)`→`(:Mixture)` 3284 | `inferred`, `molar_ratio`, `role` |
+| `HAS_MELTING_POINT` | 1510 | `(:Component)`→`(:Melting_point)` 1182<br>`(:Mixture)`→`(:Melting_point)` 328 | — |
+| `HAS_DENSITY` | 1116 | `(:Component)`→`(:Density)` 722<br>`(:Mixture)`→`(:Density)` 394 | — |
+| `HAS_BOILING_POINT` | 976 | `(:Component)`→`(:Boiling_point)` 976 | — |
+| `HAS_VISCOSITY` | 505 | `(:Mixture)`→`(:Viscosity)` 505 | — |
+| `HAS_CONDUCTIVITY` | 208 | `(:Mixture)`→`(:Conductivity)` 208 | — |
+| `HAS_REFRACTIVE_INDEX` | 169 | `(:Mixture)`→`(:Refractive_index)` 169 | — |
+| `HAS_APPLICATION` | 118 | `(:Mixture)`→`(:ApplicationRecord)` 118 | — |
+| `IN_DOMAIN` | 118 | `(:ApplicationRecord)`→`(:Application)` 118 | — |
+| `HAS_SURFACE_TENSION` | 115 | `(:Mixture)`→`(:Surface_tension)` 115 | — |
+| `HAS_THERMAL_CONDUCTIVITY` | 60 | `(:Mixture)`→`(:Thermal_conductivity)` 60 | — |
 
 #### Regenerating this section
 
@@ -678,15 +721,18 @@ ORDER BY rel, n DESC;
 `biomass_fractionation`, `metal_processing`, `fuel_cleaning`, `materials_synthesis`,
 `reaction_medium` — taken from the table caption by keyword, deterministically.
 
-The per-row detail rides on the `USED_IN` relationship, because the columns differ from
+Each row is its own `(:ApplicationRecord)`, shaped exactly like a measurement — `key`,
+`member_keys`, `source_text`, and its own `REPORTED_IN` edges. The per-row detail is that
+node's `source_text`, because the columns differ from
 table to table (alcohol and acid here, biomass source and lignin yield there, material and
 product elsewhere) and a union of every column any paper might print would be a schema
 nobody could read. Those columns need no per-table code: they are whatever the profiler
 labelled `context`, named by the `context_field` it already assigns.
 
 ```cypher
-MATCH (c:Component)-[:PART_OF]->(m:Mixture)-[u:USED_IN]->(a:Application {domain:'esterification'})
-RETURN m.name, u.detail
+MATCH (c:Component)-[:PART_OF]->(m:Mixture)-[:HAS_APPLICATION]->(rec:ApplicationRecord)
+      -[:IN_DOMAIN]->(:Application {domain:'esterification'})
+RETURN m.name, rec.source_text
 ```
 
 **Every** reference becomes a `Paper`, whether or not Crossref matched it. Nodes merge on
@@ -726,7 +772,7 @@ MATCH (m:Mixture)-[:HAS_VISCOSITY]->(v) WHERE v.origin = 'table' RETURN v.value;
 ```
 
 The two relationship types are the point: `REPORTED_IN` reaches the paper that actually
-measured the value, `REVIEW_PAPER` the review that tabulated it. Papers are attached at
+measured the value, `REPORTED_IN {role:'review'}` the review that tabulated it. Papers are attached at
 the mixture level too, because 862 of the 1535 rows report no numeric value at all and
 would otherwise have no provenance.
 
@@ -777,9 +823,6 @@ object model. Nothing in `des_pipeline/` imports them.
 3. Digitising the 11 figures.
 4. chemdataextractor — there is a hook at `extract_text_llm.normalize_components`.
 5. The text2cypher search agent.
-6. **Cross-paper mixture normalisation.** Two papers naming the same solvent in a
-   different component order produce two `Mixture` nodes. A merged measurement attaches
-   to both, so nothing is lost, but the mixtures themselves do not yet merge.
-7. **Component resolution for application rows.** `Alcohol` + `Acid` + an implied PTSA is
+6. **Component resolution for application rows.** `Alcohol` + `Acid` + an implied PTSA is
    four components against a three-slot schema; those rows carry `Component_flag =
    quaternary+`.

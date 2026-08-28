@@ -31,6 +31,7 @@ from pydantic import ValidationError
 
 from . import config
 from .enrich_components import _alnum_key, _load_cache, _to_celsius
+from .extract_table import _hash
 from .extract_text_llm import cached_call_llm, canonical_unit, verified
 from .schema import (COMPONENT_PROPERTY_STATUS_ORDER, ComponentPropertyExtraction,
                      ComponentPropertyRow)
@@ -117,6 +118,58 @@ def _status(row):
 # "g/cu m" is a millionth of g/cm3 and must stay unhandled.
 _CONDITION_ONLY = re.compile(r"^(at\b|@)", re.I)
 
+# Pressure, normalised to kPa. `temperature_C` has always been a number with its unit in
+# the field name; `pressure` was a raw string carrying its own, so "760 mmHg",
+# "760.00 mm Hg", "760 [mm Hg]" and "20 MM HG" were four spellings of two pressures and
+# the field could not be filtered or sorted.
+_PRESSURE_UNITS = (
+    (r"mm\s*hg|torr", 0.1333224),
+    (r"k\s*pa", 1.0),
+    (r"m\s*pa", 1000.0),
+    (r"h\s*pa|mbar", 0.1),
+    (r"\bpa\b", 0.001),
+    (r"\bbar\b", 100.0),
+    (r"\bpsi\b|lb/in", 6.894757),
+    # "atmospheres" spelled out, not just "atm" -- \batm\b alone misses it.
+    (r"\batm\b|\batmospheres?\b", 101.325),
+)
+# Real conditions that name no number. Kept as pressures rather than notes because they
+# are genuinely statements about pressure.
+_VACUUM = re.compile(r"\b(in|under)?\s*vacuum\b|\bvac\.", re.I)
+
+
+def read_pressure(text):
+    """Split the model's `pressure` field into what it actually holds. -> dict.
+
+    The field was a dumping ground: whatever the model could not place landed there,
+    so 30 of the 511 non-empty values were temperatures ("4 °C"), citations
+    ("USCG, 1999"), density bases ("air = 1") or methods ("closed capillary, rapid
+    heating"). The prompt's "citations are not data" rule was attached to `applies_to`
+    and nothing validated this one.
+
+    Anything without a pressure unit is MOVED to `condition_note`, never dropped -- it
+    is real information that belongs somewhere else, and a human should see it.
+    """
+    raw = str(text or "").strip()
+    if not raw:
+        return {"pressure_kPa": None, "pressure_raw": "", "condition_note": ""}
+    if _VACUUM.search(raw):
+        return {"pressure_kPa": None, "pressure_raw": raw, "condition_note": ""}
+
+    lowered = raw.lower()
+    for pattern, factor in _PRESSURE_UNITS:
+        if not re.search(pattern, lowered):
+            continue
+        number = re.search(r"(-?\d+(?:\.\d+)?)", raw.replace(",", ""))
+        if not number:
+            # A unit with no number ("mm Hg") still says the value was measured at a
+            # stated pressure, even though we cannot say which. Keeping the text is
+            # more honest than filing it as "not a pressure".
+            return {"pressure_kPa": None, "pressure_raw": raw, "condition_note": ""}
+        return {"pressure_kPa": round(float(number.group(1)) * factor, 4),
+                "pressure_raw": raw, "condition_note": ""}
+    return {"pressure_kPa": None, "pressure_raw": "", "condition_note": raw}
+
 
 def _to_row(draft, entry, name, cid, seen):
     """One validated draft + the line it points at -> a ComponentPropertyRow."""
@@ -144,7 +197,7 @@ def _to_row(draft, entry, name, cid, seen):
         value_as_written=draft.value,
         unit_as_written=unit_written,
         temperature_C=draft.temperature_C,
-        pressure=(draft.pressure or "").strip(),
+        **read_pressure(draft.pressure),
         qualifier=(draft.qualifier or "").strip(),
         applies_to=(draft.applies_to or "").strip(),
         data_source=entry.get("data_source") or "",
@@ -155,19 +208,23 @@ def _to_row(draft, entry, name, cid, seen):
                                or _alnum_key(source_record) == _alnum_key(record_title)),
         source_db=entry.get("source_db") or "pubchem",
         extractor="llm",
-        raw_string=raw,
+        source_text=raw,
         # Checked against the line we fetched, not against anything the model wrote.
         verified=_verified_in(draft.value, raw),
     )
     row.status = _status(row)
 
+    # `member_key` names the source location, the way a table row's does; `key` is a
+    # hash of it, so every property node in the graph -- table, prose or database --
+    # carries a key of the same shape instead of three different ones.
     stem = f"{name}:{row.property}:{draft.value if draft.value is not None else 'none'}:{row.data_source}"
-    key, n = stem, 1
-    while key in seen:                              # same value, same source, twice
+    member, n = stem, 1
+    while member in seen:                           # same value, same source, twice
         n += 1
-        key = f"{stem}#{n}"
-    seen.add(key)
-    row.key = key
+        member = f"{stem}#{n}"
+    seen.add(member)
+    row.member_key = member
+    row.key = _hash([member])
     return row
 
 
@@ -189,7 +246,7 @@ def extract_properties(name, entries, cid=None, backend=None, refresh=False):
             value_as_written=entry["value_as_written"],
             unit_as_written=entry["unit_as_written"],
             data_source="NIST WebBook", source_record=entry.get("source_record") or "",
-            source_db="nist", extractor="regex", raw_string=entry["string"],
+            source_db="nist", extractor="regex", source_text=entry["string"],
             verified=True, status="ok",
         ))
         seen.add(rows[-1].key)
@@ -245,4 +302,11 @@ def run(limit=None, refresh_llm=False, backend=None):
     for status in COMPONENT_PROPERTY_STATUS_ORDER:
         if counts.get(status):
             print(f"    {status:<22}{counts[status]:>5}{'  -> graph' if status == 'ok' else ''}")
+
+    pressures = sum(1 for r in rows if r.pressure_kPa is not None)
+    moved = [r.condition_note for r in rows if r.condition_note]
+    print(f"  pressure: {pressures} normalised to kPa, {len(moved)} non-pressure(s) "
+          f"moved to condition_note")
+    for note, n in Counter(moved).most_common(5):
+        print(f"    {note[:52]!r}: {n}")
     return rows
