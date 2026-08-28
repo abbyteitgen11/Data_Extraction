@@ -212,6 +212,29 @@ class ComponentRow(BaseModel):
     matched_name: str = ""               # the query PubChem actually matched, when it
                                          # was not `name` verbatim -- e.g. a hydrate
                                          # reached as "FERRIC CHLORIDE hexahydrate"
+    synonyms: str = ""                   # PubChem's own names for this compound, ";"-
+                                         # joined. Kept because it is the only evidence
+                                         # that separates a naming variant ("H2O" IS a
+                                         # synonym of water) from a mis-resolution
+                                         # ("PEG600" is NOT a synonym of diethylene
+                                         # glycol, though PubChem returned that CID)
+
+    # --- QM9: DFT descriptors for ONE ISOLATED MOLECULE IN THE GAS PHASE ---
+    # Computed, never measured, and not a property of a DES. Units are the ones
+    # torch_geometric returns (eV, not the raw files' Hartree), so they are in the
+    # field names. See des_pipeline/qm9.py.
+    qm9_id: str = ""                     # the GDB id it matched
+    qm9_n_matches: Optional[int] = None  # >1 means the skeleton was ambiguous
+    qm9_contested: str = ""              # set INSTEAD of a match: other component names
+                                         # sharing this InChIKey, so the ID is in doubt
+    qm9_dipole_D: Optional[float] = None
+    qm9_polarizability_a0_3: Optional[float] = None
+    qm9_homo_eV: Optional[float] = None
+    qm9_lumo_eV: Optional[float] = None
+    qm9_gap_eV: Optional[float] = None
+    qm9_r2_a0_2: Optional[float] = None
+    qm9_zpve_eV: Optional[float] = None
+    qm9_cv_cal_mol_K: Optional[float] = None
 
 
 # The same drift guard as PropertyName, one level down. MixtureRow spells its property

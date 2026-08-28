@@ -459,6 +459,57 @@ then flows into the enrichment step like any other component. A cheap word filte
 compound *classes* ("Amino acids", "Choline salt", "Tetraalkyl ammonium halides") and
 non-chemicals ("HBD", "RCl") from being looked up at all.
 
+### QM9 descriptors
+
+```bash
+python run_pipeline.py --steps qm9
+```
+
+QM9 is 134k small organic molecules with DFT properties. Those properties are **computed,
+gas-phase, single-molecule** values — everything else in this pipeline is a measurement of
+a real substance, and the two must not be confused:
+
+> a melting point on a Component is something somebody measured;
+> a QM9 dipole is something a computer calculated about one molecule that is not in a
+> solvent at all.
+
+So they never become property nodes. They sit on `(:Component)` beside `tpsa`, `xlogp` and
+`complexity` — which are also computed descriptors — under a `qm9_` prefix, with the unit
+in the field name. They are ML features, not evidence.
+
+**Units are torch_geometric's, not the raw files'.** PyG converts the energies from Hartree
+to eV before returning them, so `qm9_homo_eV` really is eV. A silent factor of 27.2 would
+be invisible in a descriptor nobody eyeballs, which is why the unit is in every name.
+
+**Coverage is limited by what QM9 is**: only C/H/N/O/F, at most 9 heavy atoms. Of the 403
+resolved components, 146 are eligible by formula; the rest are excluded because 132 contain
+an element QM9 does not cover (Cl, Br, S, metals — that is *every* quaternary ammonium HBA
+in this corpus) and 121 are too large. This enriches the HBD side of a mixture and never
+the HBA side.
+
+**Matching** computes the InChIKey connectivity block with rdkit from *both* sides' SMILES.
+Using one toolkit twice rather than comparing PubChem's key with QM9's is deliberate — two
+generators agreeing is an assumption. Verified on 400/400 components against PubChem's own
+InChIKey.
+
+**Contested identifications are skipped — but only the ones that deserve it.** Several
+names sharing an InChIKey is usually harmless: `Water`, `water` and `H2O` are one chemical
+written three ways. The dangerous case looks identical in our own data: `PEG600`,
+`PEG2000`, `PEG4000`, `PEG6000` and `Diethylene glycol` also share a key, because PubChem
+resolved every PEG to diethylene glycol.
+
+PubChem's own synonym list separates them on evidence rather than a heuristic — `H2O` *is*
+a synonym of water, `PEG600` is *not* a synonym of diethylene glycol. A group is contested
+when it contains a name the matched compound does not acknowledge, and only then. That is
+why `components.csv` carries a `synonyms` column; it is fetched anyway and was previously
+thrown away.
+
+A group with no synonym list at all counts as contested: the check could not be made, and
+absence of evidence is not evidence.
+
+Where a skeleton matches several QM9 entries (tautomers, stereoisomers), the lowest-energy
+one is taken and `qm9_n_matches` records how many there were.
+
 ### Component properties
 
 Each component is looked up in PubChem for identifiers and descriptors (SMILES, InChI,
@@ -551,6 +602,22 @@ call. So a second `--steps text` costs seconds instead of 35 minutes, which is w
 re-assessing earlier papers practical. Editing `PROMPT` invalidates every entry; the run
 prints `cache: 6 hit, 0 fresh` so that is impossible to miss. `--refresh-llm` forces a
 re-call.
+
+**The prompt has to be built deterministically or the cache silently stops working.** The
+component route embeds PubChem's property lines in its prompt, and PubChem does not return
+them in a stable order — so re-fetching a component produced a different key for identical
+content. The damage was invisible because every run still *worked*; it just paid full price:
+
+```
+comp-247   8 cache entries -> 1 distinct response   (eight identical answers, eight keys)
+comp-174   9 cache entries -> 2 distinct responses
+```
+
+562 cache files for 308 components, and `--steps components` costing hours instead of
+seconds. `extract_properties` now sorts the lines by content before formatting the prompt,
+and the same sorted list resolves the model's line numbers, so the key depends on *what*
+PubChem said and never on the order it arrived in. If you add another LLM route, anything
+list-shaped that reaches a prompt needs the same treatment.
 
 ## The graph
 

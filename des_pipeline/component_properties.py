@@ -229,8 +229,21 @@ def _to_row(draft, entry, name, cid, seen):
 
 
 def extract_properties(name, entries, cid=None, backend=None, refresh=False):
-    """-> (list[ComponentPropertyRow], was_cached) for one component."""
-    pubchem = [e for e in entries if e.get("source_db") != "nist"]
+    """-> (list[ComponentPropertyRow], was_cached) for one component.
+
+    The lines are SORTED, which is what makes the response cache work. The cache key
+    is a hash of the formatted prompt, and the prompt embeds these lines in order; but
+    PubChem does not return them in a stable order, so re-fetching a component used to
+    produce a different key for identical content. One component had nine cache
+    entries holding one distinct answer. Sorting by content means the key depends on
+    what PubChem said, never on the order it arrived in.
+
+    The same sorted list feeds `_numbered()` and `pubchem[draft.line - 1]`, so the
+    model's line numbers keep pointing at the entries they were computed from.
+    """
+    pubchem = sorted((e for e in entries if e.get("source_db") != "nist"),
+                     key=lambda e: (e.get("heading") or "", e.get("string") or "",
+                                    e.get("source_record") or ""))
     rows, seen = [], set()
 
     # NIST values are already structured -- they came from a regex, not prose -- so

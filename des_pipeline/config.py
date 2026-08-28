@@ -66,6 +66,11 @@ COMPONENT_PROPERTIES_CSV = DATA / "component_properties.csv"
 PAPERS_DIR = DATA / "papers"
 PAPERS_CSV = DATA / "papers.csv"
 CROSSREF_CACHE = DATA / "crossref_cache.json"     # shared across papers, keyed by DOI
+
+# QM9: computed descriptors for small organic molecules. torch_geometric manages the
+# download under QM9_DIR; QM9_INDEX is our own skeleton -> properties map.
+QM9_DIR = DATA / "qm9"
+QM9_INDEX = DATA / "qm9_index.json"
 DUPLICATES_CSV = DATA / "duplicate_measurements.csv"
 XML_GLOB = "*.xml"
 

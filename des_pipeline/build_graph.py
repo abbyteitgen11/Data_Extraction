@@ -52,6 +52,12 @@ from . import config
 from .extract_table import _hash, mixture_key
 from .config import PROPERTY_NAMES
 
+# Written onto (:Component) as attributes, never as property nodes: they are DFT values
+# for one isolated molecule in the gas phase, not measurements of a substance.
+QM9_FIELDS = ("qm9_id", "qm9_n_matches", "qm9_contested", "qm9_dipole_D",
+              "qm9_polarizability_a0_3", "qm9_homo_eV", "qm9_lumo_eV", "qm9_gap_eV",
+              "qm9_r2_a0_2", "qm9_zpve_eV", "qm9_cv_cal_mol_K")
+
 CONSTRAINTS = [
     "CREATE CONSTRAINT component_name IF NOT EXISTS "
     "FOR (c:Component) REQUIRE c.name IS UNIQUE",
@@ -303,6 +309,9 @@ def _component_rows(components_by_name):
         "melting_point_C": c.get("melting_point_C"),
         "boiling_point_C": c.get("boiling_point_C"),
         "density_g_cm3": c.get("density_g_cm3"),
+        # Computed, gas-phase, single-molecule. Deliberately node attributes rather
+        # than property nodes -- see des_pipeline/qm9.py.
+        **{f: c.get(f) for f in QM9_FIELDS},
     } for name, c in components_by_name.items() if c.get("lookup_status") == "ok"]
 
 
@@ -589,6 +598,13 @@ MATCH (c:Component {name: r.name})
       c.formal_charge = r.formal_charge,
       c.xlogp = r.xlogp,
       c.complexity = r.complexity,
+      c.qm9_id = r.qm9_id, c.qm9_n_matches = r.qm9_n_matches,
+      c.qm9_contested = r.qm9_contested,
+      c.qm9_dipole_D = r.qm9_dipole_D,
+      c.qm9_polarizability_a0_3 = r.qm9_polarizability_a0_3,
+      c.qm9_homo_eV = r.qm9_homo_eV, c.qm9_lumo_eV = r.qm9_lumo_eV,
+      c.qm9_gap_eV = r.qm9_gap_eV, c.qm9_r2_a0_2 = r.qm9_r2_a0_2,
+      c.qm9_zpve_eV = r.qm9_zpve_eV, c.qm9_cv_cal_mol_K = r.qm9_cv_cal_mol_K,
       c.melting_point_C = r.melting_point_C,
       c.boiling_point_C = r.boiling_point_C,
       c.density_g_cm3 = r.density_g_cm3

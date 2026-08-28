@@ -128,7 +128,7 @@ def _run_paper(path, steps, args, network):
 # "aliases" is a human-review step -- it proposes abbreviation definitions for you to
 # confirm by hand -- so it is deliberately not part of an "all" run.
 ALL_STEPS = ["route", "refs", "table", "figures", "text", "aliases",
-             "components", "validate", "graph"]
+             "components", "qm9", "validate", "graph"]
 
 #ALL_STEPS = ["validate"]
 
@@ -163,6 +163,8 @@ def main(argv=None):
                         help="graph: skip the prose measurements (they load by default)")
     parser.add_argument("--refresh-llm", action="store_true",
                         help="text: ignore the response cache and re-call the model")
+    parser.add_argument("--refresh-qm9", action="store_true",
+                        help="qm9: rebuild the QM9 index instead of reusing it")
     parser.add_argument("--review", action="store_true",
                         help="validate: run the interactive spot check")
     parser.add_argument("--sample", type=int, default=20,
@@ -218,6 +220,13 @@ def main(argv=None):
                                                      refresh_llm=args.refresh_llm)
             xml_utils.write_csv(property_rows, config.COMPONENT_PROPERTIES_CSV,
                                 model=ComponentPropertyRow)
+
+    # --- qm9 --------------------------------------------------------------
+    if "qm9" in steps:
+        from des_pipeline import qm9 as qm9_step
+
+        print("qm9:")
+        qm9_step.run(refresh=args.refresh_qm9)
 
     # --- validate ---------------------------------------------------------
     if "validate" in steps:

@@ -411,6 +411,9 @@ def lookup(name, session, use_nist=True):
 
     # A hydrate's CAS belongs to the hydrate, so ask under the name that matched it.
     cas = _cas_number(matched_name or name, compound)
+    # Already on the Compound we fetched; keeping them costs nothing and is what lets
+    # qm9.py tell a synonym group from a PubChem mis-resolution.
+    synonyms = ";".join((getattr(compound, "synonyms", None) or [])[:60])
     properties, comments, entries = _pugview_properties(compound.cid, session)
     sources = ["pubchem"]
 
@@ -447,6 +450,7 @@ def lookup(name, session, use_nist=True):
         sources=";".join(sources),
         lookup_status="ok",
         matched_name=matched_name,
+        synonyms=synonyms,
     )
     return row, entries
 
@@ -758,7 +762,8 @@ def _stale(row):
         being asked again on every run.
     """
     if row.get("lookup_status") == "ok":
-        return "tpsa" not in row or "property_strings" not in row
+        return ("tpsa" not in row or "property_strings" not in row
+                or "synonyms" not in row)
     return (row.get("lookup_status") == "not_found" and "matched_name" not in row
             and split_hydrate(row.get("name") or "")[1] > 0)
 
