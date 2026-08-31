@@ -411,9 +411,16 @@ def lookup(name, session, use_nist=True):
 
     # A hydrate's CAS belongs to the hydrate, so ask under the name that matched it.
     cas = _cas_number(matched_name or name, compound)
-    # Already on the Compound we fetched; keeping them costs nothing and is what lets
-    # qm9.py tell a synonym group from a PubChem mis-resolution.
-    synonyms = ";".join((getattr(compound, "synonyms", None) or [])[:60])
+    # `Compound.synonyms` is a LAZY property -- reading it issues another PubChem
+    # request, which is easy to miss and cost a whole run when a 502 came back through
+    # it. Guarded so one flaky response degrades this component's synonym list instead
+    # of aborting the other 400; qm9.py already treats a missing list as "cannot vouch
+    # for this identification", which is the right conclusion when the fetch failed.
+    try:
+        synonyms = ";".join((getattr(compound, "synonyms", None) or [])[:60])
+    except Exception as exc:
+        print(f"    {name}: could not fetch synonyms ({type(exc).__name__})")
+        synonyms = ""
     properties, comments, entries = _pugview_properties(compound.cid, session)
     sources = ["pubchem"]
 
@@ -761,6 +768,12 @@ def _stale(row):
         happens once, and a hydrate PubChem genuinely lacks stays not_found without
         being asked again on every run.
     """
+    # An error is a transient network condition, not a conclusion about the chemical.
+    # Without this a single PubChem 502 would keep a component broken forever, since
+    # nothing else would ever look at it again -- five components lost their property
+    # text to one bad afternoon and would have stayed lost.
+    if str(row.get("lookup_status") or "").startswith("error"):
+        return True
     if row.get("lookup_status") == "ok":
         return ("tpsa" not in row or "property_strings" not in row
                 or "synonyms" not in row)
@@ -786,10 +799,30 @@ def enrich_all(names, limit=None, network=True, use_nist=True):
               f"{' (+NIST)' if use_nist else ''}")
         session = requests.Session()
         for i, name in enumerate(todo, 1):
-            row, entries = lookup(name, session, use_nist=use_nist)
+            # `lookup` claims never to raise, and mostly does not, but it reaches the
+            # network in several places -- a PubChem 502 on one component once took the
+            # whole run down and lost the other 400 lookups with it. One bad component
+            # is recorded as a bad component, not as a failed run.
+            try:
+                row, entries = lookup(name, session, use_nist=use_nist)
+            except Exception as exc:
+                print(f"    {name}: lookup failed ({type(exc).__name__}: {str(exc)[:60]})")
+                row, entries = ComponentRow(
+                    name=name, lookup_status=f"error: {type(exc).__name__}"), []
             # The raw source lines ride alongside the row dump. They are far too long
             # for a CSV column and only the LLM pass reads them; pydantic ignores the
             # extra key on the way back out.
+            #
+            # A refetch that comes back empty must not DELETE text we already hold.
+            # PubChem is not idempotent -- re-running the lookup silently returned no
+            # property section for 8 components that had one the day before, and
+            # overwriting cost their measurements. Keep the old lines in that case; a
+            # later run that does return text will replace them.
+            previous = (cache.get(name) or {}).get("property_strings")
+            if not entries and previous:
+                print(f"    {name}: PubChem returned no property text this time; "
+                      f"keeping the {len(previous)} line(s) already cached")
+                entries = previous
             cache[name] = {**row.model_dump(), "property_strings": entries}
             if i % 25 == 0:
                 _save_cache(cache)

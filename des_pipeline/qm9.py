@@ -40,12 +40,18 @@ TARGETS = (
 _U0_INDEX = 7                            # internal energy at 0 K, used to break ties
 
 
-def connectivity_key(smiles):
-    """The InChIKey's first block -- the skeleton, ignoring stereo and charge.
+def inchikey_from_smiles(smiles):
+    """The FULL InChIKey for a SMILES string, stereochemistry included. -> str | None.
 
-    Both sides of the match are computed here with the same toolkit rather than
-    comparing PubChem's InChIKey with QM9's: two generators agreeing is an assumption,
-    one generator applied twice is not.
+    Used for the QM9 side only. torch_geometric writes its SMILES with
+    `isomericSmiles=True`, so QM9's stereochemistry survives into the key.
+
+    Our side does NOT go through here: `enrich_components` stores PubChem's
+    *connectivity* SMILES, which has the stereo stripped out, so regenerating a key
+    from it loses the very thing that distinguishes glucose from galactose -- 66 of our
+    403 components come back as `-UHFFFAOYSA-` if you try. The stored `inchikey` is
+    already PubChem's full stereo-aware key and is what `component_key` returns; it
+    round-trips against the stored InChI for 403/403 components.
     """
     from rdkit import Chem, RDLogger
 
@@ -54,13 +60,24 @@ def connectivity_key(smiles):
     if mol is None:
         return None
     try:
-        return Chem.MolToInchiKey(mol).split("-")[0]
+        return Chem.MolToInchiKey(mol)
     except Exception:
         return None
 
 
+def component_key(row):
+    """The full InChIKey PubChem gave for this component. -> str | None."""
+    key = str(row.get("inchikey") or "").strip()
+    return key or None
+
+
+def skeleton(key):
+    """The connectivity block of an InChIKey -- same atoms and bonds, any stereo."""
+    return str(key or "").split("-")[0]
+
+
 def build_index(refresh=False):
-    """QM9 -> {connectivity key: [record, ...]}, cached in data/qm9_index.json.
+    """QM9 -> {full InChIKey: [record, ...]}, cached in data/qm9_index.json.
 
     torch_geometric downloads and processes on first use; with rdkit installed it
     parses the raw SDF, so every molecule carries its own SMILES, and it already drops
@@ -77,7 +94,7 @@ def build_index(refresh=False):
 
     index, skipped = {}, 0
     for data in dataset:
-        key = connectivity_key(data.smiles)
+        key = inchikey_from_smiles(data.smiles)
         if key is None:
             skipped += 1
             continue
@@ -89,7 +106,7 @@ def build_index(refresh=False):
 
     config.QM9_INDEX.parent.mkdir(parents=True, exist_ok=True)
     config.QM9_INDEX.write_text(json.dumps(index))
-    print(f"  indexed {len(index)} distinct skeletons"
+    print(f"  indexed {len(index)} distinct substances"
           f"{f', {skipped} unparseable' if skipped else ''} -> {config.QM9_INDEX.name}")
     return index
 
@@ -120,7 +137,7 @@ def contested_components(rows):
     """
     by_key = {}
     for r in rows:
-        key = str(r.get("inchikey") or "").split("-")[0]
+        key = component_key(r)
         if key and r.get("lookup_status") == "ok":
             by_key.setdefault(key, []).append(r)
 
@@ -132,6 +149,11 @@ def contested_components(rows):
         for r in group:
             known.update(_norm(s) for s in str(r.get("synonyms") or "").split(";") if s)
             known.add(_norm(r.get("matched_name")))
+            # A paper often writes the formula instead of a name -- "H2O" for water.
+            # PubChem lists it as a synonym too, but hundreds deep, past the slice we
+            # store, so check the formula we already hold rather than storing more.
+            known.add(_norm(r.get("molecular_formula")))
+        known.discard("")
         names = [r["name"] for r in group]
         unvouched = [n for n in names if _norm(n) not in known]
         if unvouched:
@@ -145,16 +167,35 @@ def match(rows, index=None):
     index = index if index is not None else build_index()
     contested = contested_components(rows)
 
-    matched = ambiguous = 0
+    by_skeleton = {}
+    for k in index:
+        by_skeleton.setdefault(skeleton(k), []).append(k)
+
+    matched = ambiguous = near = 0
     for row in rows:
-        if row.get("lookup_status") != "ok" or not row.get("smiles"):
+        # Clear before deciding, so the step is idempotent. components.csv persists the
+        # previous run's answer, and without this a component that matched under an
+        # older rule kept its QM9 data even once it became contested -- ending up
+        # flagged as doubtful AND carrying the numbers the flag exists to withhold.
+        row["qm9_contested"] = ""
+        row["qm9_id"] = ""
+        row["qm9_n_matches"] = None
+        for field, _ in TARGETS:
+            row[field] = None
+
+        if row.get("lookup_status") != "ok" or not row.get("inchikey"):
             continue
         if row["name"] in contested:
             row["qm9_contested"] = ";".join(sorted(contested[row["name"]]))[:200]
             continue
-        key = connectivity_key(row["smiles"])
+        key = component_key(row)
         found = index.get(key or "") or []
         if not found:
+            # QM9 may hold a STEREOISOMER of this molecule -- same atoms and bonds,
+            # different arrangement. That is a different substance (glucose is not
+            # galactose), so nothing is attached; it is counted so the near-miss is
+            # visible rather than looking like plain absence.
+            near += bool(key and by_skeleton.get(skeleton(key)))
             continue
         # Several QM9 entries can share a skeleton (tautomers, stereoisomers). Take the
         # lowest-energy one and record how many there were, so an ambiguous match is
@@ -167,7 +208,7 @@ def match(rows, index=None):
         matched += 1
         ambiguous += len(found) > 1
 
-    return {"matched": matched, "ambiguous": ambiguous,
+    return {"matched": matched, "ambiguous": ambiguous, "stereo_near_miss": near,
             "contested": len({n for n in contested if any(
                 r["name"] == n for r in rows)}),
             "eligible": sum(1 for r in rows if r.get("lookup_status") == "ok")}
@@ -202,6 +243,8 @@ def run(refresh=False):
 
     print(f"  QM9: {stats['matched']} of {stats['eligible']} resolved components matched"
           f" ({stats['ambiguous']} matched more than one QM9 entry)")
-    print(f"       {stats['contested']} skipped -- their InChIKey is shared by another "
-          f"component name, so the identification is in doubt")
+    print(f"       {stats['contested']} skipped -- their InChIKey is shared by a name the "
+          f"compound does not acknowledge, so the identification is in doubt")
+    print(f"       {stats['stereo_near_miss']} had a QM9 STEREOISOMER but not the "
+          f"substance itself -- not attached, since glucose is not galactose")
     return out

@@ -505,7 +505,13 @@ why `components.csv` carries a `synonyms` column; it is fetched anyway and was p
 thrown away.
 
 A group with no synonym list at all counts as contested: the check could not be made, and
-absence of evidence is not evidence.
+absence of evidence is not evidence. A paper's own *formula* counts as vouching too —
+`H2O` is water, but PubChem lists it hundreds of synonyms deep, past the slice we store.
+
+Three things it still refuses, correctly: `PEG600`…`PEG6000` (the mis-resolution it exists
+to catch), `Gly` (a standard abbreviation PubChem simply does not list), and
+`1,2-propandiol` (the paper's own misspelling). The last two are the price of the rule —
+it cannot vouch for a name nobody records, so it withholds rather than guesses.
 
 Where a skeleton matches several QM9 entries (tautomers, stereoisomers), the lowest-energy
 one is taken and `qm9_n_matches` records how many there were.
@@ -732,11 +738,11 @@ once, on the node.
 | label | n | properties |
 |---|---|---|
 | `:Mixture` | 1533 | `component_flag`, `key`, `member_keys`, `n_components`, `name`, `origin`, `ratio_flag`, `ratio_raw` |
-| `:Melting_point` | 1510 | `condition_note`, `dedup_key`, `extractor`, `key`, `member_keys`, `origin`, `plausibility_note`, `plausible`, `pressure_kPa`, `pressure_raw`, `property`, `qualifier`, `source_text`, `subject`, `temperature_C`, `unit`, `value` |
-| `:Density` | 1116 | `condition_note`, `dedup_key`, `extractor`, `key`, `member_keys`, `origin`, `plausibility_note`, `plausible`, `pressure_kPa`, `pressure_raw`, `property`, `qualifier`, `source_text`, `subject`, `temperature_C`, `unit`, `value` |
-| `:Boiling_point` | 976 | `condition_note`, `extractor`, `key`, `member_keys`, `origin`, `pressure_kPa`, `pressure_raw`, `property`, `qualifier`, `source_text`, `subject`, `temperature_C`, `unit`, `value` |
+| `:Melting_point` | 1496 | `condition_note`, `dedup_key`, `extractor`, `key`, `member_keys`, `origin`, `plausibility_note`, `plausible`, `pressure_kPa`, `pressure_raw`, `property`, `qualifier`, `source_text`, `subject`, `temperature_C`, `unit`, `value` |
+| `:Density` | 1090 | `condition_note`, `dedup_key`, `extractor`, `key`, `member_keys`, `origin`, `plausibility_note`, `plausible`, `pressure_kPa`, `pressure_raw`, `property`, `qualifier`, `source_text`, `subject`, `temperature_C`, `unit`, `value` |
+| `:Boiling_point` | 961 | `condition_note`, `extractor`, `key`, `member_keys`, `origin`, `pressure_kPa`, `pressure_raw`, `property`, `qualifier`, `source_text`, `subject`, `unit`, `value` |
 | `:Paper` | 570 | `authors`, `doi`, `extracted`, `issue`, `journal`, `key`, `match_score`, `pages`, `raw`, `role`, `title`, `title_agreement`, `volume`, `year` |
-| `:Component` | 565 | `boiling_point_C`, `cas`, `cid`, `complexity`, `density_g_cm3`, `formal_charge`, `formula`, `h_bond_acceptor_count`, `h_bond_donor_count`, `inchikey`, `matched_name`, `melting_point_C`, `molecular_weight`, `name`, `origin`, `rotatable_bond_count`, `smiles`, `tpsa`, `xlogp` |
+| `:Component` | 565 | `boiling_point_C`, `cas`, `cid`, `complexity`, `density_g_cm3`, `formal_charge`, `formula`, `h_bond_acceptor_count`, `h_bond_donor_count`, `inchikey`, `matched_name`, `melting_point_C`, `molecular_weight`, `name`, `origin`, `qm9_contested`, `qm9_cv_cal_mol_K`, `qm9_dipole_D`, `qm9_gap_eV`, `qm9_homo_eV`, `qm9_id`, `qm9_lumo_eV`, `qm9_n_matches`, `qm9_polarizability_a0_3`, `qm9_r2_a0_2`, `qm9_zpve_eV`, `rotatable_bond_count`, `smiles`, `tpsa`, `xlogp` |
 | `:Viscosity` | 505 | `dedup_key`, `key`, `member_keys`, `origin`, `plausibility_note`, `plausible`, `property`, `source_text`, `subject`, `temperature_C`, `unit`, `value` |
 | `:Conductivity` | 208 | `dedup_key`, `key`, `member_keys`, `origin`, `plausibility_note`, `plausible`, `property`, `source_text`, `subject`, `temperature_C`, `unit`, `value` |
 | `:Refractive_index` | 169 | `dedup_key`, `key`, `member_keys`, `origin`, `plausibility_note`, `plausible`, `property`, `source_text`, `subject`, `temperature_C`, `value` |
@@ -748,11 +754,11 @@ once, on the node.
 
 | relationship | n | endpoints | properties |
 |---|---|---|---|
-| `REPORTED_IN` | 13214 | `(:Mixture)`→`(:Paper)` 3144<br>`(:Melting_point)`→`(:Source)` 2364<br>`(:Boiling_point)`→`(:Source)` 1952<br>`(:Density)`→`(:Source)` 1444<br>…8 more | `ref_numbers`, `role` |
+| `REPORTED_IN` | 13104 | `(:Mixture)`→`(:Paper)` 3144<br>`(:Melting_point)`→`(:Source)` 2336<br>`(:Boiling_point)`→`(:Source)` 1922<br>`(:Density)`→`(:Source)` 1392<br>…8 more | `ref_numbers`, `role` |
 | `PART_OF` | 3284 | `(:Component)`→`(:Mixture)` 3284 | `inferred`, `molar_ratio`, `role` |
-| `HAS_MELTING_POINT` | 1510 | `(:Component)`→`(:Melting_point)` 1182<br>`(:Mixture)`→`(:Melting_point)` 328 | — |
-| `HAS_DENSITY` | 1116 | `(:Component)`→`(:Density)` 722<br>`(:Mixture)`→`(:Density)` 394 | — |
-| `HAS_BOILING_POINT` | 976 | `(:Component)`→`(:Boiling_point)` 976 | — |
+| `HAS_MELTING_POINT` | 1496 | `(:Component)`→`(:Melting_point)` 1168<br>`(:Mixture)`→`(:Melting_point)` 328 | — |
+| `HAS_DENSITY` | 1090 | `(:Component)`→`(:Density)` 696<br>`(:Mixture)`→`(:Density)` 394 | — |
+| `HAS_BOILING_POINT` | 961 | `(:Component)`→`(:Boiling_point)` 961 | — |
 | `HAS_VISCOSITY` | 505 | `(:Mixture)`→`(:Viscosity)` 505 | — |
 | `HAS_CONDUCTIVITY` | 208 | `(:Mixture)`→`(:Conductivity)` 208 | — |
 | `HAS_REFRACTIVE_INDEX` | 169 | `(:Mixture)`→`(:Refractive_index)` 169 | — |
