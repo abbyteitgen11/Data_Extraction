@@ -80,8 +80,11 @@ def _run_paper(path, steps, args, network):
         from des_pipeline import extract_table as tables
 
         print("tables:")
+        # The prose usually explains the paper's own tables, and that explanation is
+        # what separates a DES component from a reagent the DES acts on.
         profiles, problems = profile_table.profile_tables(
-            routed.tables, pap, refresh=args.refresh_profiles)
+            routed.tables, pap, refresh=args.refresh_profiles,
+            paragraphs=dialect.paragraphs(root))
         mixtures, measurements, skipped, definitions = tables.extract_tables(
             routed.tables, profiles, pap, reference_map)
         store.write(mixtures, "mixtures", pap, model=tables.MixtureRow)
@@ -130,7 +133,7 @@ def _run_paper(path, steps, args, network):
 ALL_STEPS = ["route", "refs", "table", "figures", "text", "aliases",
              "components", "qm9", "duplicates", "validate", "graph"]
 
-#ALL_STEPS = ["validate"]
+#ALL_STEPS = ["graph"]
 
 DEFAULT_STEPS = [s for s in ALL_STEPS if s != "aliases"]
 

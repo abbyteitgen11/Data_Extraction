@@ -93,11 +93,22 @@ def save_cache(cache, paper):
     path.write_text(json.dumps(cache, indent=2, ensure_ascii=False))
 
 
+# What the cache is allowed to contribute: the results of a lookup, never the fields we
+# just read out of the XML. Letting a cached entry win over a fresh parse means an
+# improvement to the reader never reaches an already-cached paper -- the readable `raw`
+# citation and the new volume/fpage stayed invisible for the 78 references that happened
+# to have resolved on an earlier run.
+_LOOKUP_KEYS = {"doi", "doi_source", "match_score", "match_basis", "fields_agree",
+                "title_agreement", "_resolved", "_enriched", "cr_authors", "cr_title",
+                "cr_journal", "cr_year", "volume", "issue", "pages"}
+
+
 def apply_cache(reference_map, cache):
-    """Merge cached lookups into a freshly-parsed reference map."""
+    """Merge cached LOOKUP RESULTS into a freshly-parsed reference map."""
     for num, cached in cache.items():
         if num in reference_map:
-            reference_map[num] = {**reference_map[num], **cached}
+            results = {k: v for k, v in cached.items() if k in _LOOKUP_KEYS}
+            reference_map[num] = {**reference_map[num], **results}
     return reference_map
 
 
@@ -119,11 +130,79 @@ def save_crossref_cache(cache):
 
 
 # ---------- 2. Crossref: find the DOI ----------
+def search_query(meta):
+    """What to ask Crossref for this citation. -> (query, basis).
+
+    A title is the strongest signal, but plenty of publishers do not supply one: RSC's
+    JATS gives article-title for NONE of Canela-Xandri's 203 references, only author,
+    journal, year, volume and first page. Sending "{title} {journal} {year}" for those
+    means sending "Green Chem. 2017" -- a journal and a year -- which is why 125 of them
+    scored under 40 and found nothing.
+
+    Author + journal + year + volume + page identifies a paper about as precisely as a
+    title does, and Crossref's bibliographic index handles it well.
+    """
+    title = str(meta.get("title") or "").strip()
+    journal = str(meta.get("journal") or "").strip()
+    year = str(meta.get("year") or "").strip()
+    if title:
+        return " ".join(p for p in (title, journal, year) if p), "title"
+
+    # No title: lead with the first author's surname, which is the discriminating part.
+    authors = meta.get("authors") or []
+    surname = str(authors[0]).split()[-1] if authors else ""
+    parts = [surname, journal, year,
+             str(meta.get("volume") or ""), str(meta.get("fpage") or "")]
+    query = " ".join(p for p in parts if p.strip())
+    if surname and journal and (meta.get("volume") or meta.get("fpage")):
+        return query, "journal_volume_page"
+    # Not enough to be worth a lookup that would only invite a wrong match.
+    return (query if query.strip() else ""), "insufficient"
+
+
+def _fields_agree(meta, item):
+    """Do the citation's year, volume and first page match the record Crossref returned?
+
+    This exists because Crossref's `score` is a Lucene relevance score, not a
+    confidence: it scales with how many terms the query had. "Sheldon Green Chem. 2017
+    19 18" is a SHORTER and MORE precise query than a full title, and it scores ~35 --
+    below the threshold tuned for title queries -- while returning exactly the right
+    paper. Rejecting on score alone threw away correct matches for all 125 of
+    Canela-Xandri's title-less citations.
+
+    Year, volume and first page agreeing is far stronger evidence than any score. A
+    journal has one article at a given volume and page.
+    """
+    def same(a, b):
+        a, b = str(a or "").strip().lower(), str(b or "").strip().lower()
+        return bool(a) and bool(b) and a == b
+
+    year = ""
+    parts = (item.get("issued") or {}).get("date-parts") or [[None]]
+    if parts and parts[0] and parts[0][0]:
+        year = str(parts[0][0])
+    pairs = {
+        "year": (meta.get("year"), year),
+        "volume": (meta.get("volume"), item.get("volume")),
+        "page": (meta.get("fpage"), str(item.get("page") or "").split("-")[0]),
+    }
+    # Compare only what BOTH sides state. Demanding all three rejects correct matches
+    # for no reason: Abbott's Chem. Commun. 2001, 2010 carries no volume in the
+    # citation, so requiring one threw away the right DOI.
+    stated = {k: v for k, v in pairs.items() if str(v[0] or "").strip()
+              and str(v[1] or "").strip()}
+    if not stated or any(not same(a, b) for a, b in stated.values()):
+        return False
+    # Year alone is far too weak -- a journal publishes hundreds of papers a year -- so
+    # a volume or a page has to be among the fields that agreed.
+    return "year" in stated and bool({"volume", "page"} & set(stated))
+
+
 def crossref_search(meta, session, max_retries=5):
-    """Bibliographic search -> (doi, match_score). Backs off politely on 429."""
-    query = f"{meta['title']} {meta['journal']} {meta['year']}".strip()
-    if not query:
-        return None, 0.0
+    """Bibliographic search -> (doi, score, basis, fields_agree). Backs off on 429."""
+    query, basis = search_query(meta)
+    if not query or basis == "insufficient":
+        return None, 0.0, basis, False
     params = {"query.bibliographic": query, "rows": 1, "mailto": config.MAILTO}
     wait = 2.0
     for attempt in range(max_retries):
@@ -143,13 +222,15 @@ def crossref_search(meta, session, max_retries=5):
             r.raise_for_status()
             items = r.json().get("message", {}).get("items", [])
             if not items:
-                return None, 0.0
-            return items[0].get("DOI"), items[0].get("score", 0.0)
+                return None, 0.0, basis, False
+            item = items[0]
+            return (item.get("DOI"), item.get("score", 0.0), basis,
+                    _fields_agree(meta, item))
         except (requests.RequestException, ValueError) as exc:
             print(f"    lookup error ref {meta['num']} (attempt {attempt + 1}): {exc}")
             time.sleep(wait)
             wait *= 2
-    return None, 0.0
+    return None, 0.0, basis, False
 
 
 # ---------- 3. Crossref: full metadata for a known DOI ----------
@@ -230,6 +311,7 @@ def resolve_all(reference_map, paper, cache=None, network=True):
     for meta in reference_map.values():
         if meta.get("doi") and not meta.get("_resolved"):
             meta["match_score"] = meta.get("match_score", 100.0)
+            meta["match_basis"] = "inline_doi"
             meta["doi_source"] = meta.get("doi_source") or "xml"
             meta["_resolved"] = True
 
@@ -247,9 +329,15 @@ def resolve_all(reference_map, paper, cache=None, network=True):
     session = requests.Session()
     for i, num in enumerate(sorted(todo), 1):
         meta = reference_map[num]
-        doi, score = crossref_search(meta, session)
-        meta["doi"] = doi if score >= config.MIN_MATCH_SCORE else None
+        doi, score, basis, agree = crossref_search(meta, session)
+        # Accept on EITHER a strong relevance score or exact bibliographic agreement.
+        # The score is tuned for title queries; year+volume+page agreeing is the better
+        # evidence when there is no title to query with.
+        accepted = score >= config.MIN_MATCH_SCORE or agree
+        meta["doi"] = doi if accepted else None
         meta["match_score"] = score
+        meta["match_basis"] = f"{basis}+fields" if (agree and doi) else basis
+        meta["fields_agree"] = bool(agree)
         meta["doi_source"] = "crossref_search" if meta["doi"] else ""
         meta["_resolved"] = True
         cache[num] = meta
@@ -353,6 +441,7 @@ def reference_fields(meta, owner_key):
         "key": paper_key(meta, owner_key),
         "doi": meta.get("doi") or "",
         "match_score": meta.get("match_score"),
+        "match_basis": meta.get("match_basis") or "",
         "title_agreement": meta.get("title_agreement"),
         "raw": meta.get("raw") or "",
         "authors": authors,
@@ -433,6 +522,7 @@ def to_rows(reference_map, owner_key):
             year=f["year"],
             doi=meta.get("doi"),
             match_score=meta.get("match_score"),
+            match_basis=meta.get("match_basis") or "",
             metadata_source="crossref" if meta.get("_enriched") else "xml",
             title_agreement=meta.get("title_agreement"),
             raw=meta.get("raw", ""),

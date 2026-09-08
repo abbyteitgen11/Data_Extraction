@@ -94,6 +94,17 @@ Rules:
     conductivity.
   - Conductivity and Thermal_conductivity are DIFFERENT properties. The unit decides:
     mS/cm or S/m is electrical Conductivity; W/(m K) is Thermal_conductivity.
+  - A "component" is a constituent OF THE SOLVENT ITSELF. In a des_application table,
+    a substrate, reagent, feedstock, product, biomass source or removed compound is what
+    the DES ACTS ON, not what it is made of: role "context", not "component".
+    An esterification table listing HBA | Alcohol | Acid describes a two-component DES
+    (the HBA plus whatever the caption implies) reacting an alcohol with an acid --
+    the alcohol and the acid are role "context", named alcohol and acid.
+    If WHAT THE PAPER SAYS ABOUT THIS TABLE is shown above, use it to decide: it usually
+    states which columns are the solvent's own components.
+  - A column counting WATER EQUIVALENTS ("H2O" holding 1, 2, 3) is not a name and not a
+    plain context field: give it role "context" with context_field "water_equivalents",
+    so code can read the count as part of the composition.
   - "condition" is for a column giving the temperature or pressure AT WHICH the other
     columns were measured -- a "T/K" column beside a viscosity column.
     A melting point or boiling point is ALSO a temperature, but it IS the measured
@@ -103,7 +114,42 @@ Rules:
 """
 
 
-def table_card(table, paper=None, n_samples=5):
+def table_context(table, paragraphs, max_chars=1200):
+    """What the running text says about this table. -> str.
+
+    The paper usually explains its own table, and that explanation answers exactly the
+    questions the card cannot: which columns are the SOLVENT and which are what the
+    solvent acts on. Canela-Xandri's Table 2 is captioned only "PSTA based DES used in
+    esterification reactions", but the prose says "ammonium-based hydrogen bond
+    acceptors (HBAs) are typically used as primary components" -- which is the
+    difference between reading Alcohol and Acid as DES components and reading them as
+    the reagents they are.
+
+    Paragraphs only. A section can contain the table itself, so section text would feed
+    the table's own contents back into the prompt meant to interpret it.
+    """
+    label = (table.label or "").strip()
+    if not label or not paragraphs:
+        return ""
+    pattern = re.compile(rf"\b{re.escape(label)}\b", re.I)
+    hits = [p for p in paragraphs if p and pattern.search(p)]
+    out, used = [], 0
+    for h in hits[:2]:
+        text = re.sub(r"\s+", " ", h).strip()
+        # Trim to the neighbourhood of the mention rather than pasting a whole page.
+        m = pattern.search(text)
+        start = max(0, m.start() - 500)
+        text = ("..." if start else "") + text[start:m.end() + 500]
+        if used + len(text) > max_chars:
+            text = text[:max_chars - used]
+        out.append(text)
+        used += len(text)
+        if used >= max_chars:
+            break
+    return "\n".join(out)
+
+
+def table_card(table, paper=None, n_samples=5, paragraphs=None):
     """The small, readable view of a table that the model is asked to label."""
     lines = []
     if paper is not None:
@@ -114,6 +160,9 @@ def table_card(table, paper=None, n_samples=5):
         lines.append(f"CAPTION  {table.caption}")
     if table.footnotes:
         lines.append(f"LEGEND  {table.footnotes}")
+    context = table_context(table, paragraphs or [])
+    if context:
+        lines.append(f"WHAT THE PAPER SAYS ABOUT THIS TABLE\n  {context}")
 
     for n, row in enumerate(table.header, 1):
         lines.append(f"\nHEADER ROW {n}")
@@ -244,6 +293,7 @@ def validate(profile, table):
         if marker.marker and marker.marker not in table.footnotes:
             problems.append(f"marker {marker.marker!r} is not in the table's legend")
 
+    problems += _marker_temperature_problems(profile, table)
     problems += _layout_problems(profile, table)
     problems += _implied_problems(profile, table)
     return problems
@@ -312,6 +362,37 @@ def detected_layout(profile, table):
     if not any(_is_band_row(row) for row in table.rows):
         return "wide_per_mixture"
     return "paneled_by_mixture"
+
+
+def _marker_temperature_problems(profile, table):
+    """A marker's temperature must actually appear in the legend that defines it.
+
+    The legend states them outright -- "At a40 C, b20 C, c60 C, ..." -- so this is
+    checkable rather than a matter of trust, and it needs to be: a re-profiling run
+    returned every one of those eight markers as 4.0e-16 instead of 40.0. The columns
+    were right, the layout was right, and 407 measurements were silently stamped 0 C
+    instead of 20-60 C.
+
+    Fidelity cannot catch this. It re-reads each value through the SAME profile, so
+    extractor and re-reader agree perfectly on a temperature that is wrong. This is the
+    only place the profile itself is checked against the paper.
+    """
+    legend = table.footnotes or ""
+    if not legend:
+        return []
+    problems = []
+    for marker in profile.footnote_markers:
+        if marker.meaning != "temperature" or marker.temperature_C is None:
+            continue
+        value = float(marker.temperature_C)
+        # Accept the number however the legend might reasonably write it.
+        spellings = {f"{value:g}", f"{value:.0f}", f"{value:.1f}"}
+        if any(re.search(rf"(?<!\d){re.escape(t)}(?!\d)", legend) for t in spellings):
+            continue
+        problems.append(
+            f"marker {marker.marker!r} claims {value:g} C but the legend does not state "
+            f"that number: {legend[:90]!r}")
+    return problems
 
 
 def _layout_problems(profile, table):
@@ -392,6 +473,36 @@ def _implied_problems(profile, table):
     return problems
 
 
+def _fix_ratio_columns(profile, table):
+    """A ratio column holds numbers. One full of chemical names is a component column.
+
+    "HBA : HBD" over cells reading "ChCl : PTSA" looks like a ratio if you go by the
+    colon, and the model duly called it one -- which left that table with no component
+    column at all, so it silently produced nothing instead of seventeen rows. A ratio
+    is "1:2"; if the cells are words, the column names the components.
+    """
+    from . import xml_utils
+
+    notes = []
+    for column in profile.columns:
+        if column.role != "ratio":
+            continue
+        cells = [c.text.strip() for c in
+                 (row[column.index] for row in table.rows if column.index < len(row))
+                 if c.text.strip()]
+        if len(cells) < 3:
+            continue
+        # A ratio cell is digits and separators; anything with a run of letters is not.
+        wordy = sum(1 for c in cells if len(re.findall(r"[A-Za-z]{3,}", c)) >= 1)
+        if wordy / len(cells) < 0.5:
+            continue
+        notes.append(f"col {column.index} ({column.header!r}) labelled ratio but "
+                     f"{wordy}/{len(cells)} cells name chemicals -- read as component")
+        column.role = "component"
+        column.component_role = column.component_role or "either"
+    return notes
+
+
 def repair(profile, table):
     """Demote labels that cannot be right, rather than failing the whole table.
 
@@ -402,6 +513,7 @@ def repair(profile, table):
     extractor touches, so it becomes `context` instead and says so.
     """
     notes = _fix_condition_columns(profile, table)
+    notes += _fix_ratio_columns(profile, table)
     if profile.record_type == "des_properties":
         return profile, notes
     for column in profile.columns:
@@ -487,9 +599,9 @@ def save_profiles(profiles, paper, cards):
     return path
 
 
-def profile_table(table, paper=None, backend=None, refresh=False):
+def profile_table(table, paper=None, backend=None, refresh=False, paragraphs=None):
     """-> (TableProfile | None, problems, was_cached)."""
-    card = table_card(table, paper)
+    card = table_card(table, paper, paragraphs=paragraphs)
     digest = card_hash(card)
 
     override = load_overrides(paper).get(table.id) if paper is not None else None
@@ -518,13 +630,14 @@ def profile_table(table, paper=None, backend=None, refresh=False):
     return profile, validate(profile, table), was_cached
 
 
-def profile_tables(tables, paper=None, backend=None, refresh=False):
+def profile_tables(tables, paper=None, backend=None, refresh=False, paragraphs=None):
     """-> ({table id: TableProfile}, {table id: problems})."""
     profiles, problems, cards, hits = {}, {}, {}, 0
     for table in tables:
-        profile, issues, was_cached = profile_table(table, paper, backend, refresh)
+        profile, issues, was_cached = profile_table(table, paper, backend, refresh,
+                                                   paragraphs)
         hits += was_cached
-        cards[table.id] = card_hash(table_card(table, paper))
+        cards[table.id] = card_hash(table_card(table, paper, paragraphs=paragraphs))
         name = table.label or table.id
         if profile is None:
             problems[table.id] = issues

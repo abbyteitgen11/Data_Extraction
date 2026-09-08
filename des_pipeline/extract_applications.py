@@ -23,7 +23,8 @@ import re
 from . import config
 from .enrich_components import component_index, resolve_component
 from .extract_references import sources
-from .extract_table import parse_components, parse_ratio, read_references, with_implied
+from .extract_table import (parse_components, parse_ratio, ratio_from_coefficients,
+                            read_references, with_implied)
 from .schema import ApplicationRow
 
 # Domains worth collapsing onto one node. The caption is free text, so two papers will
@@ -92,6 +93,28 @@ def domain_of(caption, label=""):
     return "_".join(words[:3]) or "unspecified"
 
 
+# A count of water equivalents, not a name: Table 7's "H2O" column holds 1, 2, 3.
+# A DES with two waters is a different solvent from the dry one, so the count belongs in
+# the composition -- but "0/1" and "-" state no single number and must add nothing.
+_WATER_COUNT = re.compile(r"^\d{1,2}$")
+
+
+def water_equivalents(detail):
+    """The water count from a `water_equivalents` context field. -> [counts].
+
+    Returns several when the cell lists alternatives ("1,2,3"), which expand into
+    separate rows the same way the esterification alcohols do. Returns none for "0/1"
+    or a dash: a cell that will not commit to a number should not have one invented.
+    """
+    raw = str(detail.get("water_equivalents") or "").strip()
+    if not raw:
+        return []
+    parts = [p.strip() for p in raw.split(",") if p.strip()]
+    if parts and all(_WATER_COUNT.match(p) for p in parts):
+        return [int(p) for p in parts]
+    return []
+
+
 def resolve_names(names, vocabulary):
     """Map written component names onto the corpus vocabulary. -> (resolved, written).
 
@@ -156,19 +179,38 @@ def extract_application_table(table, profile, paper, reference_map,
                 detail[column.context_field or f"col{column.index}"] = text
 
         # One row per combination of the alternatives each cell lists. Usually one.
-        choices = [alternatives(n) for n in names]
-        combinations = list(itertools.product(*choices))
+        # Water equivalents join the product, so "1,2,3" waters becomes three rows in
+        # exactly the way "MeOH, BuOH, HexOH" becomes three.
+        waters = water_equivalents(detail) or [None]
+        choices = [alternatives(n) for n in names] + [waters]
+        combinations = [(c[:-1], c[-1]) for c in itertools.product(*choices)]
         if len(combinations) > MAX_ALTERNATIVES:
             combinations = combinations[:MAX_ALTERNATIVES]
             detail["alternatives_truncated"] = "yes"
 
-        for n, chosen in enumerate(combinations):
+        for n, (chosen, water) in enumerate(combinations):
             written = with_implied(list(chosen), profile)
+            if water is not None:
+                written = written + ["Water"]
             resolved, _written = resolve_names(written, vocabulary)
-            (c1, c2, c3), component_flag = parse_components(resolved)
+            (c1, c2, c3), component_flag, coefficients = parse_components(resolved)
+            # "ChCl : 2PTSA" states its stoichiometry on the name because the table has
+            # no ratio column; without this the only thing distinguishing it from
+            # ChCl : PTSA is lost.
+            row_ratio = ratio_raw
+            if not row_ratio:
+                row_ratio = ratio_from_coefficients(
+                    coefficients, sum(1 for x in (c1, c2, c3) if x))
+            if water is not None:
+                # The other components are one part each unless the table said otherwise.
+                parts = row_ratio.split(":") if row_ratio else \
+                    ["1"] * max(0, sum(1 for x in (c1, c2, c3) if x) - 1)
+                row_ratio = ":".join(parts + [str(water)])
             mixture_names = ":".join(x for x in (c1, c2, c3) if x)
             suffix = f":{n + 1:02d}" if len(combinations) > 1 else ""
             row_detail = dict(detail)
+            if water is not None:
+                row_detail["water_equivalents"] = str(water)
             if len(combinations) > 1:
                 row_detail["one_of"] = f"{n + 1} of {len(combinations)} alternatives"
             rows.append(ApplicationRow(
@@ -178,8 +220,8 @@ def extract_application_table(table, profile, paper, reference_map,
                 Domain=domain,
                 Table_caption=table.caption[:300],
                 Component_1=c1, Component_2=c2, Component_3=c3,
-                Ratio_raw=ratio_raw,
-                Mixture=f"{mixture_names} ({ratio_raw})" if ratio_raw else mixture_names,
+                Ratio_raw=row_ratio,
+                Mixture=f"{mixture_names} ({row_ratio})" if row_ratio else mixture_names,
                 Component_flag=component_flag,
                 Components_written=";".join(written),
                 Implied_components=";".join(profile.implied_components or []),

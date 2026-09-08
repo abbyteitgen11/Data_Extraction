@@ -248,6 +248,40 @@ class Elsevier:
     def glossary(root):
         return []                                        # Elsevier has no glossary element
 
+    PARAGRAPH_TAG = "para"
+
+    @staticmethod
+    def paragraphs(root):
+        """The body's paragraphs, for finding what the prose says about a table.
+
+        Paragraphs only, never whole sections: a <sec> can contain the table itself, so
+        pulling section text would feed a table's own contents back into the prompt that
+        is meant to interpret it.
+        """
+        body = root.find(".//body")
+        scope = body if body is not None else root
+        tag = "para" if scope.find(".//para") is not None else "p"
+        return [xml_utils.text(el) for el in scope.findall(f".//{tag}")]
+
+
+
+def _citation_text(authors, title, journal, year, fields):
+    """A readable citation from parsed fields. -> str.
+
+    `xml_utils.text()` concatenates an element's descendants with no separator, which is
+    right for a table cell and wrong for a bibliography entry: it turns Sheldon's into
+    "SheldonR. A. Green Chem.2017191843". This is what the review queue shows a human
+    and what a Crossref bibliographic query falls back to, so it has to read like a
+    citation.
+    """
+    parts = [", ".join(authors[:6]) + (" et al." if len(authors) > 6 else "")]
+    parts += [p for p in (title, journal, year) if p]
+    if fields.get("volume"):
+        parts.append(fields["volume"])
+    if fields.get("fpage"):
+        parts.append(fields["fpage"] + (f"-{fields['lpage']}" if fields.get("lpage") else ""))
+    return ", ".join(p for p in parts if p and p.strip())
+
 
 # ---------- JATS / PubMed Central ----------
 class JATS:
@@ -417,6 +451,13 @@ class JATS:
                     doi = xml_utils.text(pid)
                     break
 
+            # Volume and pages matter more here than they look. RSC's JATS supplies NO
+            # <article-title> at all -- 203 of 203 in Canela-Xandri -- so a citation is
+            # identified by author, journal, year, volume and first page or not at all.
+            # Discarding these left Crossref searching for "Green Chem. 2017".
+            fields = {k: xml_utils.text(source.find(k))
+                      for k in ("volume", "fpage", "lpage")}
+
             refs[num] = {
                 "num": num,
                 "id": r.get("id") or "",
@@ -424,7 +465,15 @@ class JATS:
                 "title": xml_utils.text(source.find("article-title")),
                 "journal": xml_utils.text(source.find("source")),
                 "year": xml_utils.text(source.find("year")),
-                "raw": xml_utils.text(r),
+                "volume": fields["volume"],
+                "fpage": fields["fpage"],
+                "lpage": fields["lpage"],
+                # Built from the parsed fields, not itertext(): the raw XML runs the
+                # elements together into "SheldonR. A. Green Chem.2017191843", which is
+                # what a human sees in the review queue and on the Paper node.
+                "raw": _citation_text(authors, xml_utils.text(source.find("article-title")),
+                                      xml_utils.text(source.find("source")),
+                                      xml_utils.text(source.find("year")), fields),
                 "doi": doi or None,
                 "doi_source": "xml" if doi else "",
             }
@@ -450,6 +499,22 @@ class JATS:
     @staticmethod
     def glossary(root):
         return root.findall(".//glossary//def-item")
+
+    PARAGRAPH_TAG = "p"
+
+    @staticmethod
+    def paragraphs(root):
+        """The body's paragraphs, for finding what the prose says about a table.
+
+        Paragraphs only, never whole sections: a <sec> can contain the table itself, so
+        pulling section text would feed a table's own contents back into the prompt that
+        is meant to interpret it.
+        """
+        body = root.find(".//body")
+        scope = body if body is not None else root
+        tag = "para" if scope.find(".//para") is not None else "p"
+        return [xml_utils.text(el) for el in scope.findall(f".//{tag}")]
+
 
 
 DIALECTS = (Elsevier, JATS)

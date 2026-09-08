@@ -101,6 +101,109 @@ token in `.env` as `ELSEVIER_INSTTOKEN` (ask your library) or a request from you
 institution's network. Until then, download the XML by hand and drop it in `xml/`; the
 pipeline only needs the file to exist.
 
+### Building a corpus from PMC
+
+```bash
+python fetch_pmc.py --counts      # the census, no downloads
+python fetch_pmc.py --limit 200   # a bounded first pass
+python fetch_pmc.py               # everything: 13,108 papers, 2.3 GB
+python select_papers.py           # score them and stage ~10 for validation
+```
+
+The search is just `"deep eutectic solvent" OR "deep eutectic solvents"` with PMC's
+open-access filter and no year restriction. Filtering happens later, over the manifest —
+not at download time, because a download you have to repeat is expensive and a filter you
+can re-run is not.
+
+**PMC is the only free source of full-text XML.** All four routes, measured 2026-09-08:
+
+| Route | Result |
+|---|---|
+| **NCBI `efetch` (`db=pmc`)** | **works** — 25/25 random OA DES papers returned full text, all parsing as `jats` with a DOI |
+| Europe PMC `fullTextXML` | works; kept as the fallback. 404s on papers it has not ingested yet (38 of 40 published in 2026, which `efetch` served) |
+| Unpaywall | no use — 40/40 DOIs had an OA location, **0/40** offered an `.xml` URL. It indexes PDFs and landing pages |
+| Crossref text-mining links | no use — 18/60 DOIs declare an `application/xml` link, **0/60 downloaded**. Elsevier returns a 200-wrapped auth error, Wiley 403 |
+| Elsevier article API | 403 without an institutional token, as above |
+
+So the reachable corpus is ~13,000 papers against the ~43,000 open-access DES works
+OpenAlex knows of. The rest are Elsevier, RSC, ACS and Wiley, which never deposit in PMC.
+No amount of code reaches them — only an institutional token does.
+
+`efetch` returns a `<pmc-articleset>` root, which `dialects.JATS` already claims, so this
+needed no new reader. It also batches: 20 PMCIDs per POST makes the whole corpus ~660
+requests instead of 13,000. `esearch` refuses `retstart > 9998`, so the search is sliced
+by publication year and the slices are asserted to sum to the unsliced count — a silent
+subset is the failure mode that looks like success.
+
+**PMC, open access, phrase anywhere vs. in title/abstract:**
+
+| Scope | Anywhere | Title/abstract |
+|---|---|---|
+| all years | **13,111** | 2,113 |
+| 2015+ | 13,084 | 2,110 |
+| 2020+ | 12,433 | 1,952 |
+
+The columns differ by 6× because PMC indexes reference lists: most of the `anywhere` set
+only *cites* DES work. So `data/review/pmc_corpus.csv` records `phrase_in` for every
+paper, alongside `n_tables`, `n_references` and `refs_with_doi` as the pipeline's own
+readers see them. Narrowing the corpus is then a query over that file rather than a second
+download.
+
+**The corpus as actually downloaded — 13,108 papers, 2.3 GB:**
+
+| | |
+|---|---|
+| phrase in reference list only | 7,362 |
+| phrase in body only | 3,593 |
+| phrase in title/abstract | **2,114** |
+| phrase absent | 39 |
+| has at least one table | 11,041 |
+| has a DOI (required to run) | 13,104 |
+| unreadable | **0** |
+
+That `2,114` is worth noting: PMC's own `[TIAB]` index independently counts 2,113, so the
+`phrase_in` column agrees with the search engine to within one paper. 3 of the 13,111 were
+unavailable — `efetch` returns metadata and no `<body>` for them, and Europe PMC had
+nothing either.
+
+`"natural deep eutectic"` is deliberately not in the search term and nothing is lost:
+NADES papers write "natural deep eutectic **solvent**", which contains the phrase. Of the
+3,611 open-access papers matching `"natural deep eutectic"`, only 36 fall outside it.
+
+**Files land in `xml/pmc/`, not `xml/`.** `XML_GLOB` is matched with
+`XML_FILES.glob()`, which is not recursive, so nothing downloaded is run until a human
+moves it — otherwise one download would enrol 13,000 papers into the pipeline. They are
+named by PMCID, the only identifier that is stable and known before the file is parsed,
+which is what makes a 13,000-file download resumable by an `exists()` check. The readable
+`<Surname>_<Year>` name is applied by `select_papers.py` when a paper is staged into
+`xml/selected/`.
+
+`select_papers.py` is a **one-off tool, not a pipeline step**, and is deliberately absent
+from `ALL_STEPS`. It fills quotas of property, application and review papers, preferring
+journals not yet represented. Those are guesses about what makes a paper useful to work
+on, which is exactly why they choose what *you* look at and never what enters the graph.
+
+Its one non-obvious rule is how a property paper is recognised. Counting property words in
+a table's text does not work — reviews are full of tables like `Property | Characteristic`
+and `Property | Water | Ionic Liquids | DES`, which name all six properties and tabulate
+none, and three such reviews came top of the first ranking with six "properties" each. So
+a property must be named in a **column header** and that column's own cells must be mostly
+numbers, which is the same evidence `profile_table.validate` demands before believing a
+column map. Two further corrections were needed to make that test agree with the papers we
+already know:
+
+- **Footnote markers are part of the cell.** Sadeghi prints `1.1867a`, so
+  `xml_utils.clean_number` returns `None` and scored the best table in the corpus 0.08
+  numeric. The test is now "starts with a number" — reading the value is
+  `extract_table`'s job.
+- **`config.DASH` cells leave the denominator.** Each of Sadeghi's 1539 rows fills one or
+  two of six property columns, so a property column is mostly `–`; counting those against
+  it put every column under 0.25 and failed the paper outright. A dash means "not reported
+  here", not "not a number".
+
+With both fixed the scorer agrees with what we know: Sadeghi passes with 5 properties, Fan
+with 2, and Canela-Xandri — which tabulates no physical properties at all — with 0.
+
 ## What comes out
 
 Everything lands in `data/` (gitignored).
@@ -177,6 +280,37 @@ in every paper, so the second review to cite a study pays nothing for it.
 Citations resolve through `<xref rid="cit59">` wherever the format provides it, falling
 back to parsing the printed `[40,42-44]` for Elsevier. The rid is a link the publisher
 asserted; the printed number is a convention.
+
+### Matching a citation that has no title
+
+RSC's JATS supplies **no `<article-title>` at all** — 203 of 203 references in
+Canela-Xandri. The Crossref query was therefore built from a journal and a year:
+
+```
+"Green Chem. 2017"          for   Sheldon, Green Chem. 2017, 19, 18
+```
+
+which is not enough to identify anything: 125 of 203 scored under 40 and 125 had no DOI.
+The XML does state `source` 203/203, `year` 203/203, `volume` 196/203, `fpage` 200/203 and
+an author 203/203 — the reader was simply discarding volume and pages. Keeping them gives
+a real query, and the DOI count went from **78 to 187 of 203**:
+
+```
+title present  ->  "{title} {journal} {year}"
+no title       ->  "{surname} {journal} {year} {volume} {fpage}"    "Sheldon Green Chem. 2017 19 18"
+```
+
+Each reference records `match_basis` (`inline_doi` / `title` / `journal_volume_page`) so a
+low score can be interpreted instead of merely distrusted. This matters because Crossref's
+`score` is a **Lucene relevance score, not a confidence** — it scales with query length,
+so scores are not comparable between the two query shapes. `_fields_agree` therefore
+verifies structurally instead, comparing only fields both sides state and requiring year
+plus volume-or-page. A title-less match loses `title_agreement`, its main sanity check, so
+`journal_volume_page` is the weaker basis and is labelled as such.
+
+While fixing this: `xml_utils.text()` concatenates children without separators, so the
+stored citation read `SheldonR. A. Green Chem.2017191843`. JATS `raw` is now built from
+the parsed fields — it is what a human reads in the review queue.
 
 ## Reading a table you have never seen
 
@@ -273,6 +407,40 @@ XML cannot be read through a stale hand-written map.
 Because the legend is now the authority on footnote markers rather than a constant, a
 superscript only means a temperature if *that table* says so — which is what stops the
 charge sign in `[Br⁻]` being read as one.
+
+### What the paper says about its own table
+
+A table's own header is often not enough to read it. The card therefore also carries the
+body paragraphs that mention the table's label — capped at roughly two paragraphs and 1200
+characters, taken from paragraph elements only, so a table can never echo its own contents
+back into its own prompt.
+
+The paper usually answers exactly the question the header leaves open:
+
+> *"in PTSA-based DES esterification, ammonium-based hydrogen bond acceptors (HBAs) are
+> typically used as primary components"* — Canela-Xandri, on Table 2
+
+`dialects` grows a `paragraphs(root)` method for this rather than a second place that
+knows publisher tag names; Elsevier's are `<para>` and JATS's are `<p>`, and the first
+version of this returned zero paragraphs for the Elsevier paper by assuming `<p>`.
+
+**A DES component is not a reagent.** With that context available, the prompt states the
+distinction the model was getting wrong: in a `des_application` table, `component` means a
+constituent of the *solvent*, while a substrate, reagent, feedstock, product or biomass
+source that the DES acts *on* is `context`. Table 2 is `Entry | HBA | Alcohol | Acid`,
+where the alcohol and the acid are what the esterification consumes — labelling all three
+`component` produced `BTMAC:MeOH:Acetic (AA)` flagged `quaternary+`, and worse, the
+three-slot schema then truncated and dropped PTSA, the one component genuinely in the
+solvent. 39 of 118 application rows were affected; the fix takes them to 0, and the
+reagents survive as `alcohol=` / `acid=` in the record's `source_text`.
+
+Re-deriving profiles is guarded, because a prompt change silently invalidates the cache
+for *every* paper. Re-profiling once corrupted Sadeghi's temperature markers to `4.0e-16`
+and stamped 407 measurements at 0 °C — and fidelity still read 1649/1649, because
+fidelity checks transcription against the profile and both sides shared the corrupt one.
+Only a diff of the profile caught it. So a validated profile is pinned with
+`"source": "human"`, and `_marker_temperature_problems` now rejects a marker whose
+temperature does not appear in the legend that defines it.
 
 ## Validating it
 
@@ -901,8 +1069,12 @@ LIMIT 10;
 
 ```
 run_pipeline.py          the driver
+fetch_paper.py           one paper by DOI or PII
+fetch_pmc.py             the whole open-access DES corpus from PMC
+select_papers.py         one-off: stage ~10 downloaded papers for validation
 des_pipeline/
   config.py              paths, constants, credentials from .env
+  pmc.py                 PMC search + download; the only free full-text source
   xml_utils.py           lxml primitives — one copy of each
   schema.py              pydantic models; field order is CSV column order
   router.py              classify the document's parts
@@ -929,7 +1101,10 @@ object model. Nothing in `des_pipeline/` imports them.
 
 0. **A second dialect family.** Wiley and Springer are neither Elsevier nor JATS;
    `detect()` will raise on them by name, which is the intended failure.
-1. Finding papers and fetching XML (pyalex / Unpaywall / publisher APIs).
+1. **Reaching the ~30,000 open-access DES papers that are not in PMC** — Elsevier, RSC,
+   ACS and Wiley. `fetch_pmc.py` covers the ~13,000 that are; Unpaywall and Crossref's
+   text-mining links were both measured to yield no XML at all, so this needs an
+   institutional token rather than more code.
 2. PDF parsing (docling or similar) for papers with no XML.
 3. Digitising the 11 figures.
 4. chemdataextractor — there is a hook at `extract_text_llm.normalize_components`.

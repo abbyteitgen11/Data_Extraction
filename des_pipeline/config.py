@@ -74,6 +74,20 @@ QM9_INDEX = DATA / "qm9_index.json"
 DUPLICATES_CSV = DATA / "duplicate_measurements.csv"
 XML_GLOB = "*.xml"
 
+# ---------- the downloaded PMC corpus ----------
+# Both of these are SUBDIRECTORIES of xml/ on purpose. XML_GLOB is matched with
+# XML_FILES.glob(), which is not recursive, so nothing in here is swept into a
+# run_pipeline.py run. Promoting a paper into xml/ stays a deliberate human act --
+# otherwise one download would enrol 13,000 papers into the pipeline.
+PMC_DIR = XML_FILES / "pmc"                 # every paper the search found
+SELECTED_DIR = XML_FILES / "selected"       # the handful chosen for validation
+
+# ---------- NCBI E-utilities ----------
+# NCBI asks for an email and a tool name on every request, and caps unauthenticated
+# callers at 3 requests/second (10 with a key). A key is optional and absent today.
+NCBI_API_KEY = os.environ.get("NCBI_API_KEY", "")
+NCBI_EMAIL = os.environ.get("NCBI_EMAIL", os.environ.get("CROSSREF_MAILTO", ""))
+
 # ---------- Crossref ----------
 MAILTO = os.environ.get("CROSSREF_MAILTO", "abigail.teitgen@csic.es")
 USER_AGENT = f"DES-KG/1.0 (mailto:{MAILTO})"
@@ -163,6 +177,11 @@ REVIEW_QUEUE_CSV = REVIEW_DIR / "queue.csv"
 # One chemical spelled several ways -> several Component nodes. Hand-edited: a wrong
 # merge is invisible afterwards, so nothing merges unless this file says `yes`.
 COMPONENT_DUPLICATES_CSV = REVIEW_DIR / "component_duplicates.csv"
+# One row per downloaded PMC paper: what it is and what the extractor would see in it.
+# Pure description, no filtering -- narrowing the corpus later is a query over this
+# file rather than a second download.
+PMC_CORPUS_CSV = REVIEW_DIR / "pmc_corpus.csv"
+PAPER_SHORTLIST_CSV = REVIEW_DIR / "paper_shortlist.csv"
 
 # All the ways the table writes "not reported".
 DASH = {"–", "—", "-", "−", ""}

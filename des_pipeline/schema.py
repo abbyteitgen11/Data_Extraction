@@ -156,6 +156,10 @@ class ReferenceRow(BaseModel):
     year: str = ""
     doi: Optional[str] = None
     match_score: Optional[float] = None
+    match_basis: str = ""                # inline_doi | title | journal_volume_page |
+                                         # insufficient. A low score means something
+                                         # different for each, and title_agreement
+                                         # cannot be computed without a title at all.
     metadata_source: str = "xml"         # "crossref" once the enrich pass has run
     title_agreement: Optional[float] = None   # XML vs Crossref word overlap; low = suspect
     raw: str = ""
