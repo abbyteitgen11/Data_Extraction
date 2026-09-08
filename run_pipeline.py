@@ -128,7 +128,7 @@ def _run_paper(path, steps, args, network):
 # "aliases" is a human-review step -- it proposes abbreviation definitions for you to
 # confirm by hand -- so it is deliberately not part of an "all" run.
 ALL_STEPS = ["route", "refs", "table", "figures", "text", "aliases",
-             "components", "qm9", "validate", "graph"]
+             "components", "qm9", "duplicates", "validate", "graph"]
 
 #ALL_STEPS = ["validate"]
 
@@ -227,6 +227,13 @@ def main(argv=None):
 
         print("qm9:")
         qm9_step.run(refresh=args.refresh_qm9)
+
+    # --- duplicates -------------------------------------------------------
+    if "duplicates" in steps:
+        from des_pipeline import duplicates
+
+        print("duplicate components:")
+        duplicates.run()
 
     # --- validate ---------------------------------------------------------
     if "validate" in steps:

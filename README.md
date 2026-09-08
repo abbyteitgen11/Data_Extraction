@@ -459,6 +459,44 @@ then flows into the enrichment step like any other component. A cheap word filte
 compound *classes* ("Amino acids", "Choline salt", "Tetraalkyl ammonium halides") and
 non-chemicals ("HBD", "RCl") from being looked up at all.
 
+### Merging duplicate components
+
+```bash
+python run_pipeline.py --steps duplicates      # writes the review file; merges nothing
+```
+
+`Component` merges on `name`, which is whatever spelling a paper used, so one chemical
+becomes several nodes and its memberships split between them — `Water` (47 mixtures),
+`water` (1) and `H2O` (1) were three nodes. 403 resolved components are **312 distinct
+substances**.
+
+`data/review/component_duplicates.csv` is the authority: nothing merges unless a row says
+`merge = yes`, and you set the surviving `canonical` name. Same hand-edited pattern as
+`component_aliases.json`, for the same reason — a wrong merge is invisible afterwards.
+Once Xylitol and Ribitol are one node, nothing downstream remembers they differed.
+
+Three kinds of group turn up and they need different answers:
+
+| | example | |
+|---|---|---|
+| naming variants | `Water` / `water` / `H2O` | merge |
+| PubChem mis-resolution | `PEG600`…`PEG6000` → diethylene glycol | never merge |
+| stereoisomers | `Glucose` / `Galactose` / `Mannose` | never merge |
+
+Grouping is on the **full** InChIKey for that third case — the connectivity block ignores
+stereochemistry and puts three different sugars in one group.
+
+The proposed `canonical` name is PubChem's preferred name with its casing normalised,
+except where that name is unusable: it offers a CAS number for methyltrioctylammonium
+chloride, `Dichlorozinc` for zinc chloride and `(2S,4R)-pentane-1,2,3,4,5-pentol` for
+xylitol. Those fall back to the corpus's own most-used spelling, and any row proposing a
+name no paper writes says so in `note` so it can be scanned for.
+
+Merging re-keys mixtures too, since `mixture_key` hashes component names — `X:Water (1:2)`
+and `X:water (1:2)` stop being separate. Measurement and component-property rows carry
+keys and names computed before canonicalisation, so both are translated at load time;
+skipping either silently drops data rather than failing.
+
 ### QM9 descriptors
 
 ```bash

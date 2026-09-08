@@ -160,6 +160,9 @@ DEFAULT_TEMP = 25
 # Review directory: the queue and the spot-check verdicts a human fills in.
 REVIEW_DIR = DATA / "review"
 REVIEW_QUEUE_CSV = REVIEW_DIR / "queue.csv"
+# One chemical spelled several ways -> several Component nodes. Hand-edited: a wrong
+# merge is invisible afterwards, so nothing merges unless this file says `yes`.
+COMPONENT_DUPLICATES_CSV = REVIEW_DIR / "component_duplicates.csv"
 
 # All the ways the table writes "not reported".
 DASH = {"–", "—", "-", "−", ""}

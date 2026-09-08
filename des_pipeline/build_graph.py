@@ -116,6 +116,18 @@ def _str(value):
     return str(value)
 
 
+def _canonical(name, mapping):
+    """The surviving spelling for a component name. -> str.
+
+    `mapping` comes from data/review/component_duplicates.csv and contains ONLY groups
+    a human marked `yes`, so an unreviewed or doubted duplicate simply passes through
+    unchanged. The CSVs keep whatever the paper wrote; identity is resolved here.
+    """
+    if not name:
+        return name
+    return mapping.get(str(name).strip(), name)
+
+
 # ---------- turn the wide CSV into the nested shape Cypher wants ----------
 def _paper_rows(references):
     """One record per unique paper key.
@@ -148,13 +160,14 @@ def _paper_rows(references):
     return papers
 
 
-def _mixture_rows(table, components_by_name, roles=None):
+def _mixture_rows(table, components_by_name, roles=None, canonical=None):
     """One record per mixture, with components pre-filtered into a nested list.
 
     Doing the null-filtering in Python (rather than three FOREACH blocks in Cypher)
     is what stops a null Component_3 from becoming a `Component {name: null}` node.
     """
-    rows, by_key = [], {}
+    canonical = canonical or {}
+    rows, by_key, rekeyed = [], {}, {}
     for r in table:
         comps = []
         for i, role in ((1, "HBA"), (2, "HBD"), (3, "HBD")):
@@ -162,6 +175,7 @@ def _mixture_rows(table, components_by_name, roles=None):
             if not name:
                 continue
             extra = components_by_name.get(name, {})
+            name = _canonical(name, canonical)
             comps.append({
                 "name": name,
                 "ratio": r.get(f"Ratio_component_{i}"),
@@ -173,6 +187,12 @@ def _mixture_rows(table, components_by_name, roles=None):
                 "formula": extra.get("molecular_formula"),
             })
         key = mixture_key([c["name"] for c in comps], r.get("Ratio_raw"))
+        # measurements.csv carries a Mixture_key computed at extraction time from the
+        # ORIGINAL spellings. Canonicalising here changes the key, so record the
+        # translation -- without it the measurement rows MERGE fresh Mixture nodes
+        # under the stale keys, and the count goes UP instead of down.
+        if r.get("Mixture_key"):
+            rekeyed[r["Mixture_key"]] = key
         # Every table row that produced this mixture, not just whichever came first:
         # `row_id` held one of them and read as though it were the only one.
         by_key.setdefault(key, []).append(r["Row_id"])
@@ -195,10 +215,10 @@ def _mixture_rows(table, components_by_name, roles=None):
                              else [])),
             "ref_numbers": r.get("Source_ref_numbers") or "",
         })
-    return rows
+    return rows, rekeyed
 
 
-def _measurement_rows(long_rows, roles=None):
+def _measurement_rows(long_rows, roles=None, rekeyed=None):
     """One row per DISTINCT datum, not per report of it. -> list[dict].
 
     Two reviews tabulating the same primary measurement are reporting one fact, and
@@ -217,16 +237,18 @@ def _measurement_rows(long_rows, roles=None):
         key = r.get("Dedup_key") or _hash([r["Measurement_key"]])
         groups.setdefault(key, []).append(r)
 
-    return [_one_measurement(members[0], members, roles, key)
+    return [_one_measurement(members[0], members, roles, key, rekeyed or {})
             for key, members in groups.items()]
 
 
-def _one_measurement(first, members, roles, node_key):
+def _one_measurement(first, members, roles, node_key, rekeyed=None):
     """Assemble one property node from every row that reports the same value."""
     review_papers, primary_papers, refs, mixtures, member_keys = [], [], [], [], []
     for m in members:
         member_keys.append(m["Measurement_key"])
-        pair = {"key": m.get("Mixture_key") or "", "name": m.get("Mixture") or ""}
+        pair = {"key": (rekeyed or {}).get(m.get("Mixture_key"),
+                                            m.get("Mixture_key") or ""),
+                "name": m.get("Mixture") or ""}
         if pair["key"] and pair not in mixtures:
             mixtures.append(pair)
         containing = m.get("Paper_key") or m.get("Paper_DOI") or ""
@@ -274,7 +296,7 @@ def _int(value):
         return None
 
 
-def _component_rows(components_by_name):
+def _component_rows(components_by_name, canonical=None):
     """components.csv -> the scalar properties that belong on (:Component).
 
     Kept as its own pass rather than threaded through _mixture_rows and
@@ -282,8 +304,26 @@ def _component_rows(components_by_name):
     Cypher statements, and eleven more keys in each is a lot of duplication for
     values that depend only on the component's name.
     """
+    canonical = canonical or {}
+    merged_into = {}
+    for written, target in canonical.items():
+        merged_into.setdefault(target, []).append(written)
+
+    # One row per SURVIVING name. Where several spellings collapse, the row whose own
+    # name is the canonical one wins; otherwise the first is used, since they describe
+    # the same substance and carry the same PubChem data.
+    chosen = {}
+    for name, c in components_by_name.items():
+        if c.get("lookup_status") != "ok":
+            continue
+        target = _canonical(name, canonical)
+        if target not in chosen or name == target:
+            chosen[target] = c
+
     return [{
         "name": name,
+        "merged_from": sorted(merged_into.get(name, [])),
+        "canonical_source": "review" if merged_into.get(name) else "",
         # Identifiers are written HERE and nowhere else. They used to be set inside the
         # mixture loops, which only table components pass through, so the 69 components
         # that arrive via the applications route never got a CID even though
@@ -312,18 +352,25 @@ def _component_rows(components_by_name):
         # Computed, gas-phase, single-molecule. Deliberately node attributes rather
         # than property nodes -- see des_pipeline/qm9.py.
         **{f: c.get(f) for f in QM9_FIELDS},
-    } for name, c in components_by_name.items() if c.get("lookup_status") == "ok"]
+    } for name, c in chosen.items()]
 
 
-def _component_property_rows(properties):
-    """component_properties.csv -> one record per measurement, only the loadable ones."""
+def _component_property_rows(properties, canonical=None):
+    """component_properties.csv -> one record per measurement, only the loadable ones.
+
+    The name is canonicalised for the same reason the mixture rows are: the Cypher
+    MATCHes an existing Component by name, so a row still carrying an absorbed spelling
+    matches nothing and its property node is silently never created. That cost 699
+    measurements the first time the merge ran.
+    """
+    canonical = canonical or {}
     return [{
         # Hash here rather than trusting the CSV's `key`: rows written before this
         # module hashed carry the member key in that column, and a node's key must be
         # the same shape whichever vintage of CSV it was loaded from.
         "key": _hash([r.get("member_key") or r["key"]]),
         "member_keys": [r.get("member_key") or r["key"]],
-        "name": r["name"],
+        "name": _canonical(r["name"], canonical),
         "property": r["property"],
         "value": r["value"],
         "unit": r.get("unit") or "",
@@ -369,7 +416,7 @@ def _prose_measurement_rows(prose):
     } for r in prose]
 
 
-def _prose_mixture_rows(prose, components_by_name):
+def _prose_mixture_rows(prose, components_by_name, canonical=None):
     """One record per distinct prose Mixture, components pre-split and null-filtered."""
     from . import xml_utils
 
@@ -379,7 +426,8 @@ def _prose_mixture_rows(prose, components_by_name):
         if not mixture or mixture in seen:
             continue
         seen.add(mixture)
-        names = [n.strip() for n in str(r.get("components_resolved") or "").split(";") if n.strip()]
+        names = [_canonical(n.strip(), canonical or {})
+                 for n in str(r.get("components_resolved") or "").split(";") if n.strip()]
         ratios = xml_utils.split_ratio(r.get("molar_ratio"), n=len(names) or 1)
         comps = []
         for i, name in enumerate(names):
@@ -506,7 +554,7 @@ FOREACH (k IN row.source_keys |
 """
 
 
-def _application_rows(applications, roles=None):
+def _application_rows(applications, roles=None, canonical=None):
     """applications.csv -> the shape APPLICATIONS_CYPHER wants."""
     roles = roles or {}
     rows = []
@@ -520,7 +568,8 @@ def _application_rows(applications, roles=None):
         for i, role in ((1, "HBA"), (2, "HBD"), (3, "HBD")):
             name = r.get(f"Component_{i}")
             if name and str(name).strip() and str(name) != "nan":
-                comps.append({"name": str(name).strip(), "role": role,
+                comps.append({"name": _canonical(str(name).strip(), canonical or {}),
+                              "role": role,
                               "inferred": _norm(name) in implied})
         if not comps or not r.get("Mixture"):
             continue
@@ -584,7 +633,9 @@ FOREACH (k IN row.source_keys |
 COMPONENTS_CYPHER = """
 UNWIND $rows AS r
 MATCH (c:Component {name: r.name})
-  SET c.cid = r.cid,
+  SET c.merged_from = r.merged_from,
+      c.canonical_source = r.canonical_source,
+      c.cid = r.cid,
       c.smiles = r.smiles,
       c.cas = r.cas,
       c.formula = r.formula,
@@ -724,14 +775,23 @@ def build(wipe=False, include_prose=True):
                "year": str(p.get("year") or ""), "role": p.get("role", "review")}
               for p in store.papers()]
 
+    from . import duplicates
+
+    # Only groups a human marked `yes` in data/review/component_duplicates.csv. An
+    # empty file means nothing merges, which is the safe default.
+    canonical = duplicates.canonical_map()
+    if canonical:
+        print(f"  merging {len(canonical)} component spelling(s) into "
+              f"{len(set(canonical.values()))} canonical name(s)")
+
     papers = _paper_rows(references)
-    applications = _application_rows(store.read_all("applications"), roles)
-    mixtures = _mixture_rows(table, components_by_name, roles)
-    measurements = _measurement_rows(long_rows, roles)
-    prose_mixtures = _prose_mixture_rows(prose, components_by_name)
+    applications = _application_rows(store.read_all("applications"), roles, canonical)
+    mixtures, rekeyed = _mixture_rows(table, components_by_name, roles, canonical)
+    measurements = _measurement_rows(long_rows, roles, rekeyed)
+    prose_mixtures = _prose_mixture_rows(prose, components_by_name, canonical)
     prose_measurements = _prose_measurement_rows(prose)
-    component_scalars = _component_rows(components_by_name)
-    property_records = _component_property_rows(component_properties)
+    component_scalars = _component_rows(components_by_name, canonical)
+    property_records = _component_property_rows(component_properties, canonical)
 
     driver = _driver()
     try:
