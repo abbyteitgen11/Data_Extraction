@@ -107,6 +107,15 @@ def _run_paper(path, steps, args, network):
         store.write(tables.unhandled(routed.tables, profiles, problems),
                     "tables_unhandled", pap)
 
+        # Numeric columns that look like a physical quantity but are not in
+        # config.PROPERTIES, so nothing extracts them. Recorded per paper so the
+        # vocabulary can grow on evidence instead of guesswork.
+        candidates = profile_table.discover_properties(routed.tables, profiles, pap)
+        if candidates:
+            store.write(candidates, "property_candidates", pap)
+            print(f"    {len(candidates)} numeric column(s) outside the property "
+                  f"vocabulary -> property_candidates.csv")
+
     if "figures" in steps:
         from des_pipeline import extract_figures as figures
 
@@ -118,10 +127,20 @@ def _run_paper(path, steps, args, network):
         from des_pipeline.schema import LLMMeasurement
 
         print("prose sections:")
-        rows = text.run(routed.sections, pap.key, reference_map=reference_map,
-                        only_property_sections=not args.all_sections,
-                        allow_lookup=network, refresh_llm=args.refresh_llm)
+        rows, used_for = text.run(routed.sections, pap.key,
+                                  reference_map=reference_map,
+                                  only_property_sections=not args.all_sections,
+                                  allow_lookup=network, refresh_llm=args.refresh_llm)
         store.write(rows, "sections_llm", pap, model=LLMMeasurement)
+        if used_for:
+            # Appended to whatever the table route wrote for this paper, not replacing
+            # it: both origins are applications and `Extractor` tells them apart.
+            from des_pipeline.schema import ApplicationRow as _AppRow
+
+            existing = store.read_paper("applications", pap) or []
+            keep = [r for r in existing if (r.get("Extractor") or "table") == "table"]
+            store.write(keep + [r.model_dump() for r in used_for], "applications", pap,
+                        model=_AppRow)
 
     return pap
 

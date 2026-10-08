@@ -20,25 +20,44 @@ because that is how a table reads; `to_measurements` derives the long view the g
 and any ML training want.
 """
 import re
+from dataclasses import dataclass
 
-from . import config, xml_utils
+from . import config, units, xml_utils
 from . import profile_table
 from .extract_references import numbers_for_ids as ref_numbers_for_ids, sources
 from .profile_table import _is_band_row, panel_period
 from .schema import MeasurementRow, MixtureRow, TableRow  # re-exported for the driver
 
 
-def parse_ratio(text, markers=()):
+# What a ratio marker MEANS, by the meaning the profile's legend gave it. This used to
+# be the literals "i", "us" and "C" -- the letters one paper's legend happens to use --
+# tested directly against the cell text, which is precisely the hard-coding the profiler
+# exists to remove. Sadeghi's legend defines those three with these meanings, so its
+# output is unchanged; a paper using different letters now works too.
+_RATIO_FLAGS = {"ratio_basis": "weight_ratio", "stability": "unstable"}
+
+
+def parse_ratio(text, markers=(), profile=None):
     """Read a molar-ratio cell -> (raw text, [r1, r2, r3], flag)."""
     raw = (text or "").strip()
     flag = ""
-    if "i" in markers:
-        flag = "weight_ratio"
-    if "us" in markers or raw.startswith("us"):
-        flag = "unstable"
-    if raw.startswith("C") or "C" in markers:
-        flag = "unknown_ratio"
-    stripped = re.sub(r"^(i|us|C-?)", "", raw)      # "i6:4" -> "6:4"
+    defined = {m.marker: m for m in (profile.footnote_markers if profile else [])
+               if m.marker}
+    # A marker attached to the cell, or written at the front of its text ("i6:4").
+    present = [m for m in markers if m in defined]
+    present += [m for m in defined if raw.startswith(m) and len(m) <= 2
+                and m not in present]
+    for marker in present:
+        mapped = _RATIO_FLAGS.get(defined[marker].meaning)
+        if mapped:
+            flag = mapped
+        elif defined[marker].meaning == "not_reported":
+            flag = "unknown_ratio"
+    stripped = raw
+    for marker in sorted(present, key=len, reverse=True):
+        if stripped.startswith(marker):
+            stripped = stripped[len(marker):].lstrip("-").strip()
+            break
     return raw, xml_utils.split_ratio(stripped), flag
 
 
@@ -118,6 +137,117 @@ def ratio_from_coefficients(coefficients, n_components):
     return ":".join(str(c or 1) for c in used)
 
 
+@dataclass
+class ParsedCell:
+    """What one printed measurement cell says, before any conversion.
+
+    `clean_number` returns None for every form below, so all of them were being dropped
+    as "unparseable". Counted over the ten new papers, in columns a property extractor
+    actually reads: 130 cells carry an uncertainty, 25 an inline temperature, 15 an
+    inline citation. Ranges and "<0.001" appear only in FTIR and p-value columns, so
+    those are recorded and refused rather than guessed at.
+    """
+
+    value: float = None
+    uncertainty: float = None
+    low: float = None
+    high: float = None
+    qualifier: str = ""
+    temperature_C: float = None          # from an inline "(40 °C)"
+    ref_numbers: tuple = ()              # from an inline "(ref. 22)"
+    note: str = ""                       # why nothing parsed, for the skipped-cell audit
+    status: str = ""                     # keeps the row out of the graph
+
+
+_UNCERTAINTY = re.compile(r"^\s*([-−+]?[\d.,]+)\s*(?:±|\+/-|\+-)\s*([\d.,]+)")
+_RANGE = re.compile(r"^\s*([-−]?[\d.,]+)\s*[–—]\s*([-−]?[\d.,]+)\s*$")
+_QUALIFIED = re.compile(r"^\s*([<>≤≥~≈])\s*([-−]?[\d.,]+)\s*$")
+# "(40 °C)", "(at 25 C)", "(298 K)" trailing a value.
+_INLINE_TEMPERATURE = re.compile(
+    r"\(\s*(?:at\s*)?(\d{1,3}(?:\.\d+)?)\s*(?:°|˚|º)?\s*([CK])\s*\)", re.I)
+# "(ref. 22)", "(ref 22)", "(Ref. 22, 23)"
+_INLINE_REF = re.compile(r"\(\s*refs?\.?\s*([\d,\s–—-]+)\)", re.I)
+
+
+def parse_measurement_cell(text, markers=(), profile=None):
+    """One printed cell -> ParsedCell. No conversion, no unit knowledge.
+
+    Everything here is about what the cell SAYS. Turning kelvin into Celsius or
+    kg m-3 into g cm-3 happens later, in `units`, once the column's unit is known.
+    """
+    out = ParsedCell()
+    raw = str(text or "").strip()
+    if not raw:
+        out.note = "not reported"
+        return out
+
+    # Peel the annotations off first, so what is left is just the number. An inline
+    # temperature is the strongest statement of a measurement condition there is -- the
+    # paper put it on that one value -- so it outranks the footnote marker and the
+    # table default.
+    match = _INLINE_TEMPERATURE.search(raw)
+    if match:
+        value = float(match.group(1))
+        if match.group(2).upper() == "K":
+            out.temperature_C = round(value - 273.15, 3) if 200 <= value <= 500 else None
+        elif -100 <= value <= 500:
+            out.temperature_C = value
+        raw = _INLINE_TEMPERATURE.sub(" ", raw).strip()
+
+    match = _INLINE_REF.search(raw)
+    if match:
+        out.ref_numbers = tuple(xml_utils.expand_ref_field(match.group(1)))
+        raw = _INLINE_REF.sub(" ", raw).strip()
+
+    match = _UNCERTAINTY.match(raw)
+    if match:
+        out.value = xml_utils.clean_number(match.group(1))
+        out.uncertainty = xml_utils.clean_number(match.group(2))
+        if out.value is not None:
+            return out
+
+    match = _RANGE.match(raw)
+    if match:
+        out.low = xml_utils.clean_number(match.group(1))
+        out.high = xml_utils.clean_number(match.group(2))
+        if out.low is not None and out.high is not None:
+            # Deliberately no midpoint. The component route already refuses to average a
+            # range ("emit low and high as two records"), and a mean the paper never
+            # printed is a number nobody can check against the source.
+            out.status = "range_only"
+            out.note = "a range, not a value"
+            return out
+
+    match = _QUALIFIED.match(raw)
+    if match:
+        out.qualifier = {"≤": "<", "≥": ">", "≈": "~"}.get(match.group(1), match.group(1))
+        out.value = xml_utils.clean_number(match.group(2))
+        if out.value is not None:
+            return out
+
+    out.value = xml_utils.clean_number(raw)
+    if out.value is None:
+        # A number followed by a BRACKETED annotation we could not classify -- "0.50 (0)".
+        # The value is not in doubt, only the annotation, so it is kept with a note.
+        #
+        # The bracket requirement is not cosmetic. Without it this also matched
+        # "b140 84.5" (one cell holding two values, of which it silently kept the first)
+        # and "1. 2201" (a typo for 1.2201, which it read as 1.0 -- a density wrong by
+        # 20%). Both had previously been reported as unparseable, which was right:
+        # a half-read cell is worse than an unread one, because nothing downstream can
+        # tell it happened.
+        annotated = re.match(r"^\s*([-−]?[\d.,]+)\s*\([^)]*\)\s*$", raw)
+        if annotated and xml_utils.clean_number(annotated.group(1)) is not None:
+            out.value = xml_utils.clean_number(annotated.group(1))
+            out.note = f"unexplained annotation after the value: {raw[:40]!r}"
+        elif re.match(r"^\s*[-−]?[\d.,]+\s+[-−]?[\d.,]+\s*$", raw):
+            out.note = "two values in one cell"
+        else:
+            out.note = ("unparseable" if any(c.isdigit() for c in raw)
+                        else "no numeric value")
+    return out
+
+
 def read_value(cell, column, profile):
     """One property cell -> (value, temperature_C, marker, note).
 
@@ -127,11 +257,31 @@ def read_value(cell, column, profile):
     `note` says why a cell yielded nothing, so `validate.skipped_cells` can show a
     human that "DT" was recognised and declined rather than quietly missed. It is
     derived from the cell's own text and decides nothing.
+
+    Kept as the two-value entry point every caller already uses; `read_cell` below
+    returns everything the cell said, for the callers that build a measurement row.
+    """
+    parsed, _marker, temperature, _source = read_cell(cell, column, profile)
+    return parsed.value, temperature, _marker, parsed.note
+
+
+def read_cell(cell, column, profile):
+    """One property cell -> (ParsedCell, marker, temperature_C, temperature_source).
+
+    Temperature precedence, strongest evidence first:
+      cell_inline       the cell itself says "(40 °C)"
+      marker            a footnote marker this table's legend defines
+      column_header     the header says "298 K" where a unit would go
+      caption_default   the caption or legend states one for the whole table
+      unstated          nothing said so -- and it stays null.
+
+    There is deliberately no last resort. `config.DEFAULT_TEMP = 25` used to be one, and
+    it stamped a condition the paper never reported onto every unmarked value.
     """
     raw = cell.text.strip()
     missing = set(profile.missing_value_tokens) | set(config.DASH)
     if not raw or raw in missing:
-        return None, None, "", "not reported"
+        return ParsedCell(note="not reported"), "", None, "unstated"
 
     defined = {m.marker: m for m in profile.footnote_markers if m.marker}
     marker = next((m for m in cell.markers if m in defined), "")
@@ -149,44 +299,55 @@ def read_value(cell, column, profile):
             xml_utils.clean_number(raw[:-len(marker)]) is not None:
         text = raw[:-len(marker)]
 
-    value = xml_utils.clean_number(text)
-    if value is None:
-        # No digits at all means the cell holds a token standing in for a value --
-        # this table's "DT" ("reported at different temperatures"). Digits that still
-        # will not parse are a source typo or two numbers in one cell.
-        note = "unparseable" if any(c.isdigit() for c in raw) else "no numeric value"
-        return None, None, marker, note
+    parsed = parse_measurement_cell(text, cell.markers, profile)
+    if parsed.value is None and parsed.low is None:
+        return parsed, marker, None, "unstated"
 
     spec = defined.get(marker)
+    header = " ".join([column.header or "", column.unit_as_written or ""])
+    if parsed.temperature_C is not None:
+        return parsed, marker, parsed.temperature_C, "cell_inline"
     if spec is not None and spec.meaning == "temperature" and spec.temperature_C is not None:
-        temperature = round(spec.temperature_C, 3)
-    elif profile.default_temperature_C is not None:
-        temperature = round(profile.default_temperature_C, 3)
-    else:
-        temperature = config.DEFAULT_TEMP
-    return value, temperature, marker, ""
+        return parsed, marker, round(spec.temperature_C, 3), "marker"
+    from_header = units.temperature_in_header(header)
+    if from_header is not None:
+        return parsed, marker, from_header, "column_header"
+    if profile.default_temperature_C is not None:
+        return parsed, marker, round(profile.default_temperature_C, 3), "caption_default"
+    return parsed, marker, None, "unstated"
 
 
-def read_measurement(row, column, profile):
-    """One property cell in its row -> (value, temperature_C, marker, note).
+def read_measurement_cell(row, column, profile):
+    """One property cell in its row -> (ParsedCell, marker, temperature, source).
 
-    The single entry point for re-reading a value, so `validate` cannot disagree with
-    the extractor about what a cell says. It exists because temperature reaches a
-    measurement two different ways: from a footnote marker in a wide table, and from a
-    sibling column in a paneled one. Reading only the marker would have re-derived
-    every one of Fan's 144 measurements at the default 25 C and reported them all as
-    fidelity failures.
+    The single entry point for reading a value, so `validate` cannot disagree with the
+    extractor about what a cell says. It exists because temperature reaches a
+    measurement several ways, and a sibling condition column is one of them: reading
+    only the marker would have re-derived every one of Fan's 144 measurements at the old
+    default 25 C and reported them all as fidelity failures.
+
+    A condition column outranks a footnote marker -- it states the temperature for that
+    ROW, where a marker states it for a whole class of cells -- but it does not outrank
+    the cell writing "(40 °C)" on itself.
     """
-    value, temperature, marker, note = read_value(row[column.index], column, profile)
-    if value is None:
-        return value, temperature, marker, note
+    parsed, marker, temperature, source = read_cell(row[column.index], column, profile)
+    if parsed.value is None and parsed.low is None:
+        return parsed, marker, temperature, source
+    if source == "cell_inline":
+        return parsed, marker, temperature, source
 
     condition = _condition_for(column, profile)
     if condition is not None and condition.index < len(row):
         from_column = read_condition(row[condition.index], condition)
         if from_column is not None:
-            temperature = from_column
-    return value, temperature, marker, note
+            return parsed, marker, from_column, "condition_column"
+    return parsed, marker, temperature, source
+
+
+def read_measurement(row, column, profile):
+    """The 4-tuple view, for callers that only need the value. -> (value, T, marker, note)."""
+    parsed, marker, temperature, _source = read_measurement_cell(row, column, profile)
+    return parsed.value, temperature, marker, parsed.note
 
 
 def _condition_for(column, profile):
@@ -328,11 +489,11 @@ def extract_paneled_table(table, profile, paper, reference_map, definitions=None
     if period < 2:
         return [], [{"Table_id": table.id, "Source_row": -1,
                      "reason": "paneled layout with no repeating column group",
-                     "raw": ""}]
+                     "raw": ""}], {}
 
     panels = [profile.columns[start:start + period]
               for start in range(0, len(profile.columns), period)]
-    rows, skipped = [], []
+    rows, skipped, extras = [], [], {}
     ragged = {index for index, _ in table.ragged}
     current = {}                       # panel number -> the label naming its mixture
 
@@ -355,20 +516,22 @@ def extract_paneled_table(table, profile, paper, reference_map, definitions=None
             if property_col is None or property_col.index >= len(row):
                 continue
 
-            value, marker_temp, _marker, note = read_value(
+            parsed, _marker, temperature, source = read_cell(
                 row[property_col.index], property_col, profile)
-            if value is None:
-                if note and note not in ("not reported",):
+            if parsed.value is None and parsed.low is None:
+                if parsed.note and parsed.note not in ("not reported",):
                     skipped.append({"Table_id": table.id, "Source_row": index,
-                                    "reason": note,
+                                    "reason": parsed.note,
                                     "raw": row[property_col.index].text[:120]})
                 continue
 
-            temperature = marker_temp
-            if condition_col is not None and condition_col.index < len(row):
+            # The panel's own condition column, not `_condition_for`: the panel is the
+            # scope here, and the columns have already been sliced into panels above.
+            if source != "cell_inline" and condition_col is not None \
+                    and condition_col.index < len(row):
                 from_column = read_condition(row[condition_col.index], condition_col)
                 if from_column is not None:
-                    temperature = from_column
+                    temperature, source = from_column, "condition_column"
 
             defined = (definitions or {}).get(_definition_key(label))
             if defined:
@@ -385,13 +548,17 @@ def extract_paneled_table(table, profile, paper, reference_map, definitions=None
                 ratio_raw=ratio_raw, component_flag=component_flag,
                 cited=sources([], reference_map, paper.key),
                 context=f"panel={label}")
+            fields = measurement_fields(parsed, property_col, table,
+                                        property_col.property, temperature, source,
+                                        solute_in_row(row, profile))
             suffix = property_col.property.lower()
-            record[property_col.property] = value
-            record[f"Units_{suffix}"] = _unit_for(property_col)
-            record[f"Temperature_{suffix}"] = temperature
+            record[property_col.property] = fields["Value"]
+            record[f"Units_{suffix}"] = fields["Unit"]
+            record[f"Temperature_{suffix}"] = fields["Temperature_C"]
             record[f"Source_col_{suffix}"] = property_col.index
+            extras[(record["Row_id"], property_col.property)] = fields
             rows.append(MixtureRow(**record))
-    return rows, skipped
+    return rows, skipped, extras
 
 
 def _definition_key(text):
@@ -440,7 +607,15 @@ def extract_definitions(table, profile, paper):
 
 
 def extract_property_table(table, profile, paper, reference_map):
-    """-> (list[MixtureRow], list[dict]) -- the rows, and the ones we could not read."""
+    """-> (rows, skipped, extras).
+
+    `extras` carries everything a measurement knows that a wide mixture row has no
+    column for -- the as-written value and unit, the uncertainty, the temperature's
+    provenance, the status. Keyed by (Row_id, property) and consumed by
+    `to_measurements`. The alternative was four more columns per property on MixtureRow,
+    i.e. 64 more columns, for data only the long format uses.
+    """
+    extras = {}
     by_role = {}
     for column in profile.columns:
         by_role.setdefault(column.role, []).append(column)
@@ -469,7 +644,8 @@ def extract_property_table(table, profile, paper, reference_map):
         (c1, c2, c3), component_flag, _coeff = parse_components(names)
         if ratio_col is not None and ratio_col.index < len(row):
             cell = row[ratio_col.index]
-            ratio_raw, (r1, r2, r3), ratio_flag = parse_ratio(cell.text, cell.markers)
+            ratio_raw, (r1, r2, r3), ratio_flag = parse_ratio(cell.text, cell.markers,
+                                                              profile)
         else:
             ratio_raw, (r1, r2, r3), ratio_flag = "", (None, None, None), ""
 
@@ -496,19 +672,94 @@ def extract_property_table(table, profile, paper, reference_map):
             record[f"Units_{suffix}"] = None
             record[f"Temperature_{suffix}"] = None
             record[f"Source_col_{suffix}"] = None
+
+        solute = solute_in_row(row, profile)
         for column in property_cols:
             if column.index >= len(row):
                 continue
-            value, temperature, _marker, _note = read_value(row[column.index], column,
-                                                            profile)
+            parsed, _marker, temperature, source = read_measurement_cell(
+                row, column, profile)
+            if parsed.value is None and parsed.low is None:
+                if parsed.note and parsed.note != "not reported":
+                    skipped.append({"Table_id": table.id, "Source_row": index,
+                                    "reason": parsed.note,
+                                    "raw": row[column.index].text[:120]})
+                continue
+            fields = measurement_fields(parsed, column, table, column.property,
+                                        temperature, source, solute)
             suffix = column.property.lower()
-            record[column.property] = value
-            record[f"Units_{suffix}"] = (
-                _unit_for(column) if value is not None else None)
-            record[f"Temperature_{suffix}"] = temperature
+            record[column.property] = fields["Value"]
+            record[f"Units_{suffix}"] = fields["Unit"]
+            record[f"Temperature_{suffix}"] = fields["Temperature_C"]
             record[f"Source_col_{suffix}"] = column.index
+            extras[(record["Row_id"], column.property)] = fields
         rows.append(MixtureRow(**record))
-    return rows, skipped
+    return rows, skipped, extras
+
+
+# A context column naming what dissolved. Solubility is a property of a solute IN the
+# DES, so without this the number says nothing and two solutes would merge on Dedup_key.
+_SOLUTE_FIELD = re.compile(r"solute|analyte|drug|compound|substrate|api\b|solubil",
+                           re.I)
+
+
+def solute_in_row(row, profile):
+    """What dissolved, from whichever context column names it. -> str."""
+    for column in profile.columns:
+        if column.role != "context" or column.index >= len(row):
+            continue
+        name = f"{column.context_field or ''} {column.header or ''}"
+        if _SOLUTE_FIELD.search(name):
+            text = row[column.index].text.strip()
+            if text and text not in config.DASH:
+                return text[:120]
+    return ""
+
+
+def measurement_fields(parsed, column, table, prop, temperature, source, solute=""):
+    """Everything a MeasurementRow needs about one value. -> dict.
+
+    This is where a printed number becomes a stored one. Three separate things can be
+    wrong with it and each is recorded rather than absorbed:
+
+      * a multiplier written into the header ("10-3 rho"), applied before the unit;
+      * a unit needing conversion (K, kg m-3, S/m) -- converted, with the as-written
+        number kept so `check_fidelity` still tests the transcription;
+      * a unit naming a different quantity (cSt), or a basis that cannot be read
+        (J per gram or per mole?) -- kept, flagged, and not loaded.
+    """
+    printed_header = " ".join(table.column(column.index)) or column.header or ""
+    written_unit = (column.unit_as_written or "").strip().strip("()")
+    scale = units.header_scale(printed_header)
+    written = parsed.value
+    value, unit, status = units.to_canonical(
+        written * scale if written is not None else None, written_unit, prop)
+    basis, basis_status = units.basis_of(prop, f"{printed_header} {written_unit}")
+
+    if not status and basis_status:
+        status = basis_status
+    if not status and prop in config.SOLUTE_PROPERTIES and not solute:
+        status = "no_solute"
+    if not status and parsed.status:
+        status = parsed.status
+
+    return {
+        "Value": value,
+        "Unit": unit,
+        "Value_as_written": written,
+        "Unit_as_written": written_unit,
+        "Header_scale": scale if scale != 1.0 else None,
+        "Uncertainty": parsed.uncertainty,
+        "Value_low": parsed.low,
+        "Value_high": parsed.high,
+        "Qualifier": parsed.qualifier,
+        "Temperature_C": temperature,
+        "Temperature_source": source,
+        "Solute": solute,
+        "Basis": basis,
+        "status": status or "ok",
+        "_inline_refs": parsed.ref_numbers,
+    }
 
 
 def _unit_for(column):
@@ -565,12 +816,16 @@ def mixture_key(components, ratio):
     return _hash([_component_set(components), _ratio_key(ratio)])
 
 
-def dedup_key(components, ratio, prop, value, temperature, primary_doi):
+def dedup_key(components, ratio, prop, value, temperature, primary_doi, solute=""):
     """Identify the same underlying datum reported by two different papers.
 
     Two reviews tabulating the same primary measurement is a real duplicate, and the
     primary DOI is what makes it one: same original study, same mixture, same number.
     Keyed on the resolved component SET so component order cannot split a pair.
+
+    `solute` is part of the identity because a solubility is a property of a solute IN
+    the DES: the same solvent dissolving two different drugs gives two measurements that
+    would otherwise collide here whenever the numbers happened to match.
     """
     return _hash([
         _component_set(components),
@@ -578,40 +833,59 @@ def dedup_key(components, ratio, prop, value, temperature, primary_doi):
         f"{float(value):.6g}" if value is not None else "",
         f"{float(temperature):.6g}" if temperature is not None else "",
         (primary_doi or "").split(config.SOURCE_SEP)[0].lower(),
+        str(solute or "").strip().lower(),
     ])
 
 
-def to_measurements(rows, paper):
-    """Flatten wide mixture rows into one MeasurementRow per reported value."""
+def to_measurements(rows, paper, extras=None):
+    """Flatten wide mixture rows into one MeasurementRow per reported value.
+
+    `extras` supplies what the wide row has no column for -- the as-written value, the
+    uncertainty, how the temperature was established, and the status that decides
+    whether the row loads. A row with no entry (an older CSV, or a route that does not
+    produce them) still works; it simply carries the defaults.
+    """
+    extras = extras or {}
     out = []
     for mixture in rows:
         for name in config.PROPERTY_NAMES:
+            extra = dict(extras.get((mixture.Row_id, name), {}))
             value = getattr(mixture, name, None)
-            if value is None:
+            if value is None and extra.get("Value_low") is None:
                 continue
+            inline_refs = extra.pop("_inline_refs", ()) or ()
             suffix = name.lower()
-            out.append(MeasurementRow(
-                Measurement_key=f"{mixture.Row_id}:{name}",
-                Row_id=mixture.Row_id,
-                Mixture_key=mixture.Mixture_key,
-                Paper_key=paper.key, Paper_DOI=paper.doi,
-                Table_id=mixture.Table_id, Source_row=mixture.Source_row,
-                Source_col=getattr(mixture, f"Source_col_{suffix}", None),
-                Mixture=mixture.Mixture,
-                Property=name,
-                Value=value,
-                Unit=getattr(mixture, f"Units_{suffix}"),
-                Temperature_C=getattr(mixture, f"Temperature_{suffix}"),
-                Source=f"{mixture.Table_id} row {mixture.Source_row}",
-                Source_ref_numbers=mixture.Source_ref_numbers,
-                Source_DOIs=mixture.Source_DOIs,
-                Source_paper_keys=mixture.Source_paper_keys,
-                Dedup_key=dedup_key(
-                    [mixture.Component_1, mixture.Component_2, mixture.Component_3],
-                    mixture.Ratio_raw, name, value,
-                    getattr(mixture, f"Temperature_{suffix}"), mixture.Source_DOIs),
+            temperature = getattr(mixture, f"Temperature_{suffix}")
+            fields = {
+                "Measurement_key": f"{mixture.Row_id}:{name}",
+                "Row_id": mixture.Row_id,
+                "Mixture_key": mixture.Mixture_key,
+                "Paper_key": paper.key, "Paper_DOI": paper.doi,
+                "Table_id": mixture.Table_id, "Source_row": mixture.Source_row,
+                "Source_col": getattr(mixture, f"Source_col_{suffix}", None),
+                "Mixture": mixture.Mixture,
+                "Property": name,
+                "Value": value,
+                "Unit": getattr(mixture, f"Units_{suffix}"),
+                "Temperature_C": temperature,
+                "Source": f"{mixture.Table_id} row {mixture.Source_row}",
+                "Source_ref_numbers": mixture.Source_ref_numbers,
+                "Source_DOIs": mixture.Source_DOIs,
+                "Source_paper_keys": mixture.Source_paper_keys,
                 **_plausibility(name, value),
-            ))
+                # Last, so the cell's own reading of value, unit and temperature wins
+                # over the wide row's copy of it rather than colliding with it.
+                **extra,
+            }
+            # A citation written inside the value cell -- "285.15 (ref. 22)" -- attributes
+            # that one number, which is more specific than the row's reference column.
+            if inline_refs:
+                fields["Source_ref_numbers"] = ",".join(str(n) for n in inline_refs)
+            fields["Dedup_key"] = dedup_key(
+                [mixture.Component_1, mixture.Component_2, mixture.Component_3],
+                mixture.Ratio_raw, name, fields["Value"], fields["Temperature_C"],
+                mixture.Source_DOIs, fields.get("Solute", ""))
+            out.append(MeasurementRow(**fields))
     return out
 
 
@@ -637,32 +911,44 @@ def extract_tables(tables, profiles, paper, reference_map):
     for table in tables:
         profile = profiles.get(table.id)
         if profile is not None and profile.relevant \
-                and profile.record_type == "des_definitions":
+                and "des_definitions" in profile.content_types:
             found = extract_definitions(table, profile, paper)
             definitions.update(found)
             print(f"    {table.label or table.id}: {len(found)} DES definition(s)")
 
-    mixtures, skipped = [], []
+    mixtures, skipped, extras = [], [], {}
     for table in tables:
         profile = profiles.get(table.id)
         if profile is None or not profile.relevant:
             continue
-        if profile.record_type != "des_properties":
-            continue                              # applications and definitions elsewhere
+        # `in`, not `==`. A table can hold properties AND applications AND definitions;
+        # `extract_applications` reads the same profile for its own half, and neither
+        # route excludes the other any more.
+        if "des_properties" not in profile.content_types:
+            continue
         if profile_table.detected_layout(profile, table) == "paneled_by_mixture":
-            rows, bad = extract_paneled_table(table, profile, paper, reference_map,
-                                              definitions)
+            rows, bad, more = extract_paneled_table(table, profile, paper, reference_map,
+                                                    definitions)
         else:
-            rows, bad = extract_property_table(table, profile, paper, reference_map)
+            rows, bad, more = extract_property_table(table, profile, paper, reference_map)
         mixtures += rows
+        extras.update(more)
         skipped += [{**b, "Paper_key": paper.key} for b in bad]
         print(f"    {table.label or table.id}: {len(rows)} rows"
               f"{f' [{profile.layout}]' if profile.layout != 'wide_per_mixture' else ''}"
               f"{f', {len(bad)} unreadable' if bad else ''}")
-    return mixtures, to_measurements(mixtures, paper), skipped, definitions
+    measurements = to_measurements(mixtures, paper, extras)
+    held = [m for m in measurements if m.status != "ok"]
+    if held:
+        import collections
+
+        why = collections.Counter(m.status for m in held)
+        print(f"    {len(held)} measurement(s) written but not loadable: "
+              + ", ".join(f"{k} {v}" for k, v in why.most_common()))
+    return mixtures, measurements, skipped, definitions
 
 
-EXTRACTED_TYPES = ("des_properties", "des_application", "des_definitions")
+EXTRACTED_TYPES = {"des_properties", "des_application", "des_definitions"}
 
 
 def unhandled(tables, profiles, problems):
@@ -671,14 +957,20 @@ def unhandled(tables, profiles, problems):
     for table in tables:
         profile = profiles.get(table.id)
         if profile is not None and profile.relevant \
-                and profile.record_type in EXTRACTED_TYPES:
+                and EXTRACTED_TYPES & set(profile.content_types):
             continue
-        if profile is None:
+        if table.graphic_only:
+            # A picture of a table. Reported the way a figure is, because it holds real
+            # data that a human could digitise -- and because silently dropping 21 of
+            # every 2547 tables is not a behaviour anyone would choose on purpose.
+            reason = "the table is an image, not markup; needs digitisation"
+        elif profile is None:
             reason = "; ".join(problems.get(table.id, ["no usable profile"]))[:300]
         elif not profile.relevant:
             reason = f"profiled as not relevant: {profile.reason}"[:300]
         else:
-            reason = f"record_type {profile.record_type}, no extractor yet"
+            reason = (f"content_types {'+'.join(profile.content_types)}, "
+                      f"no extractor yet")
         out.append(TableRow(table_id=table.id, label=table.label,
                             caption=table.caption[:300], n_rows=len(table.rows),
                             status=reason))

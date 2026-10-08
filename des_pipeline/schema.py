@@ -11,26 +11,44 @@ naturally list-shaped (authors, reference numbers, DOIs) is stored pre-joined:
 The Source_* columns are positionally aligned: the n-th DOI in Source_DOIs
 belongs to the n-th title in Source_titles, and so on.
 """
-from typing import Literal, Optional, get_args
+from typing import Literal, Optional
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, create_model, model_validator
 
 from .config import PROPERTY_NAMES
 
-PropertyName = Literal[
-    "Melting_point", "Boiling_point", "Density", "Viscosity",
-    "Conductivity", "Thermal_conductivity", "Surface_tension", "Refractive_index",
-]
-
-# Guard against the two lists drifting apart — this is the bug that hid all 332
-# melting points from the graph for months.
-assert set(get_args(PropertyName)) == set(PROPERTY_NAMES), (
-    "schema.PropertyName and config.PROPERTIES disagree"
-)
+# Derived, not written out. This used to be a hand-typed Literal beside a hand-typed
+# list of MixtureRow fields, with two asserts to catch them drifting apart from
+# config.PROPERTIES -- and that drift is the bug that hid all 332 melting points from
+# the graph for months. Generating both from the one declaration makes the drift
+# impossible rather than merely detected, which is what lets a property be added to
+# config.PROPERTIES and nowhere else.
+PropertyName = Literal[tuple(PROPERTY_NAMES)]        # type: ignore[valid-type]
 
 
-class MixtureRow(BaseModel):
-    """One row of Table 2 = one DES mixture. -> data/table2_with_dois.csv"""
+def _property_triples():
+    """The four fields every property contributes to a wide mixture row.
+
+    value / unit / temperature / source column, named as they always were, so the CSV
+    column names and every `getattr(row, f"Units_{suffix}")` in the pipeline are
+    unchanged. Only the typing-out by hand is gone.
+    """
+    fields = {}
+    for name in PROPERTY_NAMES:
+        suffix = name.lower()
+        fields[name] = (Optional[float], None)
+        fields[f"Units_{suffix}"] = (Optional[str], None)
+        fields[f"Temperature_{suffix}"] = (Optional[float], None)
+        fields[f"Source_col_{suffix}"] = (Optional[int], None)
+    return fields
+
+
+class _MixtureRowFields(BaseModel):
+    """Everything on a mixture row except the per-property triples.
+
+    Those are appended by `create_model` below, from config.PROPERTIES, so they end up
+    grouped at the end of the CSV instead of spelled out here eight times over.
+    """
 
     Row_id: str                          # "<slug>:<table>:0001" -- scoped, so a second
                                          # paper's table cannot overwrite this one
@@ -57,40 +75,6 @@ class MixtureRow(BaseModel):
     DOI: str = ""                        # the review; kept for backwards compatibility
     Ref: str = ""                        # the raw citation cell, e.g. "1,26-28"
 
-    # --- the six properties, as value/unit/temperature triples ---
-    Melting_point: Optional[float] = None
-    Units_melting_point: Optional[str] = None
-    Temperature_melting_point: Optional[float] = None
-    Source_col_melting_point: Optional[int] = None
-    Density: Optional[float] = None
-    Units_density: Optional[str] = None
-    Temperature_density: Optional[float] = None
-    Source_col_density: Optional[int] = None
-    Viscosity: Optional[float] = None
-    Units_viscosity: Optional[str] = None
-    Temperature_viscosity: Optional[float] = None
-    Source_col_viscosity: Optional[int] = None
-    Conductivity: Optional[float] = None
-    Units_conductivity: Optional[str] = None
-    Temperature_conductivity: Optional[float] = None
-    Source_col_conductivity: Optional[int] = None
-    Surface_tension: Optional[float] = None
-    Units_surface_tension: Optional[str] = None
-    Temperature_surface_tension: Optional[float] = None
-    Source_col_surface_tension: Optional[int] = None
-    Boiling_point: Optional[float] = None
-    Units_boiling_point: Optional[str] = None
-    Temperature_boiling_point: Optional[float] = None
-    Source_col_boiling_point: Optional[int] = None
-    Refractive_index: Optional[float] = None
-    Units_refractive_index: Optional[str] = None
-    Temperature_refractive_index: Optional[float] = None
-    Source_col_refractive_index: Optional[int] = None
-    Thermal_conductivity: Optional[float] = None
-    Units_thermal_conductivity: Optional[str] = None
-    Temperature_thermal_conductivity: Optional[float] = None
-    Source_col_thermal_conductivity: Optional[int] = None
-
     # --- the review paper that contains the table ---
     Paper_DOI: str = ""
     Paper_authors: str = ""
@@ -114,6 +98,34 @@ class MixtureRow(BaseModel):
     Context: str = ""                    # any role="context" column the profile named
 
 
+MixtureRow = create_model("MixtureRow", __base__=_MixtureRowFields,
+                          **_property_triples())
+MixtureRow.__doc__ = """One row of a property table = one DES mixture. -> mixtures.csv
+
+Wide: a value/unit/temperature/source-column quadruple per property in
+config.PROPERTIES, appended by create_model so the vocabulary has one declaration.
+`to_measurements` derives the long view the graph and any ML training want.
+"""
+
+
+# How a measurement's temperature was established, best evidence first. There is no
+# "assumed 25 C" any more: `config.DEFAULT_TEMP` used to supply one and it invented a
+# condition the paper never stated.
+TEMPERATURE_SOURCES = ("cell_inline", "marker", "condition_column", "column_header",
+                       "caption_default", "unstated")
+
+# What keeps a table measurement out of the graph, in precedence order. Same shape as
+# COMPONENT_PROPERTY_STATUS_ORDER below, for the same reason: the row is always written
+# to the CSV, and the status is what decides whether it loads.
+MEASUREMENT_STATUS_ORDER = (
+    "unhandled_unit",     # the printed unit names a different quantity (cSt, spec. grav.)
+    "ambiguous_basis",    # Heat_capacity or Polarity with no basis readable from the unit
+    "no_solute",          # Solubility with nothing saying what dissolved
+    "range_only",         # the cell states a range, not a value -- never averaged
+    "ok",
+)
+
+
 class MeasurementRow(BaseModel):
     """One property value. Derived from MixtureRow. -> data/measurements_long.csv
 
@@ -130,16 +142,37 @@ class MeasurementRow(BaseModel):
     Source_col: Optional[int] = None
     Mixture: str = ""
     Property: PropertyName
-    Value: float
+    Value: Optional[float] = None        # canonical unit; null for a range-only cell
     Unit: Optional[str] = None
+
+    # --- what the table actually printed, before conversion ---
+    # The pair matters: check_fidelity compares Value_as_written against the cell, so it
+    # tests the TRANSCRIPTION. Comparing the converted value would test the converter
+    # instead, and a wrong conversion would then look like a fidelity pass.
+    Value_as_written: Optional[float] = None
+    Unit_as_written: str = ""
+    Header_scale: Optional[float] = None    # the "10-3" a header wrote in front of rho
+    Uncertainty: Optional[float] = None     # from "1.0101 ± 0.02"
+    Value_low: Optional[float] = None       # from "3200-3500"; never averaged
+    Value_high: Optional[float] = None
+    Qualifier: str = ""                     # "<", ">", "~"
+
     Temperature_C: Optional[float] = None
-    Source: str = "Table 2"              # provenance: where in the paper
+    Temperature_source: str = "unstated"    # one of TEMPERATURE_SOURCES
+
+    # Solubility is a property of a solute IN the DES; without the solute the number
+    # says nothing and must not merge with another solute's through Dedup_key.
+    Solute: str = ""
+    Basis: str = ""                         # per_gram | per_mole | ET30 | pi_star | ...
+
+    Source: str = ""                     # provenance: where in the paper
     Source_ref_numbers: str = ""
     Source_DOIs: str = ""
     Source_paper_keys: str = ""
     Dedup_key: str = ""                  # same primary datum reported by another paper
     plausible: bool = True               # within the property's physical range?
     plausibility_note: str = ""
+    status: str = "ok"                   # see MEASUREMENT_STATUS_ORDER
 
 
 class ReferenceRow(BaseModel):
@@ -241,20 +274,10 @@ class ComponentRow(BaseModel):
     qm9_cv_cal_mol_K: Optional[float] = None
 
 
-# The same drift guard as PropertyName, one level down. MixtureRow spells its property
-# triples out by hand for readability, so adding a property to config without adding
-# its four fields here would extract the values and then silently drop them on the way
-# into the row -- which is exactly how the melting points were lost before.
-_MISSING_TRIPLES = [
-    f"{prefix}{name if prefix == '' else name.lower()}"
-    for name in PROPERTY_NAMES
-    for prefix in ("", "Units_", "Temperature_", "Source_col_")
-    if f"{prefix}{name if prefix == '' else name.lower()}" not in MixtureRow.model_fields
-]
-assert not _MISSING_TRIPLES, (
-    f"MixtureRow is missing fields for properties in config.PROPERTIES: "
-    f"{_MISSING_TRIPLES}"
-)
+# The two asserts that used to sit here -- one guarding PropertyName against
+# config.PROPERTIES, one guarding MixtureRow's hand-written triples against it -- are
+# gone because both are now generated from that one declaration. A guard that detects
+# drift is worth having; not being able to drift is better.
 
 
 class ApplicationRow(BaseModel):
@@ -270,7 +293,7 @@ class ApplicationRow(BaseModel):
     Application_key: str
     Paper_key: str = ""
     Paper_DOI: str = ""
-    Table_id: str = ""
+    Table_id: str = ""                   # "" for a prose row; Section_id carries it
     Source_row: Optional[int] = None
     Domain: str = ""                     # esterification, biodiesel, ...
     Table_caption: str = ""
@@ -283,6 +306,25 @@ class ApplicationRow(BaseModel):
     Components_written: str = ""         # as the table printed them, before resolution
     Implied_components: str = ""         # taken from the caption, not from a column
     Detail: str = ""
+
+    # --- where this row came from, and how much to trust it ---
+    # A table constrains the model with columns; running prose does not, so a prose
+    # application can confuse the solvent with what the solvent acted on and nothing
+    # structural stops it. Keeping the origin on the row means a query can exclude them
+    # in one clause instead of having to guess.
+    Extractor: str = "table"             # table | prose
+    Section_id: str = ""                 # prose only
+    Section_title: str = ""              # prose only
+    Role: str = ""                        # solvent | catalyst | extractant | ...
+    Target: str = ""                      # what the DES acted ON
+    Outcome: Optional[float] = None       # a yield / efficiency / recovery, when stated
+    Outcome_unit: str = ""
+    Outcome_metric: str = ""              # what the number measures, as written
+    source_text: str = ""                 # the verbatim clause, for a prose row
+    quote_found: bool = True              # ...and is it really in the section? (prose)
+    duplicate_of: str = ""                # a table Application_key this restates
+    status: str = "ok"                    # ok | unverified | duplicate | unresolved_components
+
     Source_ref_numbers: str = ""
     Source_DOIs: str = ""
     Source_paper_keys: str = ""
@@ -321,6 +363,15 @@ class ColumnSpec(BaseModel):
                     "separate lines or separated by slashes.")
 
 
+# What a table can hold. A LIST of these, not one of them: `record_type` was a single
+# value, and `extract_tables` skipped anything that was not des_properties while
+# `extract_applications` took only des_application -- so a table with a composition and
+# measured properties lost whichever half the label did not name, and `repair()` went
+# further and demoted the property columns outright.
+ContentType = Literal["des_properties", "des_application", "des_definitions",
+                      "component_properties", "other"]
+
+
 class FootnoteMarker(BaseModel):
     """One marker the table's own legend defines, e.g. superscript 'a' = 40 C."""
 
@@ -345,14 +396,13 @@ class TableProfile(BaseModel):
 
     relevant: bool = Field(
         description="False when the table carries no deep-eutectic-solvent data.")
-    record_type: Literal["des_properties", "des_application", "des_definitions",
-                         "component_properties", "other"] = Field(
-        description="des_properties = measured physical properties of DES mixtures; "
-                    "des_application = a DES used FOR something (source, target, "
-                    "technique, yield); des_definitions = a table that only NAMES DES, "
-                    "giving each an abbreviation or code, with no measurements; "
-                    "component_properties = properties of single pure compounds; "
-                    "other = anything else, including fitted equation parameters.")
+    content_types: list[ContentType] = Field(
+        description="EVERY kind of data this table holds -- a list, because one table "
+                    "often holds more than one. A table giving each DES a composition "
+                    "AND a measured density AND the yield it achieved is all three of "
+                    "des_definitions, des_properties and des_application. Do not pick "
+                    "the single best label. Empty only when the table holds none of "
+                    "them, in which case use [\"other\"].")
     layout: Literal["wide_per_mixture", "paneled_by_mixture"] = Field(
         description="wide_per_mixture = one data row per DES, properties in fixed "
                     "columns. paneled_by_mixture = the SAME column pattern repeats "
@@ -381,6 +431,35 @@ class TableProfile(BaseModel):
     default_temperature_C: Optional[float] = Field(
         description="The temperature unmarked values were measured at, if the caption "
                     "or legend states one. null otherwise.")
+
+    @model_validator(mode="before")
+    @classmethod
+    def _accept_legacy_record_type(cls, data):
+        """Read a profile written before `content_types` existed. -> data.
+
+        Every table_profiles.json on disk stores the old single `record_type`, and one of
+        them -- Sadeghi's -- is pinned `source: "human"` precisely so it is never
+        re-derived. Dropping that on the floor would silently re-profile the one table
+        whose profile has been checked by hand, which is the operation that once stamped
+        407 measurements at 0 C.
+        """
+        if not isinstance(data, dict):
+            return data
+        if data.get("content_types"):
+            return data
+        legacy = data.get("record_type")
+        if legacy:
+            data = {**data, "content_types": [legacy]}
+        return data
+
+    @property
+    def record_type(self):
+        """The first content type, for log lines that want one word. Read-only.
+
+        Deliberately not writable: code that has to DECIDE something must ask
+        `"des_properties" in profile.content_types`, because a table can be two things.
+        """
+        return self.content_types[0] if self.content_types else "other"
 
 
 class ComponentPropertyRow(BaseModel):
@@ -533,9 +612,57 @@ STATUS_ORDER = ("qualitative", "unverified", "duplicate", "unresolved_components
 
 
 class LLMExtraction(BaseModel):
-    """Container so the model can return a list. Its JSON schema constrains the call."""
+    """Container so the model can return lists. Its JSON schema constrains the call.
+
+    Two lists, because a paper says what a DES IS and what it was USED FOR in the same
+    prose. Applications used to be found only when a table tabulated them, which meant
+    they were found in one paper of the three and missed in every review that simply
+    discusses them.
+    """
 
     measurements: list["LLMMeasurementDraft"]
+    applications: list["LLMApplicationDraft"]
+
+
+class LLMApplicationDraft(BaseModel):
+    """One "this DES was used for X" claim in prose.
+
+    Mirrors the fields the table route produces so both feed one ApplicationRow writer.
+    Every field is required-but-nullable for the same grammar reason as the measurement
+    draft: `Optional[X] = None` drops the key out of the schema's `required` list and
+    ollama's grammar then lets the model skip it entirely.
+    """
+
+    components: list[str] = Field(
+        description="Chemicals in the DES, HBA first. Full chemical names, never "
+                    "abbreviations: 'Choline chloride', not 'ChCl'.")
+    molar_ratio: Optional[str] = Field(
+        description="Mixing ratio exactly as written, e.g. '1:2'. null if not stated.")
+    domain: str = Field(
+        description="What the DES was used for, in the paper's own words: "
+                    "'lignin extraction', 'biodiesel purification', 'CO2 capture'.")
+    role: Optional[str] = Field(
+        description="What the DES itself did: solvent, catalyst, extractant, "
+                    "electrolyte, pretreatment, antisolvent. null if not stated.")
+    target: Optional[str] = Field(
+        description="What the DES acted ON -- the substrate, feedstock, analyte or "
+                    "material. This is NOT part of the solvent: in 'ChCl:urea used to "
+                    "extract lignin from birch', the DES is choline chloride and urea "
+                    "and the target is lignin. null if not stated.")
+    outcome: Optional[float] = Field(
+        description="The number quantifying how well it worked -- a yield, efficiency "
+                    "or recovery. null when the text gives none. Never invent one.")
+    outcome_unit: Optional[str] = Field(
+        description="Unit of that number as written, usually '%'. null if none.")
+    outcome_metric: Optional[str] = Field(
+        description="What the number measures, as written: 'lignin yield', 'extraction "
+                    "efficiency', 'removal rate'. null if there is no number.")
+    ref_numbers: Optional[str] = Field(
+        description="The bracketed citation this claim is attributed to, e.g. '113' or "
+                    "'73,80'. The nearest one, not every citation in the sentence.")
+    source_text: str = Field(
+        description="The clause stating this, verbatim and SHORT -- at most about 150 "
+                    "characters, not a whole paragraph.")
 
 
 class LLMMeasurementDraft(BaseModel):

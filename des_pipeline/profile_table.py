@@ -51,8 +51,18 @@ Return, for EVERY column index 0..{n_columns} exactly once, in order:
 
 Also return:
   relevant               false when the table has no DES data at all.
-  record_type            des_properties | des_application | des_definitions |
-                         component_properties | other.
+  content_types          a LIST of every kind of data this table holds. One table often
+                         holds several, and naming only the best one throws the rest
+                         away:
+                           des_properties    measured physical properties of DES
+                           des_application   a DES used FOR something (substrate,
+                                             technique, yield, product)
+                           des_definitions   names/abbreviates DES, no measurements
+                           component_properties  properties of single pure compounds
+                           other             anything else
+                         A table with a composition, a measured density AND the yield it
+                         achieved is all three of the first three. Return every one that
+                         applies, not the closest single label.
                          Fitted equation parameters (columns like A, B, C, r2, E, eta0)
                          are "other" -- they are coefficients, not measurements, even
                          though every cell is a number.
@@ -74,6 +84,10 @@ Also return:
   implied_from           the caption words that justify implied_components.
   reason                 one sentence.
   header_row_count       how many leading rows are header, not data.
+                         When the card says NO HEADER MARKUP, this is what recovers the
+                         table: say how many of the leading rows shown are really the
+                         header, and label the columns from them. 0 if the table truly
+                         starts with data.
   footnote_markers       one entry per marker the legend defines, with its meaning and,
                          for a temperature marker, the temperature in Celsius.
                          Empty list when the table has no legend.
@@ -164,6 +178,16 @@ def table_card(table, paper=None, n_samples=5, paragraphs=None):
     if context:
         lines.append(f"WHAT THE PAPER SAYS ABOUT THIS TABLE\n  {context}")
 
+    if table.header_missing:
+        # No <thead>, so the header is sitting in the data rows. Say so, and show the
+        # candidates: without this the model is asked to echo a header it was never
+        # shown, every echo fails validation, and the table extracts nothing.
+        lines.append("\nNO HEADER MARKUP: this table declares no header row. The first "
+                     "rows below may be the header.\n  Say how many in header_row_count "
+                     "and label the columns from them.")
+        for n, row in enumerate(table.rows[:3]):
+            lines.append(f"\nLEADING ROW {n} (header or data?)")
+            lines += [f"  col {i}: {cell.text}" for i, cell in enumerate(row)]
     for n, row in enumerate(table.header, 1):
         lines.append(f"\nHEADER ROW {n}")
         lines += [f"  col {i}: {cell.text}" for i, cell in enumerate(row)]
@@ -506,32 +530,29 @@ def _fix_ratio_columns(profile, table):
 def repair(profile, table):
     """Demote labels that cannot be right, rather than failing the whole table.
 
-    A property column has to hold numbers. In a table of DES *applications* a
-    mislabelled one is also irrelevant -- "Removed compounds" called a refractive index
-    is wrong, but nothing reads properties out of an application table anyway. Failing
-    the table over it would throw away nine good application rows to avoid a column no
-    extractor touches, so it becomes `context` instead and says so.
+    A property column has to hold numbers, and that is the ONLY reason one is demoted
+    here now. This used to demote every property column in any table not labelled
+    `des_properties`, on the reasoning that nothing reads properties out of an
+    application table -- which was true while `record_type` forced a table to be one
+    thing. It no longer is: a table can declare both, and Solcan's and Alotaibi's do, so
+    demoting on the label alone would throw away exactly the measurements this change
+    exists to keep.
+
+    The numeric check stands on its own evidence and is kept. It is what caught
+    "Yield model substrate (%)" being labelled Refractive_index -- a real quantity, but
+    not one in the vocabulary, so the model picked the nearest name.
     """
     notes = _fix_condition_columns(profile, table)
     notes += _fix_ratio_columns(profile, table)
-    if profile.record_type == "des_properties":
-        return profile, notes
     for column in profile.columns:
         if column.role != "property":
             continue
-        # In an application table a "property" column is almost always a yield, a
-        # water equivalent or a removal rate -- a real quantity, but not one in the
-        # config vocabulary, so the model picks the nearest name and is wrong. This
-        # paper's "Yield model substrate (%)" came back as Refractive_index. Nothing
-        # reads properties out of an application table, and keeping the number as
-        # context loses none of it.
         fraction, checked = _numeric_fraction(table, column.index, profile)
-        why = ("holds no numbers" if checked >= 5 and fraction < 0.5
-               else "is not a physical property of the DES")
-        if profile.record_type != "des_application" and fraction >= 0.5:
+        if checked < 5 or fraction >= 0.5:
             continue
         notes.append(f"col {column.index} ({column.header!r}) labelled "
-                     f"{column.property} {why} -- read as context")
+                     f"{column.property} but only {fraction:.0%} of {checked} filled "
+                     f"cells are numbers -- read as context")
         column.role = "context"
         column.context_field = column.context_field or _snake(column.header)
         column.property = None
@@ -571,6 +592,71 @@ def _snake(text):
     return "_".join(w.lower() for w in words) or "detail"
 
 
+# ---------- what the vocabulary is missing ----------
+#
+# A header that names a quantity rather than a label: it carries a unit in brackets, or
+# reads like a measured thing. Deliberately loose -- this list is read by a human, and a
+# false positive costs one row in a review CSV while a false negative costs a property
+# nobody ever learns the corpus contains.
+_QUANTITY_HEADER = re.compile(
+    r"\(.*(?:%|/|·|\bg\b|\bm\b|\bs\b|\bk\b|\bj\b|\bv\b|\bpa\b|\bmol\b).*\)"
+    r"|temperature|content|capacit|potential|strength|energy|point|index|ratio"
+    r"|conductiv|tension|densit|viscosit|solubilit|polarit|\bph\b|weight|mass",
+    re.I)
+
+
+def property_candidates(table, profile, paper):
+    """Numeric columns that look like properties but are not in the vocabulary. -> rows.
+
+    The answer to "I don't know what properties the other papers have": the corpus says,
+    with the header it printed, the unit it printed and three of its own values, and
+    promoting one is then an edit to config.PROPERTIES and nothing else.
+    """
+    from . import xml_utils
+
+    out = []
+    for column in profile.columns:
+        if column.role in ("property", "component", "ratio", "reference"):
+            continue
+        printed = " ".join(table.column(column.index)) or column.header or ""
+        if not _QUANTITY_HEADER.search(printed):
+            continue
+        values = [row[column.index].text.strip() for row in table.rows
+                  if column.index < len(row) and row[column.index].text.strip()
+                  and row[column.index].text.strip() not in config.DASH]
+        if len(values) < 4:
+            continue
+        numeric = sum(1 for v in values if xml_utils.clean_number(v) is not None
+                      or v[:1].isdigit())
+        if numeric / len(values) < 0.6:
+            continue
+        out.append({
+            "Paper_key": getattr(paper, "key", ""),
+            "slug": getattr(paper, "slug", ""),
+            "Table_id": table.id,
+            "table_label": table.label,
+            "column": column.index,
+            "header": printed[:120],
+            "unit_as_written": (column.unit_as_written or "")[:40],
+            "role_given": column.role,
+            "context_field": column.context_field or "",
+            "n_values": len(values),
+            "examples": " | ".join(values[:3])[:120],
+            "caption": table.caption[:160],
+        })
+    return out
+
+
+def discover_properties(tables, profiles, paper):
+    """Collect property candidates across one paper's tables. -> rows."""
+    out = []
+    for table in tables:
+        profile = profiles.get(table.id)
+        if profile is not None and profile.relevant:
+            out += property_candidates(table, profile, paper)
+    return out
+
+
 # ---------- hand overrides ----------
 def _overrides_path(paper):
     return config.PAPERS_DIR / getattr(paper, "slug", "unknown") / "table_profiles.json"
@@ -599,8 +685,47 @@ def save_profiles(profiles, paper, cards):
     return path
 
 
+# A chemical name looks like this: a run of letters long enough not to be a symbol, or
+# one of the shapes a DES table uses to name its components.
+_NAMEISH = re.compile(r"[A-Za-z]{4,}|\[[A-Za-z]{2,}\]|\b[A-Z]{2,5}\b")
+
+
+def worth_profiling(table):
+    """Should this table cost a model call? -> (bool, reason).
+
+    Every table is one LLM call, so the full 13,108-paper corpus is ~33,000 of them.
+    A table with no numbers AND no chemical names holds neither a measurement nor a
+    composition, whatever its caption says, and the call can only return "other".
+
+    Deliberately generous: it takes evidence to REJECT, and either signal alone is
+    enough to keep. A table of instrument settings survives this, and should -- it is
+    the model's job to call that "other", not this function's.
+    """
+    if table.graphic_only:
+        return False, "the table is an image, not markup; it needs digitisation"
+    if not table.rows:
+        return False, "no data rows"
+    cells = [c.text.strip() for row in table.rows[:60] for c in row
+             if c.text.strip() and c.text.strip() not in config.DASH]
+    if not cells:
+        return False, "every cell is empty or a dash"
+    from . import xml_utils
+
+    if any(xml_utils.clean_number(c) is not None or c[:1].isdigit() for c in cells):
+        return True, ""
+    header = " ".join(" ".join(table.column(i)) for i in range(table.n_columns))
+    if any(_NAMEISH.search(c) for c in cells) or _NAMEISH.search(header):
+        return True, ""
+    return False, "no numeric cell and no chemical name anywhere in the table"
+
+
 def profile_table(table, paper=None, backend=None, refresh=False, paragraphs=None):
-    """-> (TableProfile | None, problems, was_cached)."""
+    """-> (TableProfile | None, problems, was_cached).
+
+    Mutates `table` when its header had to be recovered from the data rows -- the same
+    Table object is what `extract_table` reads, so the promotion has to happen here,
+    between the model naming the header rows and `validate` checking the echo.
+    """
     card = table_card(table, paper, paragraphs=paragraphs)
     digest = card_hash(card)
 
@@ -610,7 +735,13 @@ def profile_table(table, paper=None, backend=None, refresh=False, paragraphs=Non
             print(f"    {table.label or table.id}: hand-written profile is stale "
                   f"(the table has changed since it was written) -- ignoring it")
         else:
-            return TableProfile(**override["profile"]), [], True
+            profile = TableProfile(**override["profile"])
+            table.promote_header(profile.header_row_count)
+            return profile, [], True, digest
+
+    usable, why = worth_profiling(table)
+    if not usable:
+        return None, [f"not profiled: {why}"], True, digest
 
     prompt = PROMPT.format(card=card, n_columns=table.n_columns - 1,
                            properties=", ".join(config.PROPERTY_NAMES))
@@ -622,26 +753,37 @@ def profile_table(table, paper=None, backend=None, refresh=False, paragraphs=Non
     try:
         profile = TableProfile.model_validate_json(raw)
     except ValidationError as exc:
-        return None, [f"output did not validate: {exc.errors()[0]['msg']}"], was_cached
+        return None, [f"output did not validate: {exc.errors()[0]['msg']}"], was_cached, digest
+
+    moved = table.promote_header(profile.header_row_count)
+    if moved:
+        print(f"      no header markup: promoted {moved} leading row(s) into the header")
 
     profile, repairs = repair(profile, table)
     for note in repairs:
         print(f"      {note}")
-    return profile, validate(profile, table), was_cached
+    return profile, validate(profile, table), was_cached, digest
 
 
 def profile_tables(tables, paper=None, backend=None, refresh=False, paragraphs=None):
     """-> ({table id: TableProfile}, {table id: problems})."""
-    profiles, problems, cards, hits = {}, {}, {}, 0
+    profiles, problems, cards, hits, skipped = {}, {}, {}, 0, 0
     for table in tables:
-        profile, issues, was_cached = profile_table(table, paper, backend, refresh,
-                                                   paragraphs)
+        # The digest comes back from profile_table rather than being recomputed here.
+        # Rebuilding the card cost a second full render of every table, and after header
+        # promotion it no longer even described the same table.
+        profile, issues, was_cached, digest = profile_table(
+            table, paper, backend, refresh, paragraphs)
         hits += was_cached
-        cards[table.id] = card_hash(table_card(table, paper, paragraphs=paragraphs))
+        cards[table.id] = digest
         name = table.label or table.id
         if profile is None:
             problems[table.id] = issues
-            print(f"    {name:<12} FAILED  {issues[0] if issues else ''}")
+            if issues and issues[0].startswith("not profiled:"):
+                skipped += 1
+                print(f"    {name:<12} skipped  {issues[0][14:]}")
+            else:
+                print(f"    {name:<12} FAILED  {issues[0] if issues else ''}")
             continue
         if issues:
             problems[table.id] = issues
@@ -651,12 +793,13 @@ def profile_tables(tables, paper=None, backend=None, refresh=False, paragraphs=N
             continue
         profiles[table.id] = profile
         kinds = ", ".join(sorted({c.property for c in profile.columns if c.property}))
-        print(f"    {name:<12} {profile.record_type:<18} {table.n_columns} cols, "
-              f"{len(profile.footnote_markers)} markers"
+        print(f"    {name:<12} {'+'.join(profile.content_types):<28} "
+              f"{table.n_columns} cols, {len(profile.footnote_markers)} markers"
               f"{'  cached' if was_cached else ''}")
         if kinds:
             print(f"                 properties: {kinds}")
     if paper is not None and profiles:
         save_profiles(profiles, paper, cards)
-    print(f"  profiles: {hits} cached, {len(tables) - hits} fresh")
+    print(f"  profiles: {hits} cached, {len(tables) - hits} fresh"
+          f"{f', {skipped} skipped without a call' if skipped else ''}")
     return profiles, problems

@@ -161,7 +161,7 @@ def extract_application_table(table, profile, paper, reference_map,
 
         if ratio_col is not None and ratio_col.index < len(row):
             cell = row[ratio_col.index]
-            ratio_raw, _parts, _flag = parse_ratio(cell.text, cell.markers)
+            ratio_raw, _parts, _flag = parse_ratio(cell.text, cell.markers, profile)
         else:
             ratio_raw = ""
 
@@ -235,9 +235,12 @@ def extract_application_table(table, profile, paper, reference_map,
 
 def extract_applications(tables, profiles, paper, reference_map):
     """Every des_application table in one paper. -> list[ApplicationRow]."""
+    # `in`, not `==`: a table holding both a composition and an application is read by
+    # both routes now. It used to have to choose, and lost whichever half the single
+    # `record_type` label did not name.
     relevant = [t for t in tables
                 if (profiles.get(t.id) is not None and profiles[t.id].relevant
-                    and profiles[t.id].record_type == "des_application")]
+                    and "des_application" in profiles[t.id].content_types)]
     if not relevant:
         return []
 

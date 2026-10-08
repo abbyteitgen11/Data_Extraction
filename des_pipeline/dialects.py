@@ -51,9 +51,36 @@ class Table:
     n_columns: int = 0
     element: object = None
 
+    # The markup declared no header rows, so the real header is sitting in `rows`.
+    # 78 of 2547 table-wraps in the PMC corpus are like this, and every one of them
+    # extracted nothing: `column()` returned [] for every index, so the header echo in
+    # profile_table.validate could not match anything the model said. The profiler's
+    # `header_row_count` says how many leading rows to promote; profile_table does it.
+    header_missing: bool = False
+    # The "table" is a picture of a table. Nothing can be read out of it, but it must be
+    # REPORTED rather than skipped -- the same treatment a figure gets.
+    graphic_only: bool = False
+
     def column(self, index):
         """Every header cell at one column index, top row first."""
         return [row[index].text for row in self.header if index < len(row)]
+
+    def promote_header(self, n_rows):
+        """Move the first `n_rows` data rows into the header. -> the number moved.
+
+        Only for a table whose markup declared no header. Bounded at half the table so a
+        wrong `header_row_count` cannot consume the data: a two-row table claiming five
+        header rows keeps its rows and stays unprofiled instead.
+        """
+        if not self.header_missing or n_rows < 1:
+            return 0
+        n_rows = min(int(n_rows), max(0, len(self.rows) // 2), 3)
+        if n_rows < 1:
+            return 0
+        self.header = self.rows[:n_rows]
+        self.rows = self.rows[n_rows:]
+        self.header_missing = False
+        return n_rows
 
 
 # ---------- shared grid machinery ----------
@@ -160,6 +187,10 @@ class Elsevier:
             group = el.find(".//tgroup")
             header_rows = group.findall("./thead/row") if group is not None else []
             body_rows = group.findall("./tbody/row") if group is not None else []
+            # Same fallback as JATS: a CALS table with no <tbody> keeps its rows
+            # directly under <tgroup>.
+            if group is not None and not body_rows:
+                body_rows = [r for r in group.findall(".//row") if r not in header_rows]
 
             # CALS column spans are named ranges; resolve the names to indices once.
             names = [c.get("colname") for c in (group.findall("./colspec") if group is not None else [])]
@@ -183,6 +214,7 @@ class Elsevier:
                 caption=xml_utils.text(el.find("caption")),
                 footnotes=" ".join(xml_utils.text(l) for l in el.findall(".//legend")),
                 header=header, rows=rows, ragged=ragged, n_columns=width, element=el,
+                header_missing=not header_rows,
             ))
         return out
 
@@ -367,38 +399,66 @@ class JATS:
 
     @staticmethod
     def tables(root):
+        """Every table in the document, including the awkward ones.
+
+        Measured over 800 corpus papers, 2547 table-wraps: 78 declare no <thead>, 20 no
+        <tbody>, 25 hold more than one <table>, and 21 hold a picture instead of a
+        table. Every one of those used to produce either nothing or silence.
+        """
         out = []
         for wrap in root.findall(".//table-wrap"):
-            table = wrap.find(".//table")
-            if table is None:
-                continue
-            header_rows = table.findall(".//thead/tr")
-            body_rows = table.findall(".//tbody/tr")
-
-            def span_of(cell):
-                # XHTML spans say how many cells this one COVERS; _expand wants how many
-                # further rows it still owns, hence the -1.
-                down = int(cell.get("rowspan") or 1) - 1
-                across = int(cell.get("colspan") or 1)
-                return _cell(cell), down, across
-
-            def cells_of(tr):
-                return [c for c in tr if c.tag in ("td", "th")]
-
-            header, width_h, _ = _expand(header_rows, cells_of, span_of)
-            rows, width_b, ragged = _expand(body_rows, cells_of, span_of)
-            width = max(width_h, width_b)
-            for row in header + rows:
-                row += [Cell()] * (width - len(row))
-
+            found = wrap.findall(".//table")
+            label = xml_utils.text(wrap.find("label"))
+            caption = xml_utils.text(wrap.find("caption"))
             foot = wrap.find(".//table-wrap-foot")
-            out.append(Table(
-                id=wrap.get("id", ""),
-                label=xml_utils.text(wrap.find("label")),
-                caption=xml_utils.text(wrap.find("caption")),
-                footnotes=xml_utils.text(foot) if foot is not None else "",
-                header=header, rows=rows, ragged=ragged, n_columns=width, element=wrap,
-            ))
+            footnotes = xml_utils.text(foot) if foot is not None else ""
+
+            if not found:
+                # A picture of a table. Recorded so `unhandled` can list it for
+                # digitisation; skipping it silently is the one option with nothing to
+                # be said for it.
+                out.append(Table(
+                    id=wrap.get("id", ""), label=label, caption=caption,
+                    footnotes=footnotes, element=wrap,
+                    graphic_only=wrap.find(".//graphic") is not None,
+                ))
+                continue
+
+            for n, table in enumerate(found):
+                header_rows = table.findall(".//thead/tr")
+                body_rows = table.findall(".//tbody/tr")
+                # No <tbody>: the rows are bare <tr> children of <table>. Reading only
+                # tbody gave these tables zero rows, so they profiled and extracted
+                # nothing without ever looking wrong.
+                if not body_rows:
+                    body_rows = [tr for tr in table.iter("tr")
+                                 if tr not in header_rows]
+
+                def span_of(cell):
+                    # XHTML spans say how many cells this one COVERS; _expand wants how
+                    # many further rows it still owns, hence the -1.
+                    down = int(cell.get("rowspan") or 1) - 1
+                    across = int(cell.get("colspan") or 1)
+                    return _cell(cell), down, across
+
+                def cells_of(tr):
+                    return [c for c in tr if c.tag in ("td", "th")]
+
+                header, width_h, _ = _expand(header_rows, cells_of, span_of)
+                rows, width_b, ragged = _expand(body_rows, cells_of, span_of)
+                width = max(width_h, width_b)
+                for row in header + rows:
+                    row += [Cell()] * (width - len(row))
+
+                out.append(Table(
+                    # A second table in one wrap would otherwise share the wrap's id, and
+                    # Row_id, the profile cache and the fidelity re-read all key on it.
+                    id=wrap.get("id", "") + (f".{n + 1}" if n else ""),
+                    label=label + (f" ({n + 1})" if n else ""),
+                    caption=caption, footnotes=footnotes,
+                    header=header, rows=rows, ragged=ragged, n_columns=width,
+                    element=wrap, header_missing=not header_rows,
+                ))
         return out
 
     @staticmethod

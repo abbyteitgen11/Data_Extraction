@@ -35,13 +35,18 @@ from . import config, xml_utils
 from .enrich_components import (_norm_key, component_index, resolve_components,
                                 resolve_phrase)
 from .extract_references import sources
-from .schema import STATUS_ORDER, LLMExtraction, LLMMeasurement
+from .schema import STATUS_ORDER, ApplicationRow, LLMExtraction, LLMMeasurement
 
-PROMPT = """You extract deep eutectic solvent (DES) property measurements from one \
-section of a chemistry review paper.
+PROMPT = """You extract two things from one section of a chemistry paper about deep \
+eutectic solvents (DES): property MEASUREMENTS, and APPLICATIONS -- what a DES was \
+used for.
 
 The section is titled "{title}", so the measurements it describes are most likely \
 {property_hint}.
+
+Return TWO lists. Either may be empty; most sections fill only one.
+
+=== measurements ===
 
 Return one record per (DES, property) pair the text reports. Emit EVERY field of \
 every record, using null where the text does not state it.
@@ -57,8 +62,7 @@ every record, using null where the text does not state it.
   molar_ratio    The mixing ratio exactly as written: "1:2", "1:1.5", "1:1:1".
                  It usually sits in brackets right after the components:
                  "ChAc:EG(1:2, 23 C)" -> "1:2".
-  property       One of: Melting_point, Density, Viscosity, Conductivity,
-                 Surface_tension, Refractive_index.
+  property       One of: {properties}.
   value          The number stated in the text, or null.
                  USE null when the text only ranks or compares DESs and gives no
                  number ("A > B > C", "higher than", "increases with").
@@ -81,12 +85,55 @@ Rules:
   - Citation numbers in square brackets, years and page numbers are NOT data.
   - If the section states no DES measurements, return an empty list.
 
-Example -- illustration only, this sentence is NOT in the text below:
+Example measurement -- illustration only, this sentence is NOT in the text below:
   "TBAB:Gly (1:3, viscosity 47.3 mPa.s at 30 C) [999]"
   -> {{"components": ["Tetrabutylammonium bromide", "Glycolic acid"],
        "molar_ratio": "1:3", "property": "Viscosity", "value": 47.3,
        "unit": "mPa.s", "temperature_C": 30.0, "ref_numbers": "999",
        "source_text": "TBAB:Gly (1:3, viscosity 47.3 mPa.s at 30 C) [999]"}}
+
+=== applications ===
+
+Return one record per (DES, use) pair the text reports: a DES used AS something, or
+used FOR something.
+
+  components     The DES itself, HBA first, full chemical names. Same rule as above.
+  molar_ratio    As written, or null.
+  domain         What it was used for, in the paper's own words: "lignin extraction",
+                 "biodiesel purification", "CO2 capture", "metal leaching".
+  role           What the DES itself did: solvent, catalyst, extractant, electrolyte,
+                 pretreatment, antisolvent. null if the text does not say.
+  target         What the DES acted ON -- the substrate, feedstock, analyte, material
+                 or compound removed.
+
+                 THE COMMONEST MISTAKE IS PUTTING THE TARGET IN components. The DES is
+                 what the solvent is MADE OF; the target is what it was applied to.
+                 "ChCl:urea was used to extract lignin from birch sawdust"
+                     components = ["Choline chloride", "Urea"]
+                     target     = "lignin from birch sawdust"
+                 Lignin is NOT a component of the solvent. Neither is the alcohol or
+                 the acid in an esterification, nor the metal in a leaching study.
+  outcome        The number saying how well it worked -- a yield, efficiency, recovery
+                 or conversion. null if the text gives none. NEVER invent one.
+  outcome_unit   Its unit as written, usually "%". null if there is no number.
+  outcome_metric What that number measures, as written: "lignin yield", "extraction
+                 efficiency", "removal rate". null if there is no number.
+  ref_numbers    The citation this claim is attributed to, as written. null if none.
+  source_text    The clause stating it, verbatim and SHORT (about 150 characters).
+
+Rules:
+  - A DES merely NAMED, characterised or measured is not an application. There must be
+    a use: something it dissolved, extracted, catalysed, separated or was a medium for.
+  - Do not invent a domain for a DES the section only lists.
+  - If the section describes no use of any DES, return an empty list.
+
+Example application -- illustration only, this sentence is NOT in the text below:
+  "ChCl:lactic acid (1:2) removed 87% of the lignin from oak sawdust [42]"
+  -> {{"components": ["Choline chloride", "Lactic acid"], "molar_ratio": "1:2",
+       "domain": "lignin removal", "role": "solvent", "target": "oak sawdust",
+       "outcome": 87.0, "outcome_unit": "%", "outcome_metric": "lignin removal",
+       "ref_numbers": "42",
+       "source_text": "removed 87% of the lignin from oak sawdust [42]"}}
 
 TEXT:
 {text}
@@ -455,11 +502,34 @@ def _status_for(row):
     return "ok"
 
 
+def property_for_title(title):
+    """Which property a section title is about. -> name, or "".
+
+    Keyword matching, because exact equality was one paper's table of contents: across
+    the ten new papers `title in config.PROPERTY_SECTIONS` selected 3 sections out of
+    203, and rejected "2.2.1. Melting Point of Deep Eutectic Solvents" for carrying a
+    section number.
+    """
+    stripped = re.sub(r"^[\d.\s]+", "", str(title or "")).strip().lower()
+    for name, pattern in config.PROPERTY_SECTION_KEYWORDS:
+        if re.search(pattern, stripped):
+            return name
+    return ""
+
+
+def is_application_section(title):
+    """Does this section's title suggest it says what a DES was USED FOR? -> bool."""
+    stripped = re.sub(r"^[\d.\s]+", "", str(title or "")).strip().lower()
+    return any(re.search(p, stripped) for p in config.APPLICATION_SECTION_KEYWORDS)
+
+
 def extract_section(section_id, title, text, paper_doi="", reference_map=None,
                     index=None, backend=None, allow_lookup=False, refresh_llm=False):
-    """-> (list[LLMMeasurement], elapsed_seconds, was_cached) for one prose section."""
-    hint = config.PROPERTY_SECTIONS.get(title, "any of the six properties")
-    prompt = PROMPT.format(title=title, property_hint=hint, text=text)
+    """-> (measurements, applications, elapsed_seconds, was_cached) for one section."""
+    name = property_for_title(title)
+    hint = name or "any of the properties listed"
+    prompt = PROMPT.format(title=title, property_hint=hint, text=text,
+                           properties=", ".join(config.PROPERTY_NAMES))
 
     started = time.time()
     raw, was_cached = cached_call_llm(prompt, LLMExtraction.model_json_schema(),
@@ -471,14 +541,19 @@ def extract_section(section_id, title, text, paper_doi="", reference_map=None,
     (config.RAW_LLM_DIR / f"{section_id or 'section'}.json").write_text(raw, encoding="utf-8")
 
     try:
-        drafts = LLMExtraction.model_validate_json(raw).measurements
+        parsed = LLMExtraction.model_validate_json(raw)
+        drafts, application_drafts = parsed.measurements, parsed.applications
     except ValidationError as exc:
         hint_text = ""
         if not raw.rstrip().endswith("}"):
+            # Now that one response carries two lists it is longer, and a cut-off
+            # response loses the measurements as well as the applications. If this
+            # starts happening the fix is a second call per section, not a bigger
+            # budget -- see the OLLAMA_NUM_PREDICT note in config.py.
             hint_text = f" -- output looks cut off; try a larger num_predict"
         print(f"    {section_id} {title!r}: output did not validate "
               f"({exc.errors()[0]['msg']}){hint_text}")
-        return [], elapsed, was_cached
+        return [], [], elapsed, was_cached
 
     normalised_text = re.sub(r"\s+", " ", text)
     rows = []
@@ -542,20 +617,101 @@ def extract_section(section_id, title, text, paper_doi="", reference_map=None,
         value = f"{draft.value:g}" if draft.value is not None else "none"
         row.Measurement_key = f"P-{section_id}:{draft.property}:{stem}:{value}"
         rows.append(row)
-    return rows, elapsed, was_cached
+
+    applications = _application_rows(application_drafts, section_id, title,
+                                     normalised_text, paper_doi, reference_map,
+                                     index, allow_lookup)
+    return rows, applications, elapsed, was_cached
+
+
+def _application_rows(drafts, section_id, title, normalised_text, paper_doi,
+                      reference_map, index, allow_lookup):
+    """Prose application drafts -> list[ApplicationRow].
+
+    The same three guards the measurement route uses, for the same reason -- prose is
+    the least constrained thing the model reads, and a table at least has columns:
+
+      * the quote must really be in the section (`quote_found`);
+      * component names resolve against the corpus vocabulary, and an unresolved one is
+        recorded rather than guessed at;
+      * the status decides what loads, and nothing unverified does.
+    """
+    from .extract_applications import domain_of
+
+    out = []
+    for n, draft in enumerate(drafts, 1):
+        written = normalize_components(draft.components, normalised_text)
+        resolved, unresolved, _ = resolve_components(written, index,
+                                                     allow_lookup=allow_lookup)
+        quote = re.sub(r"\s+", " ", draft.source_text or "").strip()
+        found = bool(quote) and quote[:80].lower() in normalised_text.lower()
+
+        numbers = xml_utils.expand_ref_field(draft.ref_numbers or "")
+        cited = sources(numbers, reference_map, paper_doi)
+
+        components = (resolved + [None, None, None])[:3]
+        ratio = (draft.molar_ratio or "").strip()
+        names = ":".join(c for c in components if c)
+        status = "ok"
+        if not found:
+            status = "unverified"
+        elif unresolved or not names:
+            status = "unresolved_components"
+
+        out.append(ApplicationRow(
+            Application_key=f"P-{section_id}:{n:03d}",
+            Paper_key=paper_doi, Paper_DOI=paper_doi,
+            Domain=domain_of(draft.domain or "", ""),
+            Table_caption=(draft.domain or "")[:300],
+            Component_1=components[0], Component_2=components[1],
+            Component_3=components[2],
+            Ratio_raw=ratio,
+            Mixture=f"{names} ({ratio})" if ratio else names,
+            Components_written=";".join(written),
+            Component_flag="quaternary+" if len(resolved) > 3 else "",
+            Detail=" | ".join(
+                f"{k}={v}" for k, v in (("role", draft.role), ("target", draft.target),
+                                        ("metric", draft.outcome_metric)) if v)[:500],
+            Extractor="prose", Section_id=section_id, Section_title=title[:120],
+            Role=(draft.role or "")[:80], Target=(draft.target or "")[:200],
+            Outcome=draft.outcome, Outcome_unit=(draft.outcome_unit or "")[:20],
+            Outcome_metric=(draft.outcome_metric or "")[:80],
+            source_text=quote[:300], quote_found=found, status=status,
+            Source_ref_numbers=",".join(str(x) for x in numbers),
+            Source_DOIs=cited["doi"], Source_paper_keys=cited["key"],
+            Source_titles=cited["title"], Source_years=cited["year"],
+        ))
+    return out
 
 
 # ---------- all sections ----------
+def choose_sections(sections, only_property_sections=True):
+    """Which sections are worth a model call. -> [(id, title, text)].
+
+    Two filters over one list, not one: a property is discussed in a section named
+    after it, an application in Results / Extraction / Pretreatment. Selecting only the
+    first kind found 3 of the ten new papers' 203 sections.
+
+    Sections shorter than MIN_SECTION_CHARS are dropped whatever their title -- one
+    review here has 82 sections, many of them a single heading line.
+    """
+    chosen = []
+    for sid, title, text in sections:
+        if len(text or "") < config.MIN_SECTION_CHARS:
+            continue
+        if not only_property_sections or property_for_title(title) \
+                or is_application_section(title):
+            chosen.append((sid, title, text))
+    return chosen
+
+
 def run(sections, paper_doi="", reference_map=None, only_property_sections=True,
         backend=None, allow_lookup=True, refresh_llm=False):
-    """Extract from every routed prose section. -> list[LLMMeasurement]."""
-    chosen = [
-        (sid, title, text) for sid, title, text in sections
-        if not only_property_sections or title in config.PROPERTY_SECTIONS
-    ]
+    """Extract from every routed prose section. -> (measurements, applications)."""
+    chosen = choose_sections(sections, only_property_sections)
     if not chosen:
         print("  no matching prose sections (use --all-sections to widen)")
-        return []
+        return [], []
 
     index = component_index()
 
@@ -566,9 +722,9 @@ def run(sections, paper_doi="", reference_map=None, only_property_sections=True,
                   f"num_ctx={config.OLLAMA_NUM_CTX})")
     print(f"  {len(chosen)} section(s) via {backend_name}{detail}")
 
-    rows, total_seconds, hits = [], 0.0, 0
+    rows, applications, total_seconds, hits = [], [], 0.0, 0
     for sid, title, text in chosen:
-        found, elapsed, was_cached = extract_section(
+        found, used_for, elapsed, was_cached = extract_section(
             sid, title, text, paper_doi, reference_map=reference_map, index=index,
             backend=backend, allow_lookup=allow_lookup, refresh_llm=refresh_llm)
         total_seconds += elapsed
@@ -576,8 +732,10 @@ def run(sections, paper_doi="", reference_map=None, only_property_sections=True,
         ok = sum(1 for r in found if r.verified)
         timing = "  cached" if was_cached else f"{elapsed:6.1f}s"
         print(f"    {sid} {title[:30]:<32} {timing}  "
-              f"{len(found):>3} found, {ok:>3} verified")
+              f"{len(found):>3} found, {ok:>3} verified"
+              f"{f', {len(used_for)} application(s)' if used_for else ''}")
         rows += found
+        applications += used_for
 
     mark_duplicates(rows)
     for n, row in enumerate(rows, 1):
@@ -603,4 +761,39 @@ def run(sections, paper_doi="", reference_map=None, only_property_sections=True,
         print(f"  unresolved component names ({len(unresolved)}): {', '.join(unresolved)}")
         print(f"  -> add them to {config.COMPONENT_ALIASES.name}, or run "
               f"--steps aliases for candidates")
-    return rows
+
+    if applications:
+        mark_duplicate_applications(applications)
+        used = Counter(a.status for a in applications)
+        quoted = sum(1 for a in applications if a.quote_found)
+        print(f"  applications from prose: {len(applications)} "
+              f"({quoted} with the quote found in the section)")
+        for status, n in used.most_common():
+            print(f"    {status:<24}{n:>4}{' -> graph' if status == 'ok' else ''}")
+    return rows, applications
+
+
+def mark_duplicate_applications(applications):
+    """Flag a prose application that restates one a table already gave. -> None.
+
+    The table is authoritative for the same reason it is for measurements: it was read
+    from columns, not from a sentence. Matched on the mixture and the domain, which is
+    all two accounts of the same use are guaranteed to share.
+    """
+    from . import store
+
+    try:
+        existing = store.read_all("applications")
+    except Exception:
+        return
+    seen = {}
+    for row in existing:
+        if (row.get("Extractor") or "table") != "table":
+            continue
+        key = (_norm_key(row.get("Mixture", "")), (row.get("Domain") or "").lower())
+        seen.setdefault(key, row.get("Application_key", ""))
+    for app in applications:
+        key = (_norm_key(app.Mixture), (app.Domain or "").lower())
+        if key in seen and app.status == "ok":
+            app.duplicate_of = seen[key]
+            app.status = "duplicate"

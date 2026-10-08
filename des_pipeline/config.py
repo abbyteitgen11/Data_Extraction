@@ -109,6 +109,15 @@ MIN_MATCH_SCORE = 40          # Crossref confidence below this is treated as "no
 #                    Seeded from the observed 1st/99th percentiles with headroom.
 #                    Refractive index is the tight, well-behaved one, so a violation
 #                    there is a strong signal of an extraction bug rather than a typo.
+#   basis            for a property printed on two incompatible bases. Heat capacity is
+#                    tabulated per gram AND per mole, and no conversion exists between
+#                    them without the molar mass; polarity names several unrelated
+#                    scales. A value whose basis cannot be read off the printed unit is
+#                    given status "ambiguous_basis" and kept out of the graph.
+#   needs_solute     the value describes a SOLUTE IN the DES, not the DES. Solubility is
+#                    the only one: "465 ug/mL" means nothing without saying of what, and
+#                    two different solutes must never merge through dedup_key. A row
+#                    with no solute gets status "no_solute" and does not load.
 PROPERTIES = {
     "Melting_point":    {"unit": "C",        "pugview": "Melting Point",
                          "plausible_range": (-150, 400)},
@@ -131,12 +140,49 @@ PROPERTIES = {
                          "plausible_range": (10, 100)},
     "Refractive_index": {"unit": "",         "pugview": None,
                          "plausible_range": (1.2, 1.8)},
+
+    # --- added after surveying the PMC corpus. The counts are papers out of a random
+    # 1200 of the 13,108 downloaded, measured on columns that are actually numeric.
+    "pH":               {"unit": "",         "pugview": None,        # 36 papers
+                         "plausible_range": (-1, 15)},
+    "Water_content":    {"unit": "wt%",      "pugview": None,        # 15 papers
+                         "plausible_range": (0, 100)},
+    "Decomposition_temperature": {"unit": "C", "pugview": None,      # 3 papers, and 1
+                                  "plausible_range": (50, 600)},     # of the 10 selected
+    "Glass_transition": {"unit": "C",        "pugview": None,        # 6 papers
+                         "plausible_range": (-150, 300)},
+    "Zeta_potential":   {"unit": "mV",       "pugview": None,        # 6 papers
+                         "plausible_range": (-150, 150)},
+    # Printed as J/(g K) and as J/(mol K). Those are different quantities, so the basis
+    # has to be established from the unit or the value is meaningless.
+    # The separator class allows brackets: heat capacity is printed "J/gK", "J g-1 K-1"
+    # and "J/(mol K)" alike, and a pattern that only allowed one separator character
+    # read the last of those as having no basis at all.
+    "Heat_capacity":    {"unit": "J*g^-1*K^-1", "pugview": None,     # 3 papers
+                         "plausible_range": (0.5, 5),
+                         "basis": {"per_mole": r"\bj[\s·⋅*/()-]*mol|\bkj[\s·⋅*/()-]*mol",
+                                   "per_gram": r"\bj[\s·⋅*/()-]*g|\bkj[\s·⋅*/()-]*kg"}},
+    # "Polarity" is not one scale. E_T(30) is in kcal/mol and runs ~30-70; Kamlet-Taft
+    # pi*, alpha and beta are dimensionless and run ~0-2. Reporting them as one number
+    # would put values from unrelated scales in the same distribution.
+    "Polarity_ET30":    {"unit": "kcal*mol^-1", "pugview": None,     # 5 papers
+                         "plausible_range": (30, 75),
+                         "basis": {"ET30": r"kcal|e\s*t\s*\(?30",
+                                   "pi_star": r"π\*|pi\*",
+                                   "alpha": r"\balpha\b|\bα\b",
+                                   "beta": r"\bbeta\b|\bβ\b"}},
+    # A property of a solute IN the DES, not of the DES. See needs_solute above.
+    "Solubility":       {"unit": "mg*mL^-1", "pugview": None,        # 12 papers
+                         "plausible_range": (0, 2000),
+                         "needs_solute": True},
 }
 PLAUSIBLE_RANGE = {n: s["plausible_range"] for n, s in PROPERTIES.items()}
 # Only the properties whose names are confusable need one; absent means "no constraint".
 UNIT_PATTERN = {n: s["unit_pattern"] for n, s in PROPERTIES.items() if s.get("unit_pattern")}
 PROPERTY_NAMES = tuple(PROPERTIES)
 PROPERTY_UNITS = {name: spec["unit"] for name, spec in PROPERTIES.items()}
+PROPERTY_BASIS = {n: s["basis"] for n, s in PROPERTIES.items() if s.get("basis")}
+SOLUTE_PROPERTIES = tuple(n for n, s in PROPERTIES.items() if s.get("needs_solute"))
 
 # PUG-View heading -> our property name. Used by the component route.
 PUGVIEW_PROPERTIES = {spec["pugview"]: name for name, spec in PROPERTIES.items()
@@ -165,11 +211,13 @@ UNIT_ALIASES = {
     "w/m/k": "W*m^-1*K^-1", "w m-1 k-1": "W*m^-1*K^-1", "w·m−1k−1": "W*m^-1*K^-1",
 }
 
-# Footnote markers used to be hard-coded here, copied from one paper's legend. They
-# now come from that paper's own legend via profile_table, so a second paper with a
-# different convention needs no code change. This is only the fallback for a table
-# whose caption states no measurement temperature at all.
-DEFAULT_TEMP = 25
+# There is deliberately NO default measurement temperature.
+#
+# `DEFAULT_TEMP = 25` used to live here and was applied whenever a table stated no
+# temperature, which stamped 25 C on measurements nobody said were made at 25 C -- an
+# invented condition, indistinguishable in the graph from one the paper actually
+# reported. An unstated temperature is now null, and `Temperature_source` on the
+# measurement says which of the six ways it was established, "unstated" included.
 
 # Review directory: the queue and the spot-check verdicts a human fills in.
 REVIEW_DIR = DATA / "review"
@@ -182,6 +230,10 @@ COMPONENT_DUPLICATES_CSV = REVIEW_DIR / "component_duplicates.csv"
 # file rather than a second download.
 PMC_CORPUS_CSV = REVIEW_DIR / "pmc_corpus.csv"
 PAPER_SHORTLIST_CSV = REVIEW_DIR / "paper_shortlist.csv"
+# Numeric columns that look like a physical quantity but are not in PROPERTIES, so no
+# extractor touches them. Recording them is how the vocabulary grows on evidence rather
+# than on guesswork -- and it is the audit trail that nothing was dropped in silence.
+PROPERTY_CANDIDATES_CSV = REVIEW_DIR / "property_candidates.csv"
 
 # All the ways the table writes "not reported".
 DASH = {"–", "—", "-", "−", ""}
@@ -191,15 +243,47 @@ DASH = {"–", "—", "-", "−", ""}
 SOURCE_SEP = "|"
 
 # ---------- prose sections worth sending to the LLM ----------
-# These six section titles match the six properties in Table 2.
-PROPERTY_SECTIONS = {
-    "Melting point": "Melting_point",
-    "Density": "Density",
-    "Viscosity": "Viscosity",
-    "Electrical conductivity": "Conductivity",
-    "Surface tension": "Surface_tension",
-    "Refractive index": "Refractive_index",
-}
+#
+# This used to be a dict of six exact section titles, matched with `title in
+# PROPERTY_SECTIONS`. That is one paper's table of contents: across the ten new papers it
+# selected 3 sections out of 203, against 6 of 14 for the paper it was written from.
+# Marco-Velasco's "2.2.1. Melting Point of Deep Eutectic Solvents" names the property in
+# its own title and was rejected for carrying a section number.
+#
+# So the title is matched on keywords instead. First match wins, which is why
+# Thermal_conductivity is listed before Conductivity -- "thermal conductivity" contains
+# "conductivity", and the more specific pattern has to be tried first.
+PROPERTY_SECTION_KEYWORDS = (
+    ("Thermal_conductivity", r"thermal conductiv"),
+    ("Melting_point", r"melting|freezing|eutectic point|phase behaviour|phase behavior"),
+    ("Boiling_point", r"boiling"),
+    ("Density", r"densit"),
+    ("Viscosity", r"viscosit|rheolog"),
+    ("Conductivity", r"conductiv|ionic transport"),
+    ("Surface_tension", r"surface tension|interfacial tension"),
+    ("Refractive_index", r"refractive index|refractomet"),
+    ("Decomposition_temperature", r"decomposit|thermal stabilit|thermogravimetr|\btga\b"),
+    ("Glass_transition", r"glass transition|\bdsc\b"),
+    ("Heat_capacity", r"heat capacit|specific heat"),
+    ("Polarity_ET30", r"polarit|solvatochrom|kamlet"),
+    ("Zeta_potential", r"zeta potential"),
+    ("Water_content", r"water content|water activity|hygroscop"),
+    ("Solubility", r"solubilit|dissolution"),
+    ("pH", r"\bph\b|acidit"),
+)
+
+# Where a paper says what a DES was USED FOR. Applications live in the results and in
+# method sections, not in a section named after a property, so the prose route selects
+# them separately -- the same section list, a different filter.
+APPLICATION_SECTION_KEYWORDS = (
+    r"applicat|extraction|pretreat|pre-treat|delignif|fractionat|synthesis|catalys",
+    r"biodiesel|esterificat|transesterificat|leach|recovery|separat|absorb|adsorb",
+    r"electro|batter|corros|result|discussion|performance|efficien|yield",
+)
+
+# A section too short to contain a reported measurement, and long enough to be worth the
+# call. Guards against sending 82 one-line headings (Barbara has that many sections).
+MIN_SECTION_CHARS = 200
 
 # ---------- LLM ----------
 LLM_BACKEND = os.environ.get("DES_LLM_BACKEND", "ollama")     # "ollama" | "anthropic"
