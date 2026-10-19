@@ -12,7 +12,6 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 XML_FILES = ROOT / "xml"
 XML = XML_FILES / "SadeghiDESReview.xml"
-DATA = ROOT / "data"
 
 
 def _load_dotenv(path=ROOT / ".env"):
@@ -29,6 +28,21 @@ def _load_dotenv(path=ROOT / ".env"):
 
 _load_dotenv()
 
+# Two kinds of thing live under data/, and they must not be confused when comparing
+# models. OUTPUTS depend on which model read the paper; CACHES of network lookups
+# (Crossref, PubChem, QM9) and hand-edited review files do not. A run tag gives each
+# model its own outputs while every run shares the caches, so comparing four models
+# does not mean four rounds of Crossref and PubChem.
+#
+#   DES_RUN_TAG unset   outputs in data/                 (the default, as before)
+#   DES_RUN_TAG=qwen3   outputs in runs/qwen3/data/
+SHARED_DATA = ROOT / "data"
+RUN_TAG = os.environ.get("DES_RUN_TAG", "").strip()
+RUN_DIR = ROOT / "runs" / RUN_TAG if RUN_TAG else None
+DATA = RUN_DIR / "data" if RUN_DIR else SHARED_DATA
+# Token use, cost and latency of every fresh model call, for comparing models.
+USAGE_CSV = (RUN_DIR if RUN_DIR else SHARED_DATA) / "usage.csv"
+
 # Outputs. Everything the pipeline writes lands in data/.
 TABLE_CSV = DATA / "table2_with_dois.csv"      # wide: one row per DES mixture
 LONG_CSV = DATA / "measurements_long.csv"      # long: one row per measurement
@@ -44,8 +58,11 @@ TABLES_UNHANDLED_CSV = DATA / "tables_unhandled.csv"
 # every REPORTED_IN edge would point at the wrong study. Caches now live per paper at
 # data/papers/<slug>/reference_map.json; this path survives only so the old file can be
 # migrated into the paper it actually belongs to. See extract_references._migrate_legacy.
-LEGACY_REFERENCE_CACHE = DATA / "reference_map.json"
-COMPONENT_CACHE = DATA / "components_cache.json"
+LEGACY_REFERENCE_CACHE = SHARED_DATA / "reference_map.json"
+COMPONENT_CACHE = SHARED_DATA / "components_cache.json"
+# Per-paper reference maps are Crossref lookups, not model output, so every run tag
+# reads and writes the same ones: data/papers/<slug>/reference_map.json.
+REFERENCE_MAP_DIR = SHARED_DATA / "papers"
 RAW_LLM_DIR = ROOT / "raw_responses"
 # Model responses keyed by content. A full prose run costs 30-45 minutes, so this is
 # what makes re-assessing a paper after an alias-file change effectively free.
@@ -65,12 +82,15 @@ COMPONENT_PROPERTIES_CSV = DATA / "component_properties.csv"
 # paper's identity onto another's data. Identity now comes from des_pipeline.paper.
 PAPERS_DIR = DATA / "papers"
 PAPERS_CSV = DATA / "papers.csv"
-CROSSREF_CACHE = DATA / "crossref_cache.json"     # shared across papers, keyed by DOI
+CROSSREF_CACHE = SHARED_DATA / "crossref_cache.json"   # shared across papers and runs
+# Hand-pinned table profiles ("source": "human") are a human's verdict, not a model's,
+# so a tagged run still honours the ones in data/papers/<slug>/table_profiles.json.
+HUMAN_PROFILES_DIR = SHARED_DATA / "papers"
 
 # QM9: computed descriptors for small organic molecules. torch_geometric manages the
 # download under QM9_DIR; QM9_INDEX is our own skeleton -> properties map.
-QM9_DIR = DATA / "qm9"
-QM9_INDEX = DATA / "qm9_index.json"
+QM9_DIR = SHARED_DATA / "qm9"
+QM9_INDEX = SHARED_DATA / "qm9_index.json"
 DUPLICATES_CSV = DATA / "duplicate_measurements.csv"
 XML_GLOB = "*.xml"
 
@@ -145,8 +165,10 @@ PROPERTIES = {
     # 1200 of the 13,108 downloaded, measured on columns that are actually numeric.
     "pH":               {"unit": "",         "pugview": None,        # 36 papers
                          "plausible_range": (-1, 15)},
-    "Water_content":    {"unit": "wt%",      "pugview": None,        # 15 papers
-                         "plausible_range": (0, 100)},
+    # Water_content was here and is deliberately gone. In every paper reviewed it was
+    # how the DES was MADE ("ChCl:LA 1:1 + 20% water", Solcan's water % design factor),
+    # and reading it as a measured property split one solvent into a dry mixture plus a
+    # number. Water is now a component of the composition -- see composition.py.
     "Decomposition_temperature": {"unit": "C", "pugview": None,      # 3 papers, and 1
                                   "plausible_range": (50, 600)},     # of the 10 selected
     "Glass_transition": {"unit": "C",        "pugview": None,        # 6 papers
@@ -183,6 +205,56 @@ PROPERTY_NAMES = tuple(PROPERTIES)
 PROPERTY_UNITS = {name: spec["unit"] for name, spec in PROPERTIES.items()}
 PROPERTY_BASIS = {n: s["basis"] for n, s in PROPERTIES.items() if s.get("basis")}
 SOLUTE_PROPERTIES = tuple(n for n, s in PROPERTIES.items() if s.get("needs_solute"))
+# The value IS a temperature, so the measurement has no separate measuring temperature.
+# A caption's "at 25 C" applies to the densities beside it, never to the melting point.
+PHASE_TRANSITION_PROPERTIES = ("Melting_point", "Boiling_point",
+                               "Decomposition_temperature", "Glass_transition")
+
+# ---------- what a DES is used FOR ----------
+#
+# A CONTROLLED vocabulary. The domain used to fall back to the first three words of a
+# table caption, which produced "summary_some_recent" and "examples_different_liquids" --
+# names that are not domains and that no query would ever ask for. Anything that matches
+# nothing is "other", and the paper's own wording is kept in Domain_detail.
+#
+# First match wins, so the specific entries come before the general ones: "biodiesel"
+# before "esterification", "pharmaceutical" before "extraction".
+APPLICATION_DOMAINS = (
+    ("pharmaceutical_solubilization", ("drug solubil", "solubility of", "solubilization of",
+                                       "solubilisation of", "pharmaceutical", "drug",
+                                       "api ", "active pharmaceutical", "fluconazole")),
+    ("drug_delivery", ("drug delivery", "transdermal", "formulation")),
+    ("biodiesel", ("biodiesel", "fame", "transesterification", "glycerol removal",
+                   "glycerol extraction")),
+    ("esterification", ("esterification", "ester synthesis")),
+    ("biomass_fractionation", ("lignocellulos", "lignin", "fractionation", "delignif",
+                               "pretreatment", "pre-treatment", "biomass", "cellulose",
+                               "hemicellulose", "biorefin")),
+    ("natural_product_extraction", ("bioactive", "polyphenol", "phenolic", "flavonoid",
+                                    "plant extract", "leaf extract", "leaves",
+                                    "natural product", "antioxidant", "anthocyanin")),
+    ("analytical_sample_prep", ("microextraction", "sample preparation", "sorbent",
+                                "solid-phase extraction", "spe", "mspe", "determination",
+                                "preconcentration", "analytical")),
+    ("metal_processing", ("metal", "leaching", "electrodeposition", "electroplating",
+                          "battery recycling", "ore")),
+    ("electrochemistry_batteries", ("electrolyte", "battery", "batteries", "lithium-ion",
+                                    "supercapacitor", "electrochem", "corrosion")),
+    ("gas_capture", ("co2", "carbon dioxide", "gas absorption", "so2", "h2s", "capture")),
+    ("membrane_separation", ("membrane", "pervaporation")),
+    ("fuel_cleaning", ("crude oil", "desulfurization", "desulphurization",
+                       "denitrogenation", "fuel")),
+    # "polymer" alone is not a keyword: "polymeric membranes" are membranes.
+    ("polymer_materials", ("polymer chemistry", "polymer synthesis", "polymeriz",
+                           "polymeris", "monomer", "hydrogel",
+                           "nanomaterial", "nanoparticle", "material", "composite")),
+    ("catalysis", ("catalys", "catalyst")),
+    ("organic_synthesis_medium", ("reaction medium", "synthesis", "promoter",
+                                  "organic reaction")),
+    ("extraction_separation", ("extraction", "separation", "extractant", "absorb",
+                               "adsorb", "removal")),
+)
+APPLICATION_DOMAIN_NAMES = tuple(d for d, _ in APPLICATION_DOMAINS) + ("other",)
 
 # PUG-View heading -> our property name. Used by the component route.
 PUGVIEW_PROPERTIES = {spec["pugview"]: name for name, spec in PROPERTIES.items()
@@ -223,8 +295,9 @@ UNIT_ALIASES = {
 REVIEW_DIR = DATA / "review"
 REVIEW_QUEUE_CSV = REVIEW_DIR / "queue.csv"
 # One chemical spelled several ways -> several Component nodes. Hand-edited: a wrong
-# merge is invisible afterwards, so nothing merges unless this file says `yes`.
-COMPONENT_DUPLICATES_CSV = REVIEW_DIR / "component_duplicates.csv"
+# merge is invisible afterwards, so nothing merges unless this file says `yes`. Shared
+# across run tags, because the decisions are a human's, not a model's.
+COMPONENT_DUPLICATES_CSV = SHARED_DATA / "review" / "component_duplicates.csv"
 # One row per downloaded PMC paper: what it is and what the extractor would see in it.
 # Pure description, no filtering -- narrowing the corpus later is a query over this
 # file rather than a second download.
@@ -267,7 +340,6 @@ PROPERTY_SECTION_KEYWORDS = (
     ("Heat_capacity", r"heat capacit|specific heat"),
     ("Polarity_ET30", r"polarit|solvatochrom|kamlet"),
     ("Zeta_potential", r"zeta potential"),
-    ("Water_content", r"water content|water activity|hygroscop"),
     ("Solubility", r"solubilit|dissolution"),
     ("pH", r"\bph\b|acidit"),
 )
@@ -288,7 +360,27 @@ MIN_SECTION_CHARS = 200
 # ---------- LLM ----------
 LLM_BACKEND = os.environ.get("DES_LLM_BACKEND", "ollama")     # "ollama" | "anthropic"
 OLLAMA_MODEL = os.environ.get("DES_OLLAMA_MODEL", "qwen3")
-ANTHROPIC_MODEL = os.environ.get("DES_ANTHROPIC_MODEL", "claude-sonnet-4-5")
+ANTHROPIC_MODEL = os.environ.get("DES_ANTHROPIC_MODEL", "claude-sonnet-5-5")
+
+# Anthropic settings. Effort is the depth control on current models: Opus 5.5 cannot
+# turn thinking off at all, so "low" is how its cost is kept proportionate to what is a
+# labelling task. Empty means the model's own default.
+ANTHROPIC_EFFORT = os.environ.get("DES_ANTHROPIC_EFFORT", "low")
+ANTHROPIC_MAX_TOKENS = int(os.environ.get("DES_ANTHROPIC_MAX_TOKENS", 16000))
+# Parallel calls within one paper. Only the API backends benefit; ollama serves one
+# request at a time on a laptop, so it stays sequential whatever this says.
+ANTHROPIC_CONCURRENCY = int(os.environ.get("DES_ANTHROPIC_CONCURRENCY", 8))
+# A hard stop on spend for one run tag, in US dollars, read from USAGE_CSV. 0 = none.
+# Stopping loses nothing: every answer received so far is in the response cache.
+BUDGET_USD = float(os.environ.get("DES_BUDGET_USD", 0) or 0)
+# $ per million tokens (input, output). From the Anthropic price list, 2026-09-25; check
+# it before trusting a cost figure. Thinking tokens are billed as output.
+ANTHROPIC_PRICES = {
+    "claude-opus-5-5": (4.00, 20.00),
+    "claude-sonnet-5-5": (2.00, 10.00),
+    "claude-haiku-4-5": (1.00, 5.00),
+    "claude-fable-5-1": (10.00, 50.00),
+}
 
 # qwen3 is a reasoning model and ollama turns thinking on by default. We read only
 # message.content and discard message.thinking, so every reasoning token is wasted:

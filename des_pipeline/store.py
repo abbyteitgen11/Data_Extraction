@@ -30,6 +30,10 @@ KINDS = (
     "tables_unhandled",    # tables with no usable profile
     "des_definitions",     # abbreviation -> components, from the paper's own table
     "applications",        # what a DES was used FOR
+    "property_candidates", # numeric columns outside the property vocabulary
+    "des_dictionary",      # every DES and abbreviation the paper defines
+    "tables",              # the ledger: one row per table, whatever happened to it
+    "sections_llm_rejected",  # prose rows with no number (rankings, comparisons)
 )
 
 

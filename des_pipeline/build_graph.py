@@ -186,7 +186,7 @@ def _mixture_rows(table, components_by_name, roles=None, canonical=None):
                 "cid": int(extra["cid"]) if extra.get("cid") is not None else None,
                 "formula": extra.get("molecular_formula"),
             })
-        key = mixture_key([c["name"] for c in comps], r.get("Ratio_raw"))
+        key = mixture_key([c["name"] for c in comps], r.get("Ratio_molar") or r.get("Ratio_raw"))
         # measurements.csv carries a Mixture_key computed at extraction time from the
         # ORIGINAL spellings. Canonicalising here changes the key, so record the
         # translation -- without it the measurement rows MERGE fresh Mixture nodes
@@ -559,6 +559,10 @@ def _application_rows(applications, roles=None, canonical=None):
     roles = roles or {}
     rows = []
     for r in applications:
+        # Only verified rows load: a prose or paper-level link whose quote was not
+        # found, or that names no DES the paper defines, stays in the CSV for review.
+        if (r.get("status") or "ok") != "ok":
+            continue
         # A component the caption implied is marked on its PART_OF edge rather than
         # repeated as a string on every record -- 118 identical copies of "PTSA" said
         # nothing about WHICH component was inferred.
@@ -577,7 +581,7 @@ def _application_rows(applications, roles=None, canonical=None):
         is_primary = roles.get(containing) == "primary"
         rows.append({
             "key": r["Application_key"],
-            "mixture_key": mixture_key([c["name"] for c in comps], r.get("Ratio_raw")),
+            "mixture_key": mixture_key([c["name"] for c in comps], r.get("Ratio_molar") or r.get("Ratio_raw")),
             "domain": r.get("Domain") or "unspecified",
             "caption": r.get("Table_caption") or "",
             "mixture": r["Mixture"],
@@ -725,7 +729,11 @@ def build(wipe=False, include_prose=True):
     from . import store
 
     table = store.read_all("mixtures")
-    long_rows = store.read_all("measurements")
+    # `status` decides what loads (schema.MEASUREMENT_STATUS_ORDER): a value in a unit
+    # naming another quantity, with no solute, or stated only as a range stays in the
+    # CSV for review and out of the graph.
+    long_rows = [r for r in store.read_all("measurements")
+                 if (r.get("status") or "ok") == "ok"]
     references = store.read_all("references")
 
     # Only rows the prose route judged loadable: a real number, present in the

@@ -24,9 +24,11 @@ from dataclasses import dataclass
 
 from . import config, units, xml_utils
 from . import profile_table
+from .composition import compose, des_problem, has_ionic_liquid
 from .extract_references import numbers_for_ids as ref_numbers_for_ids, sources
 from .profile_table import _is_band_row, panel_period
-from .schema import MeasurementRow, MixtureRow, TableRow  # re-exported for the driver
+from .schema import (MeasurementRow, MixtureRow, TableLedgerRow,  # re-exported for the driver
+                     TableRow)
 
 
 # What a ratio marker MEANS, by the meaning the profile's legend gave it. This used to
@@ -387,23 +389,19 @@ def _looks_like_header(row, profile):
     return bool(cells) and sum(c in printed for c in cells) >= max(2, len(cells) // 2)
 
 
-def mixture_record(paper, table, index, ordinal, components, ratios, ratio_raw="",
-                   ratio_flag="", component_flag="", ref_text="", ref_numbers=(),
-                   cited=None, context=""):
-    """The provenance-carrying half of a MixtureRow, shared by both layouts.
+def mixture_record(paper, table, index, ordinal, comp, ratio_flag="", ref_text="",
+                   ref_numbers=(), cited=None, context=""):
+    """The provenance-carrying half of a MixtureRow, shared by every layout.
 
-    Every mixture row records the same thing about where it came from, whatever the
-    table looked like; only *finding* the components differs between a wide table and
-    a paneled one.
+    `comp` is a composition.Composition: what the DES is made of, however the table
+    wrote it. Only *finding* the composition differs between layouts.
     """
     cited = cited or {k: "" for k in ("doi", "key", "authors", "title", "journal",
                                       "volume", "issue", "pages", "year")}
-    c1, c2, c3 = components
-    r1, r2, r3 = ratios
-    names = ":".join(n for n in (c1, c2, c3) if n)
+    (c1, c2, c3), (r1, r2, r3), component_flag = comp.slots()
     record = {
         "Row_id": f"{paper.slug}:{table.id}:{ordinal:04d}",
-        "Mixture_key": mixture_key((c1, c2, c3), ratio_raw),
+        "Mixture_key": mixture_key((c1, c2, c3), comp.key_ratio),
         "Paper_key": paper.key, "Paper_DOI": paper.doi,
         "Paper_authors": paper.authors, "Paper_title": paper.title,
         "Paper_journal": paper.journal, "Paper_volume": paper.volume,
@@ -411,9 +409,17 @@ def mixture_record(paper, table, index, ordinal, components, ratios, ratio_raw="
         "Table_id": table.id, "Source_row": index,
         "Component_1": c1, "Component_2": c2, "Component_3": c3,
         "Ratio_component_1": r1, "Ratio_component_2": r2, "Ratio_component_3": r3,
-        "Ratio_raw": ratio_raw,
-        "Mixture": f"{names} ({ratio_raw})" if ratio_raw else names,
+        "Ratio_raw": comp.ratio_raw,
+        "Mixture": comp.label(),
         "Ratio_flag": ratio_flag, "Component_flag": component_flag,
+        "Components_written": ";".join(comp.components_written)[:300],
+        "Ratio_molar": comp.ratio_molar,
+        "Ratio_source": comp.ratio_source,
+        "Composition_basis": comp.basis,
+        "Water_fraction": comp.water_fraction,
+        "Water_basis": comp.water_basis,
+        "DES_code": comp.code,
+        "Composition_note": "; ".join(comp.notes)[:300],
         "DOI": paper.doi, "Ref": ref_text,
         "Source_ref_numbers": ",".join(str(n) for n in ref_numbers),
         "Source_DOIs": cited["doi"], "Source_paper_keys": cited["key"],
@@ -477,13 +483,16 @@ def read_condition(cell, column):
     return round(value, 3)
 
 
-def extract_paneled_table(table, profile, paper, reference_map, definitions=None):
-    """A table whose column pattern repeats, one panel per DES. -> (rows, skipped).
+def extract_paneled_table(table, profile, paper, reference_map, dictionary=None,
+                          resolve=None, strict=""):
+    """A table whose column pattern repeats, one panel per DES. -> (rows, skipped, extras).
 
     Fan's thermal-conductivity table is 3 panels of (T, lambda) with the DES named in a
     row spanning each panel. `_expand` has already broadcast those spanning cells
     across their columns, so the mixture for a panel is just the band row's text at
-    that panel's first column -- no span arithmetic is needed here.
+    that panel's first column -- no span arithmetic is needed here. The label is read
+    through the paper's own dictionary, which is what says "[ChCl][Gl]3" means
+    choline chloride and glycerol at 1:3.
     """
     period = panel_period([c.role for c in profile.columns])
     if period < 2:
@@ -533,19 +542,15 @@ def extract_paneled_table(table, profile, paper, reference_map, definitions=None
                 if from_column is not None:
                     temperature, source = from_column, "condition_column"
 
-            defined = (definitions or {}).get(_definition_key(label))
-            if defined:
-                names, ratio_raw = defined["components"], defined["ratio_raw"]
-            else:
-                names, ratio_raw = [label], ""
-            (c1, c2, c3), component_flag, _coeff = parse_components(
-            with_implied(names, profile))
-
+            comp = compose([label], dictionary=dictionary, resolve=resolve,
+                           implied=profile.implied_components or ())
+            problem = _refusal(comp, dictionary, strict)
+            if problem:
+                skipped.append({"Table_id": table.id, "Source_row": index,
+                                "reason": f"not extracted: {problem}", "raw": label[:120]})
+                continue
             record = mixture_record(
-                paper, table, index, len(rows) + 1,
-                components=(c1, c2, c3),
-                ratios=xml_utils.split_ratio(ratio_raw),
-                ratio_raw=ratio_raw, component_flag=component_flag,
+                paper, table, index, len(rows) + 1, comp,
                 cited=sources([], reference_map, paper.key),
                 context=f"panel={label}")
             fields = measurement_fields(parsed, property_col, table,
@@ -565,65 +570,66 @@ def _definition_key(text):
     return re.sub(r"\W+", "", str(text or "")).lower()
 
 
-def extract_definitions(table, profile, paper):
-    """A table that only NAMES mixtures. -> {key: {components, ratio_raw, label}}.
+def extract_definitions(table, profile, paper, resolve=None, dictionary=None):
+    """A table that says what each DES is. -> {code: Composition}.
 
     Fan's Table 2 is the only thing that says what "[ChCl][Gl]3" means, and its data
-    tables label their panels with nothing else. This is the same
-    abbreviation-is-authoritative idea as component_aliases.json, except the paper
-    defines it in its own table so nobody has to write it out by hand.
+    tables label their panels with nothing else; Solcan's design table names runs
+    N1..N39 with an HBA, an HBD, a ratio and a water percentage. The code is read from
+    whichever column NAMES the row (found by its header, across every role -- Fan's
+    "Abbreviation" column was labelled `reference`); when there is none, the DES's own
+    printed formula is its code.
     """
-    by_role = {}
-    for column in profile.columns:
-        by_role.setdefault(column.role, []).append(column)
-    component_cols = by_role.get("component", [])
-    ratio_cols = by_role.get("ratio", [])
-    # Find the naming column by what its header SAYS, across every role. Fan's
-    # "Abbreviation" column was labelled `reference` -- understandable, since
-    # "[ChCl][Gl]3" looks like a citation key -- and restricting the search by role
-    # would have lost the one column the whole table exists to provide.
     label_cols = [c for c in profile.columns
-                  if c.role != "component"
-                  and re.search(r"abbrev|acronym|code|symbol|short|label|des\b|name",
-                                c.header or "", re.I)]
+                  if c.role not in ("component", "property", "ratio", "water")
+                  and _LABEL_FIELD.search(f"{_printed(table, c)} {c.context_field or ''}")]
+    mixture_cols = [c for c in profile.columns if c.role == "mixture"]
 
     out = {}
     for row in table.rows:
-        if _looks_like_header(row, profile) or _is_band_row(row):
+        if _looks_like_header(row, profile) or _is_band_row(row) \
+                or _is_group_row(row, table):
             continue
-        label = next((row[c.index].text.strip() for c in label_cols
-                      if c.index < len(row) and row[c.index].text.strip()), "")
-        names = [row[c.index].text for c in component_cols if c.index < len(row)]
-        names = [n for n in names if n and n.strip()]
-        if not label or not names:
+        comp, _flag = row_composition(row, table, profile, dictionary, resolve)
+        if des_problem(comp):
             continue
-        # A split ratio ("1 | 3") is two ratio columns, one number each.
-        parts = [row[c.index].text.strip() for c in ratio_cols if c.index < len(row)]
-        parts = [p for p in parts if p]
-        ratio_raw = ":".join(parts) if len(parts) > 1 else (parts[0] if parts else "")
-        out[_definition_key(label)] = {"label": label, "components": names,
-                                       "ratio_raw": ratio_raw}
+        label = comp.code or next((row[c.index].text.strip() for c in label_cols
+                                   if c.index < len(row) and row[c.index].text.strip()
+                                   and row[c.index].text.strip() not in config.DASH), "")
+        if not label:
+            label = next((row[c.index].text.strip() for c in mixture_cols
+                          if c.index < len(row) and row[c.index].text.strip()), "")
+        # A run or entry NUMBER ("1", "2.1") names the row, not the DES: a later "2"
+        # anywhere in the paper would otherwise resolve to it.
+        if not label or not re.search(r"[A-Za-z]", label):
+            label = comp.label()
+        out.setdefault(label, comp)
     return out
 
 
-def extract_property_table(table, profile, paper, reference_map):
+def extract_property_table(table, profile, paper, reference_map, dictionary=None,
+                           resolve=None, strict=""):
     """-> (rows, skipped, extras).
 
     `extras` carries everything a measurement knows that a wide mixture row has no
     column for -- the as-written value and unit, the uncertainty, the temperature's
     provenance, the status. Keyed by (Row_id, property) and consumed by
-    `to_measurements`. The alternative was four more columns per property on MixtureRow,
-    i.e. 64 more columns, for data only the long format uses.
+    `to_measurements`.
+
+    A row is written to mixtures.csv only if it yielded at least one value. A row that
+    only DEFINES a DES (a composition, a code, a design-of-experiments run) belongs in
+    the paper's dictionary, not among the measured mixtures.
     """
     extras = {}
     by_role = {}
     for column in profile.columns:
         by_role.setdefault(column.role, []).append(column)
-    component_cols = by_role.get("component", [])
-    ratio_col = next(iter(by_role.get("ratio", [])), None)
+    name_cols = by_role.get("mixture", []) + by_role.get("component", [])
     ref_col = next(iter(by_role.get("reference", [])), None)
     property_cols = by_role.get("property", [])
-    context_cols = by_role.get("context", [])
+    water_ids = {c.index for c in water_columns(profile, table)}
+    context_cols = [c for c in by_role.get("context", []) + by_role.get("other_quantity", [])
+                    if c.index not in water_ids]
 
     rows, skipped = [], []
     ragged = {index for index, _ in table.ragged}
@@ -634,20 +640,20 @@ def extract_property_table(table, profile, paper, reference_map):
                             "reason": "cell count did not fit the grid",
                             "raw": " | ".join(c.text for c in row)[:300]})
             continue
-        if _looks_like_header(row, profile):
+        if _looks_like_header(row, profile) or _is_group_row(row, table):
             continue
 
-        names = [row[c.index].text for c in component_cols if c.index < len(row)]
-        if not any(n.strip() for n in names):
+        names = [row[c.index].text for c in name_cols if c.index < len(row)]
+        if not any(n.strip() and n.strip() not in config.DASH for n in names):
             continue                                  # a spacer or continuation row
 
-        (c1, c2, c3), component_flag, _coeff = parse_components(names)
-        if ratio_col is not None and ratio_col.index < len(row):
-            cell = row[ratio_col.index]
-            ratio_raw, (r1, r2, r3), ratio_flag = parse_ratio(cell.text, cell.markers,
-                                                              profile)
-        else:
-            ratio_raw, (r1, r2, r3), ratio_flag = "", (None, None, None), ""
+        comp, ratio_flag = row_composition(row, table, profile, dictionary, resolve)
+        problem = _refusal(comp, dictionary, strict)
+        if problem:
+            skipped.append({"Table_id": table.id, "Source_row": index,
+                            "reason": f"not extracted: {problem}",
+                            "raw": " | ".join(n for n in names if n)[:300]})
+            continue
 
         ref_text, ref_numbers = "", []
         if ref_col is not None and ref_col.index < len(row):
@@ -657,23 +663,15 @@ def extract_property_table(table, profile, paper, reference_map):
         cited = sources(ref_numbers, reference_map, paper.key)
 
         record = mixture_record(
-            paper, table, index, len(rows) + 1,
-            components=(c1, c2, c3), ratios=(r1, r2, r3), ratio_raw=ratio_raw,
-            ratio_flag=ratio_flag, component_flag=component_flag,
+            paper, table, index, len(rows) + 1, comp, ratio_flag=ratio_flag,
             ref_text=ref_text, ref_numbers=ref_numbers, cited=cited,
             context=" | ".join(f"{c.context_field or c.header}={row[c.index].text}"
                                for c in context_cols if c.index < len(row)
                                and row[c.index].text)[:300])
 
-        # Every declared property gets its triple; the ones this table lacks stay null.
-        for name in config.PROPERTY_NAMES:
-            suffix = name.lower()
-            record[name] = None
-            record[f"Units_{suffix}"] = None
-            record[f"Temperature_{suffix}"] = None
-            record[f"Source_col_{suffix}"] = None
-
         solute = solute_in_row(row, profile)
+        found = 0
+        pending = {}
         for column in property_cols:
             if column.index >= len(row):
                 continue
@@ -692,7 +690,12 @@ def extract_property_table(table, profile, paper, reference_map):
             record[f"Units_{suffix}"] = fields["Unit"]
             record[f"Temperature_{suffix}"] = fields["Temperature_C"]
             record[f"Source_col_{suffix}"] = column.index
-            extras[(record["Row_id"], column.property)] = fields
+            pending[column.property] = fields
+            found += 1
+        if not found:
+            continue
+        for prop, fields in pending.items():
+            extras[(record["Row_id"], prop)] = fields
         rows.append(MixtureRow(**record))
     return rows, skipped, extras
 
@@ -727,6 +730,9 @@ def measurement_fields(parsed, column, table, prop, temperature, source, solute=
         number kept so `check_fidelity` still tests the transcription;
       * a unit naming a different quantity (cSt), or a basis that cannot be read
         (J per gram or per mole?) -- kept, flagged, and not loaded.
+
+    A melting, boiling, decomposition or glass-transition temperature IS a temperature:
+    it has no separate measuring temperature, so a caption's "at 25 C" never lands on it.
     """
     printed_header = " ".join(table.column(column.index)) or column.header or ""
     written_unit = (column.unit_as_written or "").strip().strip("()")
@@ -742,6 +748,8 @@ def measurement_fields(parsed, column, table, prop, temperature, source, solute=
         status = "no_solute"
     if not status and parsed.status:
         status = parsed.status
+    if prop in config.PHASE_TRANSITION_PROPERTIES and source != "cell_inline":
+        temperature, source = None, "not_applicable"
 
     return {
         "Value": value,
@@ -883,8 +891,8 @@ def to_measurements(rows, paper, extras=None):
                 fields["Source_ref_numbers"] = ",".join(str(n) for n in inline_refs)
             fields["Dedup_key"] = dedup_key(
                 [mixture.Component_1, mixture.Component_2, mixture.Component_3],
-                mixture.Ratio_raw, name, fields["Value"], fields["Temperature_C"],
-                mixture.Source_DOIs, fields.get("Solute", ""))
+                mixture.Ratio_molar or mixture.Ratio_raw, name, fields["Value"],
+                fields["Temperature_C"], mixture.Source_DOIs, fields.get("Solute", ""))
             out.append(MeasurementRow(**fields))
     return out
 
@@ -901,42 +909,48 @@ def _plausibility(prop, value):
             "plausibility_note": f"outside the plausible range {low} to {high}"}
 
 
-def extract_tables(tables, profiles, paper, reference_map):
-    """Every profiled table in one paper. -> (mixtures, measurements, skipped).
+def extract_tables(tables, profiles, paper, reference_map, dictionary=None, resolve=None,
+                   paragraphs=None):
+    """Every profiled property table in one paper. -> (mixtures, measurements, skipped, stats).
 
-    Definition tables are read first, because a paneled table's panels are labelled
-    with abbreviations that only a definition table explains.
+    `dictionary` is the paper's DES dictionary (paper_dictionary.build), which already
+    holds what its definitions tables say. `stats` is per table, for the ledger.
     """
-    definitions = {}
-    for table in tables:
-        profile = profiles.get(table.id)
-        if profile is not None and profile.relevant \
-                and "des_definitions" in profile.content_types:
-            found = extract_definitions(table, profile, paper)
-            definitions.update(found)
-            print(f"    {table.label or table.id}: {len(found)} DES definition(s)")
+    if dictionary is not None and dictionary.des_is_subject is False:
+        print("    the paper is not about DES: only rows matching its own DES are kept")
 
-    mixtures, skipped, extras = [], [], {}
+    mixtures, skipped, extras, stats = [], [], {}, {}
     for table in tables:
         profile = profiles.get(table.id)
         if profile is None or not profile.relevant:
             continue
-        # `in`, not `==`. A table can hold properties AND applications AND definitions;
-        # `extract_applications` reads the same profile for its own half, and neither
-        # route excludes the other any more.
         if "des_properties" not in profile.content_types:
+            continue
+        strict, skip = table_gate(table, profile, paper, dictionary, paragraphs)
+        if skip:
+            stats[table.id] = {"n_mixtures": 0, "n_values": 0, "n_refused": 1, "why": skip}
+            print(f"    {table.label or table.id}: skipped -- {skip}")
             continue
         if profile_table.detected_layout(profile, table) == "paneled_by_mixture":
             rows, bad, more = extract_paneled_table(table, profile, paper, reference_map,
-                                                    definitions)
+                                                    dictionary, resolve, strict)
         else:
-            rows, bad, more = extract_property_table(table, profile, paper, reference_map)
+            rows, bad, more = extract_property_table(table, profile, paper, reference_map,
+                                                     dictionary, resolve, strict)
         mixtures += rows
         extras.update(more)
         skipped += [{**b, "Paper_key": paper.key} for b in bad]
+        refused = [b for b in bad if str(b.get("reason", "")).startswith("not extracted")]
+        stats[table.id] = {
+            "n_mixtures": len(rows), "n_values": sum(1 for k in more if k[0] in
+                                                      {r.Row_id for r in rows}),
+            "n_refused": len(refused),
+            "why": (refused[0]["reason"] if refused and not rows else ""),
+        }
         print(f"    {table.label or table.id}: {len(rows)} rows"
               f"{f' [{profile.layout}]' if profile.layout != 'wide_per_mixture' else ''}"
-              f"{f', {len(bad)} unreadable' if bad else ''}")
+              f"{f', {len(refused)} refused (not a DES)' if refused else ''}"
+              f"{f', {len(bad) - len(refused)} unreadable' if len(bad) > len(refused) else ''}")
     measurements = to_measurements(mixtures, paper, extras)
     held = [m for m in measurements if m.status != "ok"]
     if held:
@@ -945,7 +959,7 @@ def extract_tables(tables, profiles, paper, reference_map):
         why = collections.Counter(m.status for m in held)
         print(f"    {len(held)} measurement(s) written but not loadable: "
               + ", ".join(f"{k} {v}" for k, v in why.most_common()))
-    return mixtures, measurements, skipped, definitions
+    return mixtures, measurements, skipped, stats
 
 
 EXTRACTED_TYPES = {"des_properties", "des_application", "des_definitions"}
@@ -974,4 +988,210 @@ def unhandled(tables, profiles, problems):
         out.append(TableRow(table_id=table.id, label=table.label,
                             caption=table.caption[:300], n_rows=len(table.rows),
                             status=reason))
+    return out
+
+
+# A context column that is really the water content the DES was made with.
+_WATER_FIELD = re.compile(r"\bwater\b|\bh2o\b|moisture", re.I)
+# A column naming the row's subject -- the code or name of its DES.
+_LABEL_FIELD = re.compile(r"abbrev|acronym|code|symbol|short|label|\bdes\b|name|sample|"
+                          r"\brun\b|entry|system|^no\.?$|^#$|^s/n$", re.I)
+
+
+def _printed(table, column):
+    return " ".join(table.column(column.index)) or column.header or ""
+
+
+def _strip_ratio_markers(cell, profile):
+    """A ratio cell -> (text without footnote markers, flag). See parse_ratio."""
+    raw, _parts, flag = parse_ratio(cell.text, cell.markers, profile)
+    defined = {m.marker for m in (profile.footnote_markers if profile else []) if m.marker}
+    text = raw
+    for marker in sorted(defined, key=len, reverse=True):
+        if marker and len(marker) <= 2 and text.startswith(marker):
+            text = text[len(marker):].lstrip("-").strip()
+            break
+    return text, flag
+
+
+def water_columns(profile, table):
+    """Columns holding the water the DES was made with. -> list[ColumnSpec]."""
+    out = [c for c in profile.columns if c.role == "water"]
+    for column in profile.columns:
+        if column.role in ("context", "other_quantity") and column not in out:
+            name = f"{column.context_field or ''} {_printed(table, column)}"
+            if _WATER_FIELD.search(name):
+                out.append(column)
+    return out
+
+
+def row_composition(row, table, profile, dictionary=None, resolve=None):
+    """One table row -> (Composition, ratio flag). The one way every route reads a DES.
+
+    Gathers whichever of these the table has: a column naming the whole DES, one column
+    per component, one or more ratio columns, a water column, and components the caption
+    implies. composition.compose turns them into one composition.
+    """
+    by_role = {}
+    for column in profile.columns:
+        by_role.setdefault(column.role, []).append(column)
+    # With component columns present, a "mixture" column is the row's CODE ("CEM5",
+    # "[ChCl][Gl]3"), not another constituent: Fan's Table 2 lists both, and reading
+    # the code as a component made "[ChCl][Gl]3" part of its own DES.
+    code_cols = by_role.get("mixture", []) if by_role.get("component") else []
+    name_cols = by_role.get("component", []) or by_role.get("mixture", [])
+    cells = [row[c.index].text for c in name_cols if c.index < len(row)]
+    code = next((row[c.index].text.strip() for c in code_cols
+                 if c.index < len(row) and row[c.index].text.strip()
+                 and row[c.index].text.strip() not in config.DASH), "")
+
+    ratio_parts, flag, ratio_header = [], "", ""
+    for column in by_role.get("ratio", []):
+        if column.index >= len(row):
+            continue
+        text, this_flag = _strip_ratio_markers(row[column.index], profile)
+        flag = flag or this_flag
+        if text and text not in config.DASH:
+            ratio_parts.append(text)
+            ratio_header = ratio_header or _printed(table, column)
+    # A ratio printed across two columns ("Molar Ratio" over HBA | HBD) is one ratio.
+    ratio_text = ":".join(ratio_parts) if len(ratio_parts) > 1 else \
+        (ratio_parts[0] if ratio_parts else "")
+
+    water_text, water_header = "", ""
+    for column in water_columns(profile, table):
+        if column.index < len(row) and row[column.index].text.strip() not in config.DASH:
+            water_text, water_header = row[column.index].text, _printed(table, column)
+            break
+
+    comp = compose(cells, ratio_text, ratio_header, water_text, water_header,
+                   dictionary=dictionary, resolve=resolve,
+                   implied=profile.implied_components or ())
+    if code and not comp.code:
+        comp.code = code
+    return comp, flag
+
+
+def _refusal(comp, dictionary, strict):
+    """Why this row is not extracted as a DES. -> "" when it is.
+
+    `strict` is "" (any DES row), or the reason rows must match a DES the paper itself
+    defines (see table_gate); "il" adds that ionic-liquid rows are refused.
+    """
+    problem = des_problem(comp, dictionary)
+    if problem:
+        return problem
+    known = dictionary is not None and dictionary.matches(comp)
+    if strict and "il" in strict.split("+") and has_ionic_liquid(comp) and not known:
+        return "an ionic liquid, in a table of ionic liquids"
+    reason = "+".join(x for x in strict.split("+") if x and x != "il")
+    if reason and not known:
+        return f"matches none of the DES the paper defines ({reason})"
+    return ""
+
+
+def table_gate(table, profile, paper, dictionary, paragraphs=None):
+    """How strictly to read this table's rows. -> (mode, skip_reason).
+
+    Rows must match a DES the paper itself defines when:
+      not_about_des     the paper is not about DES (its overview says so);
+      no_des_mention    the table never says it is about DES -- not in its caption,
+                        legend, header, or what the paper says about it;
+      research_paper    a research paper that defines its DES: its tables report values
+                        for the DES it made, so anything else in them is not one.
+    A table whose caption names both ionic liquids and DES, without saying which row is
+    which, is skipped. A table of ionic liquids refuses rows written as one ("il").
+    """
+    from .paper_dictionary import caption_mixes_il_and_des, mentions_des
+
+    if profile.des_vs_il_ambiguous or caption_mixes_il_and_des(table):
+        return "", "mixes ionic liquids and DES without saying which row is which"
+    reasons = []
+    if dictionary is not None and dictionary.des_is_subject is False:
+        reasons.append("not_about_des")
+    if not mentions_des(table, paragraphs):
+        reasons.append("no_des_mention")
+    if getattr(paper, "role", "") == "primary" and dictionary is not None \
+            and dictionary.has_definitions:
+        reasons.append("research_paper")
+    if profile.involves_ionic_liquids:
+        reasons.append("il")
+    return "+".join(reasons), ""
+
+
+def _is_group_row(row, table):
+    """A sub-header row inside the body, not data.
+
+    Marco-Velasco's Table 4 interleaves rows like "Use of DESs as additive and/or
+    modifier" between its data: one cell spanning the whole table, broadcast by `_expand`
+    into the same text in every column. Such a row labels the rows below it.
+    """
+    texts = [c.text.strip() for c in row]
+    filled = [t for t in texts if t and t not in config.DASH]
+    if not filled or len(texts) < 2:
+        return False
+    if len(set(filled)) == 1 and len(filled) >= max(2, len(texts) - 1):
+        return xml_utils.clean_number(filled[0]) is None
+    return False
+
+
+def table_ledger(tables, profiles, problems, repairs, paper, table_stats=None,
+                 application_stats=None, definition_counts=None):
+    """One row per table in the paper -- every one of them. -> list[TableLedgerRow]."""
+    table_stats = table_stats or {}
+    application_stats = application_stats or {}
+    definition_counts = definition_counts or {}
+    out = []
+    for table in tables:
+        profile = profiles.get(table.id)
+        stats = table_stats.get(table.id, {})
+        apps = application_stats.get(table.id, {})
+        n_defs = definition_counts.get(table.id, 0)
+        issues = problems.get(table.id, [])
+        n_values = stats.get("n_values", 0)
+        n_mixtures = stats.get("n_mixtures", 0)
+        n_apps = apps.get("n_applications", 0)
+        refused = stats.get("n_refused", 0) + apps.get("n_refused", 0)
+
+        if table.graphic_only:
+            status, why = "not_profiled", "the table is an image, not markup"
+        elif profile is None and issues and issues[0].startswith("not profiled"):
+            status, why = "not_profiled", issues[0][14:]
+        elif profile is None:
+            status, why = "failed", "the model's labels failed validation"
+        elif not profile.relevant:
+            status, why = "not_relevant", "the profile says it holds no DES data"
+        elif n_values or n_mixtures or n_apps or n_defs:
+            status, why = "extracted", ""
+        elif refused:
+            status = "not_des"
+            why = stats.get("why") or apps.get("why") or "every row failed the DES test"
+        elif profile.des_vs_il_ambiguous:
+            status, why = "not_des", "mixes ionic liquids and DES without saying which"
+        else:
+            kinds = set(profile.content_types)
+            if not kinds & {"des_properties", "des_application", "des_definitions"}:
+                status, why = "not_relevant", (f"content is "
+                                               f"{'+'.join(profile.content_types)}")
+            else:
+                status, why = "no_rows", stats.get("why") or "no row yielded a value"
+
+        columns = ""
+        if profile is not None:
+            columns = " | ".join(
+                f"{c.index}:{c.role}" + (f"={c.property}" if c.property else "")
+                + (f"({c.context_field})" if c.role in ("context", "other_quantity")
+                   and c.context_field else "")
+                for c in profile.columns)
+        out.append(TableLedgerRow(
+            Paper_key=paper.key, table_id=table.id, label=table.label,
+            caption=table.caption[:300], n_rows=len(table.rows),
+            n_columns=table.n_columns, status=status, why=why[:300],
+            content_types="+".join(profile.content_types) if profile else "",
+            involves_ionic_liquids=profile.involves_ionic_liquids if profile else None,
+            n_values=n_values, n_mixtures=n_mixtures, n_definitions=n_defs,
+            n_applications=n_apps, n_rows_refused=refused, columns=columns[:600],
+            demoted="; ".join(repairs.get(table.id, []))[:600],
+            problems="; ".join(issues)[:600] if status in ("failed",) else "",
+            model_reason=(profile.reason if profile else "")[:300]))
     return out

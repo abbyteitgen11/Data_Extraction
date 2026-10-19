@@ -19,6 +19,7 @@ from pathlib import Path
 
 from des_pipeline import (config, dialects, paper as paper_mod, profile_table, router,
                           store, xml_utils)
+from des_pipeline.extract_text_llm import BudgetExceeded
 
 # Steps that run once per paper. Everything else works on the whole corpus by reading
 # store.read_all(), so it must run after all the papers have been processed.
@@ -28,8 +29,11 @@ PER_PAPER_STEPS = ("route", "refs", "table", "figures", "text")
 def _inputs(args):
     """The XML files to process, honouring --xml and --papers."""
     if args.xml:
-        paths = sorted(Path().glob(args.xml)) if any(c in args.xml for c in "*?[") \
-            else [Path(args.xml)]
+        paths = []
+        for pattern in args.xml.split(","):
+            pattern = pattern.strip()
+            paths += sorted(Path().glob(pattern)) if any(c in pattern for c in "*?[") \
+                else [Path(pattern)]
     else:
         paths = sorted(config.XML_FILES.glob(config.XML_GLOB))
     if args.papers:
@@ -76,43 +80,70 @@ def _run_paper(path, steps, args, network):
         if "refs" in steps:
             store.write(refs.to_rows(reference_map, pap.key), "references", pap)
 
+    from des_pipeline import paper_dictionary
+
+    dictionary = None
     if "table" in steps:
+        from des_pipeline import extract_applications as applications
         from des_pipeline import extract_table as tables
+        from des_pipeline.schema import ApplicationRow, DictionaryRow, TableLedgerRow
 
         print("tables:")
         # The prose usually explains the paper's own tables, and that explanation is
         # what separates a DES component from a reagent the DES acts on.
-        profiles, problems = profile_table.profile_tables(
+        profiles, problems, repairs, _failed = profile_table.profile_tables(
             routed.tables, pap, refresh=args.refresh_profiles,
             paragraphs=dialect.paragraphs(root))
-        mixtures, measurements, skipped, definitions = tables.extract_tables(
-            routed.tables, profiles, pap, reference_map)
+
+        # The paper's own definitions, BEFORE anything is extracted: definitions
+        # tables, glossary, "Full name (ABBR)" in the text, and one overview call.
+        print("dictionary:")
+        dictionary, overview = paper_dictionary.build(
+            pap, root, dialect, routed.sections, routed.tables, profiles,
+            refresh=args.refresh_llm, use_model=not args.no_overview)
+        store.write(dictionary.to_rows(), "des_dictionary", pap, model=DictionaryRow)
+        if overview is not None:
+            (config.PAPERS_DIR / pap.slug / "paper_overview.json").write_text(
+                overview.model_dump_json(indent=2), encoding="utf-8")
+            (config.PAPERS_DIR / pap.slug / "paper_overview_text.txt").write_text(
+                dictionary.overview_text, encoding="utf-8")
+        verified = sum(1 for r in dictionary.rows if r.verified and r.kind == "mixture")
+        print(f"    {verified} DES and {len(dictionary.aliases)} abbreviation(s) defined"
+              f"{'; family: ' + dictionary.family.label() if dictionary.family else ''}"
+              f"{'' if dictionary.des_is_subject is not False else '; DES NOT the subject'}")
+        resolve = dictionary.resolver(paper_dictionary.global_alias_resolver())
+
+        paragraphs = dialect.paragraphs(root)
+        mixtures, measurements, skipped, table_stats = tables.extract_tables(
+            routed.tables, profiles, pap, reference_map, dictionary, resolve, paragraphs)
         store.write(mixtures, "mixtures", pap, model=tables.MixtureRow)
         store.write(measurements, "measurements", pap, model=tables.MeasurementRow)
-        if skipped:
-            store.write(skipped, "skipped_rows", pap)
-        if definitions:
-            store.write([{"Paper_key": pap.key, "abbreviation": d["label"],
-                          "components": ";".join(d["components"]),
-                          "ratio_raw": d["ratio_raw"]}
-                         for d in definitions.values()], "des_definitions", pap)
 
-        from des_pipeline import extract_applications as applications
-        from des_pipeline.schema import ApplicationRow
+        used_for, refused, app_stats = applications.extract_applications(
+            routed.tables, profiles, pap, reference_map, dictionary, resolve, paragraphs)
+        from_paper = applications.paper_applications(overview, dictionary, pap,
+                                                     dictionary.overview_text, resolve)
+        if from_paper:
+            print(f"    {len(from_paper)} paper-level application link(s), "
+                  f"{sum(1 for a in from_paper if a.status == 'ok')} verified")
+        store.write(used_for + from_paper, "applications", pap, model=ApplicationRow)
+        store.write(skipped + refused, "skipped_rows", pap)
 
-        used_for = applications.extract_applications(routed.tables, profiles, pap,
-                                                     reference_map)
-        if used_for:
-            store.write(used_for, "applications", pap, model=ApplicationRow)
-        store.write(tables.unhandled(routed.tables, profiles, problems),
-                    "tables_unhandled", pap)
+        ledger = tables.table_ledger(routed.tables, profiles, problems, repairs, pap,
+                                     table_stats, app_stats, dictionary.table_counts)
+        store.write(ledger, "tables", pap, model=TableLedgerRow)
+        counts = {}
+        for row in ledger:
+            counts[row.status] = counts.get(row.status, 0) + 1
+        print("    tables: " + ", ".join(f"{k} {v}" for k, v in sorted(counts.items())))
 
-        # Numeric columns that look like a physical quantity but are not in
-        # config.PROPERTIES, so nothing extracts them. Recorded per paper so the
-        # vocabulary can grow on evidence instead of guesswork.
-        candidates = profile_table.discover_properties(routed.tables, profiles, pap)
+        # Numeric columns of DES tables that the vocabulary does not cover. Recorded per
+        # paper so the vocabulary can grow on evidence instead of guesswork.
+        extracted = {r.table_id for r in ledger if r.status == "extracted"}
+        candidates = profile_table.discover_properties(routed.tables, profiles, pap,
+                                                       des_tables=extracted)
+        store.write(candidates, "property_candidates", pap)
         if candidates:
-            store.write(candidates, "property_candidates", pap)
             print(f"    {len(candidates)} numeric column(s) outside the property "
                   f"vocabulary -> property_candidates.csv")
 
@@ -124,25 +155,45 @@ def _run_paper(path, steps, args, network):
 
     if "text" in steps:
         from des_pipeline import extract_text_llm as text
+        from des_pipeline.schema import ApplicationRow as _AppRow
         from des_pipeline.schema import LLMMeasurement
 
+        if dictionary is None:
+            dictionary = paper_dictionary.load(store.read_paper("des_dictionary", pap),
+                                               pap.key)
+        resolve = dictionary.resolver(paper_dictionary.global_alias_resolver())
         print("prose sections:")
-        rows, used_for = text.run(routed.sections, pap.key,
-                                  reference_map=reference_map,
-                                  only_property_sections=not args.all_sections,
-                                  allow_lookup=network, refresh_llm=args.refresh_llm)
+        rows, rejected, used_for = text.run(
+            routed.sections, pap.key, reference_map=reference_map,
+            only_property_sections=not args.all_sections, allow_lookup=network,
+            refresh_llm=args.refresh_llm, dictionary=dictionary, resolve=resolve,
+            paper_slug=pap.slug)
         store.write(rows, "sections_llm", pap, model=LLMMeasurement)
-        if used_for:
-            # Appended to whatever the table route wrote for this paper, not replacing
-            # it: both origins are applications and `Extractor` tells them apart.
-            from des_pipeline.schema import ApplicationRow as _AppRow
-
-            existing = store.read_paper("applications", pap) or []
-            keep = [r for r in existing if (r.get("Extractor") or "table") == "table"]
-            store.write(keep + [r.model_dump() for r in used_for], "applications", pap,
-                        model=_AppRow)
+        store.write(rejected, "sections_llm_rejected", pap, model=LLMMeasurement)
+        # Appended to whatever the table and paper routes wrote, not replacing it:
+        # `Extractor` tells the three apart.
+        existing = store.read_paper("applications", pap) or []
+        keep = [r for r in existing if (r.get("Extractor") or "table") != "prose"]
+        store.write(keep + [r.model_dump() for r in used_for], "applications", pap,
+                    model=_AppRow)
 
     return pap
+
+def _log_timing(slug, steps, seconds):
+    """Wall-clock seconds per paper per run, for comparing models on speed."""
+    import csv
+    import time
+
+    path = (config.RUN_DIR or config.SHARED_DATA) / "timing.csv"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    new = not path.exists()
+    with open(path, "a", newline="") as handle:
+        writer = csv.writer(handle)
+        if new:
+            writer.writerow(["time", "run_tag", "slug", "steps", "seconds"])
+        writer.writerow([time.strftime("%Y-%m-%d %H:%M:%S"), config.RUN_TAG, slug,
+                         "+".join(steps), round(seconds, 1)])
+
 
 # "text" runs before "components" so the prose-only component names exist by the time
 # the PubChem lookup runs. "table" and "text" both read the reference cache, so "refs"
@@ -169,6 +220,12 @@ def main(argv=None):
                         help="keep going when one paper fails, instead of stopping")
     parser.add_argument("--refresh-profiles", action="store_true",
                         help="table: ignore cached table profiles and re-ask the model")
+    parser.add_argument("--ignore-human-profiles", action="store_true",
+                        help="table: profile EVERY table with the model, including ones a "
+                             "human pinned -- for comparing models")
+    parser.add_argument("--no-overview", action="store_true",
+                        help="table: skip the per-paper overview call (dictionary from "
+                             "tables, glossary and text only)")
     parser.add_argument("--no-network", action="store_true",
                         help="use cached lookups only; make no HTTP requests")
     parser.add_argument("--limit", type=int, default=None,
@@ -200,15 +257,25 @@ def main(argv=None):
 
     config.DATA.mkdir(parents=True, exist_ok=True)
     network = not args.no_network
+    profile_table.IGNORE_HUMAN_PROFILES = args.ignore_human_profiles
+    if config.RUN_TAG:
+        print(f"run tag {config.RUN_TAG!r}: outputs in {config.DATA}")
 
     per_paper = [s for s in steps if s in PER_PAPER_STEPS]
     corpus = [s for s in steps if s not in PER_PAPER_STEPS]
 
     papers = []
     if per_paper:
+        import time
+
         for path in _inputs(args):
+            started = time.time()
             try:
                 papers.append(_run_paper(path, per_paper, args, network))
+                _log_timing(papers[-1].slug, per_paper, time.time() - started)
+            except BudgetExceeded as exc:
+                print(f"  STOPPED: {exc}")
+                break
             except Exception as exc:
                 if not args.continue_on_error:
                     raise

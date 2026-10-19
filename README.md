@@ -87,6 +87,37 @@ names exist by the time the PubChem lookup runs. `--steps all` already does both
 
 Prose measurements load into the graph by default; `--no-prose` skips them.
 
+### Run tags: one output tree per model
+
+```bash
+DES_RUN_TAG=qwen3 python run_pipeline.py --steps all --xml 'xml/*.xml,xml/selected/*.xml'
+```
+
+With `DES_RUN_TAG` set, every output goes to `runs/<tag>/data/` instead of `data/`.
+What does not depend on the model stays shared in `data/`, so comparing four models
+does not mean four rounds of network lookups:
+
+- Crossref and PubChem caches, per-paper `reference_map.json`, QM9;
+- hand-pinned table profiles;
+- `review/component_duplicates.csv`.
+
+Each run also writes `runs/<tag>/usage.csv`, one row per fresh model call with tokens,
+seconds and cost, and `runs/<tag>/timing.csv`, wall-clock time per paper.
+
+| Flag / variable | What it does |
+|---|---|
+| `--ignore-human-profiles` | profile every table with the model under test, including pinned ones |
+| `--no-overview` | skip the per-paper overview call (see "The paper's own dictionary") |
+| `DES_LLM_BACKEND=anthropic` | use the Claude API |
+| `DES_ANTHROPIC_MODEL` | `claude-haiku-4-5`, `claude-sonnet-5-5` or `claude-opus-5-5` |
+| `DES_ANTHROPIC_EFFORT` | `low` by default |
+| `DES_ANTHROPIC_CONCURRENCY` | parallel calls per paper, 8 by default |
+| `DES_BUDGET_USD` | stops the run before it spends more, read from `usage.csv`; nothing already answered is lost |
+
+The Anthropic backend uses structured outputs (`output_config.format`). The 5.x models
+reject a forced `tool_choice` with a 400, so the backend does not use one. Sonnet 5.5 and
+Opus 5.5 requests opt into server-side refusal fallbacks.
+
 ### Getting a paper
 
 ```bash
@@ -218,7 +249,11 @@ Counts below are for the Sadeghi paper.
 | `papers/<slug>/references.csv` | 343 | the bibliography, with Crossref DOIs, volume, issue, pages |
 | `papers/<slug>/figures.csv` | 11 | worklist for manual digitisation (WebPlotDigitizer) |
 | `papers/<slug>/sections_llm.csv` | 138 | prose measurements, `status` deciding which reach the graph |
-| `papers/<slug>/tables_unhandled.csv` | 1 | tables that produced no data, with the reason |
+| `papers/<slug>/tables.csv` | — | **every** table and what happened to it: `extracted`, `no_rows`, `not_relevant`, `not_des`, `failed` or `not_profiled`, with code's reason, the column map, and any label code changed (`demoted`) |
+| `papers/<slug>/des_dictionary.csv` | — | every DES and abbreviation the paper defines, its source, and its evidence |
+| `papers/<slug>/paper_overview.json` | — | the overview call's answer: is DES the subject, which DES, what for |
+| `papers/<slug>/sections_llm_rejected.csv` | — | prose rows with no number (rankings, comparisons) |
+| `papers/<slug>/tables_unhandled.csv` | — | legacy; superseded by `tables.csv` |
 | `papers/<slug>/table_profiles.json` | — | how each table was read; hand-overridable |
 | `papers.csv` | 1 | the corpus index, one row per paper |
 | `components.csv` | 498 | PubChem identifiers and descriptors |
@@ -442,6 +477,67 @@ Only a diff of the profile caught it. So a validated profile is pinned with
 `"source": "human"`, and `_marker_temperature_problems` now rejects a marker whose
 temperature does not appear in the legend that defines it.
 
+## What a DES is made of
+
+`composition.py` reads a DES however the paper wrote it, and every route uses it:
+
+```
+ChCl:Gly (1:2)              -> Choline chloride, Glycerol            1:2
+Urea, 1:2  (with ChCl)      -> Choline chloride, Urea                1:2
+Glycerol/Ethylene glycol    -> two components
+ChCl:LA | 1:1 +20% water    -> Choline chloride, Lactic acid, Water  1:1:3.19 (computed)
+L-Pro | PGL | 2  (HBA:HBD)  -> L-Proline, Propylene glycol           2:1 (inferred)
+DES 1:4 + 10 %wt EC         -> the paper's DES family at 1:4, plus EC at 10 wt%
+CEM5                        -> whatever the paper's own dictionary says CEM5 is
+```
+
+**Water is a component**, never a property; `Water_content` has been removed from the
+vocabulary. A weight-percent composition is kept as written. Beside it, the ratio is also
+converted to a molar one using PubChem molecular weights, recorded in `Ratio_molar` with
+`Ratio_source = computed`. What the paper printed is never overwritten.
+
+**Is it a DES at all?** A row must have at least two constituents to be extracted.
+Water counts as one when it is listed with a molar share (salt:water 1:4); it does not
+count when it is a few percent added to one compound. Refused rows go to
+`skipped_rows.csv` with the reason:
+- a single compound (corrosion inhibitors, reagents);
+- a structural fragment ("-CH3" in a group-contribution table);
+- a lone ionic liquid.
+
+An ionic liquid used *as* an HBA with a donor is a DES. A table that mixes ILs and DES
+without saying which row is which is skipped.
+
+### The paper's own dictionary
+
+Before anything is extracted, `paper_dictionary.py` gathers what the paper says its DES
+and abbreviations are, most authoritative first:
+1. definitions tables;
+2. the glossary;
+3. "Full name (ABBR)" in the text;
+4. **one model call per paper** over title, abstract, keywords, methods and table captions.
+
+The model call also says whether DES are the paper's subject, and what each DES was used
+for. Its answers are kept only if their evidence quote and every component name are
+actually in the paper.
+
+Every route resolves codes through this dictionary:
+- **Numbered variants are inferred and labelled `inferred`.** Alotaibi defines CEM as
+  1:4:(1–11), so CEM5 is 1:4:5.
+- **A paper that studies one DES family resolves a bare "DES 1:4" to that family.**
+- **If the paper is not about DES, only rows matching its own DES are kept.** This is
+  the case for Verma.
+
+### Which DES was used for what
+
+Applications come from three routes, told apart by `Extractor`:
+- `table`: an application table;
+- `prose`: a section;
+- `paper`: the overview, i.e. what the title and abstract say the DES were used for.
+
+All three use one controlled domain vocabulary (`config.APPLICATION_DOMAINS`) plus
+`other`, with the paper's own wording kept in `Domain_detail`. Only rows with
+`status = ok` load into the graph.
+
 ## Validating it
 
 ```bash
@@ -555,11 +651,22 @@ wins and sets `status`:
 
 | status | meaning | in graph |
 |---|---|---|
-| `qualitative` | no number; the text only ranked or compared | no |
-| `unverified` | the value does not occur in the real section text | no |
-| `duplicate` | Table 2 already has it (`duplicate_of` names the row) | no |
+| `qualitative` | no number; the text only ranked or compared (written to `sections_llm_rejected.csv`) | no |
+| `quote_not_found` | the quote is not in the section (90% fuzzy match, typography normalised; `textmatch.py`) | no |
+| `value_not_in_quote` | the number is not in that quote | no |
+| `no_des_in_quote` | the quote names no specific DES: the model is not allowed to supply one | no |
+| `unhandled_unit` | the unit measures something else (kcal/mol as "solubility"), or will not convert | no |
+| `duplicate` | a table already has it (`duplicate_of` names the row) | no |
 | `unresolved_components` | a chemical name we refused to guess at | no |
 | `ok` | — | **yes** |
+
+The DES is read from the **quote**, never from the model's list:
+- a code the paper's dictionary defines;
+- else a formula written in the quote;
+- else the model's names, but only those the quote actually writes.
+
+A "respectively" sentence assigns its values to its formulas in order. A sentence about
+DES in general produces no row. Values go through `units.py`, so K becomes °C.
 
 `verified` compares against the XML section text, not the model's own quoted sentence, so
 a hallucination cannot validate itself.
@@ -831,6 +938,29 @@ and the same sorted list resolves the model's line numbers, so the key depends o
 PubChem said and never on the order it arrived in. If you add another LLM route, anything
 list-shaped that reaches a prompt needs the same treatment.
 
+## Measuring accuracy against a gold set
+
+```bash
+python tools/make_gold_drafts.py --tag qwen3       # eval/gold/<slug>/*.csv, for a human
+python tools/evaluate.py --tag qwen3 --self-test   # the scorer scores gold as 100%
+python tools/evaluate.py --tag qwen3 --tag sonnet55 --tag opus55   # compare runs
+```
+
+Every number a model produces is scored against a human-corrected gold set, per task:
+
+| task | measured as |
+|---|---|
+| table relevance and content types | accuracy and F1 |
+| column roles | accuracy |
+| the paper's DES dictionary | precision / recall / F1 |
+| distinct mixtures | precision / recall / F1 |
+| measurements | precision / recall / F1, and a count of right-DES-wrong-value errors |
+| applications | precision / recall / F1 |
+
+Pooled scores carry 95% bootstrap intervals that resample papers, because thirteen papers
+is a small sample. Cost and time come from each run's `usage.csv` and `timing.csv`. The
+annotation rules are in `eval/ANNOTATION.md`.
+
 ## The graph
 
 ```
@@ -1078,7 +1208,11 @@ des_pipeline/
   xml_utils.py           lxml primitives — one copy of each
   schema.py              pydantic models; field order is CSV column order
   router.py              classify the document's parts
-  extract_table.py       Table 2 → mixtures + measurements
+  composition.py         any written DES -> components, ratio, water; the DES gate
+  paper_dictionary.py    the paper's own DES codes and abbreviations, built first
+  textmatch.py           is a quote really in the paper (one test for every route)
+  units.py               value conversion, and unit-vs-property conflicts
+  extract_table.py       property tables → mixtures + measurements; the table ledger
   extract_references.py  bibliography → Crossref DOIs and metadata
   extract_figures.py     figures → human worklist
   extract_text_llm.py    prose → LLM + pydantic  [chemdataextractor hook]

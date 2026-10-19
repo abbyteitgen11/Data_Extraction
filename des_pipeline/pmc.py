@@ -419,7 +419,9 @@ def proposed_slug(meta, pmcid):
     surname = first.split()[-1] if first else ""
     year = str(meta.get("year") or "").strip()
     stem = f"{surname}_{year}" if surname and year else pmcid
-    return re.sub(r"[^A-Za-z0-9_.-]", "_", stem)
+    from .paper import ascii_slug
+
+    return ascii_slug(stem)
 
 
 def build_manifest(out_dir=None, verbose=True):

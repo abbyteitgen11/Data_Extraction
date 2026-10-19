@@ -32,8 +32,8 @@ from collections import Counter
 
 import pandas as pd
 
-from . import config, dialects, paper as paper_mod, profile_table, store, xml_utils
-from .extract_table import read_measurement, read_value
+from . import config, dialects, paper as paper_mod, profile_table, store, units, xml_utils
+from .extract_table import read_measurement, read_measurement_cell, read_value
 
 
 # ---------- re-reading the source ----------
@@ -57,6 +57,11 @@ def _reread_context(paper_row):
         profile = TableProfile(**record["profile"])
         profiles[table_id] = profile
         columns[table_id] = {c.index: c for c in profile.columns}
+        # The extractor read the table AFTER moving its header rows out of the body
+        # (tables with no header markup). Source_row counts from there, so the
+        # re-read must do the same or every row is off by the header's height.
+        if table_id in tables:
+            tables[table_id].promote_header(profile.header_row_count)
     return tables, profiles, columns
 
 
@@ -95,14 +100,50 @@ def check_fidelity(paper_row, sample=None):
 
         cell = table.rows[index][col]
         spec = columns[row["Table_id"]].get(col)
-        value, temperature, _marker, _note = read_measurement(
+        if spec is None:
+            mismatches.append({**_ident(row), "problem": "column not in the profile"})
+            continue
+        parsed, _marker, temperature, _source = read_measurement_cell(
             table.rows[index], spec, profile)
         checked += 1
-        if value is None or abs(float(value) - float(row["Value"])) > 1e-9:
+
+        # TRANSCRIPTION: what we stored as written vs what the cell says. Comparing the
+        # converted Value here (as this once did) reported every kelvin melting point
+        # as a fidelity failure -- 445.6 K re-read against 172.45 C -- which is the
+        # converter working, not the transcription failing.
+        written = row.get("Value_as_written")
+        if written is None or written == "":
+            written = row.get("Value")
+        re_read = parsed.value if parsed.value is not None else parsed.low
+        if written is None or written == "":
+            stored = row.get("Value_low")
+        else:
+            stored = written
+        if re_read is None or stored in (None, "") or \
+                abs(float(re_read) - float(stored)) > 1e-9:
             mismatches.append({**_ident(row), "problem": "value does not round-trip",
-                               "extracted": row["Value"], "re_read": value,
+                               "extracted": stored, "re_read": re_read,
                                "raw_cell": cell.text})
-        elif row.get("Temperature_C") is not None and temperature is not None and \
+            continue
+
+        # CONVERSION, checked separately: the stored Value must be what units.py makes
+        # of the as-written value in the printed unit.
+        if parsed.value is not None and row.get("Value") not in (None, "") and \
+                row.get("status", "ok") == "ok":
+            printed = " ".join(table.column(spec.index)) or spec.header or ""
+            scale = units.header_scale(printed)
+            expected, _unit, status = units.to_canonical(
+                parsed.value * scale, (spec.unit_as_written or "").strip().strip("()"),
+                row["Property"])
+            if not status and expected is not None and \
+                    abs(float(expected) - float(row["Value"])) > 1e-6 * max(1, abs(expected)):
+                mismatches.append({**_ident(row), "problem": "unit conversion does not "
+                                   "round-trip", "extracted": row["Value"],
+                                   "re_read": expected, "raw_cell": cell.text})
+                continue
+
+        if row.get("Temperature_C") not in (None, "") and temperature is not None and \
+                row.get("Property") not in config.PHASE_TRANSITION_PROPERTIES and \
                 abs(float(temperature) - float(row["Temperature_C"])) > 1e-9:
             mismatches.append({**_ident(row), "problem": "temperature does not round-trip",
                                "extracted": row["Temperature_C"], "re_read": temperature,
@@ -266,9 +307,15 @@ def review_queue():
         items.append({"priority": priority, "kind": kind, "detail": detail[:200],
                       "rows_affected": affects, "Paper_key": paper, "verdict": ""})
 
-    for row in store.read_all("tables_unhandled"):
-        add(1, "table not extracted", f"{row.get('label')}: {row.get('status')}",
-            row.get("n_rows") or 0, row.get("Paper_key", ""))
+    for row in store.read_all("tables"):
+        if row.get("status") in ("failed", "no_rows"):
+            add(1, f"table {row.get('status')}",
+                f"{row.get('label')}: {row.get('why')} {row.get('problems') or ''}",
+                int(row.get("n_rows") or 0), row.get("Paper_key", ""))
+        if row.get("demoted"):
+            add(2, "column relabelled by code",
+                f"{row.get('label')}: {row.get('demoted')}", int(row.get("n_rows") or 0),
+                row.get("Paper_key", ""))
 
     prose = store.read_all("sections_llm")
     unresolved = Counter()
@@ -288,17 +335,26 @@ def review_queue():
 
     for row in store.read_all("references"):
         agreement = row.get("title_agreement")
-        if agreement is not None and float(agreement) < 0.5:
+        confidence = row.get("match_confidence")
+        if confidence and confidence != "low":
+            continue
+        if confidence == "low" or (agreement is not None and float(agreement) < 0.5):
             add(4, "doubtful Crossref match",
                 f"ref {row.get('ref_number')} {row.get('doi')}: title agreement "
                 f"{agreement} -- {str(row.get('title'))[:60]}", 1,
                 row.get("Paper_key", ""))
 
     for row in prose:
-        if row.get("status") == "unverified":
-            add(5, "prose value not in the text",
+        if row.get("status") in ("quote_not_found", "value_not_in_quote", "unverified"):
+            add(5, f"prose: {row.get('status')}",
                 f"{row.get('components_resolved')} {row.get('property')} = "
-                f"{row.get('value')}", 1, row.get("Paper_key", ""))
+                f"{row.get('value')} -- {str(row.get('source_text'))[:80]}", 1,
+                row.get("Paper_key", ""))
+    for row in store.read_all("des_dictionary"):
+        if str(row.get("verified")).lower() in ("false", "0"):
+            add(4, "DES definition not verified",
+                f"{row.get('code')} = {row.get('components')} ({row.get('note')})", 1,
+                row.get("Paper_key", ""))
 
     items.sort(key=lambda i: (i["priority"], -i["rows_affected"]))
     config.REVIEW_DIR.mkdir(parents=True, exist_ok=True)
@@ -379,7 +435,9 @@ def spot_check(paper_row, n=20, seed=0, interactive=False):
     changes; the table and XML row index do not.
     """
     slug = paper_row["slug"]
-    path = config.REVIEW_DIR / f"{slug}_spotcheck.csv"
+    # Verdicts are a human's, so they live in the shared review folder and every run
+    # tag reads them; a run-local file (from --review in a tagged run) adds to them.
+    path = config.SHARED_DATA / "review" / f"{slug}_spotcheck.csv"
     answered = {}
     if path.exists():
         for row in pd.read_csv(path).to_dict("records"):
@@ -455,8 +513,12 @@ def report(interactive=False, sample=20):
         checked, mismatches = check_fidelity(paper_row)
         skipped = skipped_cells(paper_row)
         implausible = check_plausibility(rows)
-        unhandled = [r for r in store.read_all("tables_unhandled")
-                     if r.get("Paper_key") == paper_row["Paper_key"]]
+        ledger = [r for r in store.read_all("tables")
+                  if r.get("Paper_key") == paper_row["Paper_key"]]
+        unhandled = [r for r in ledger if r.get("status") != "extracted"]
+        no_data_verdict = bool(ledger) and all(
+            r.get("status") in ("not_relevant", "not_des", "not_profiled")
+            for r in ledger)
         verdicts = spot_check(paper_row, n=sample, interactive=interactive)
         mine = [v for v in verdicts.values() if v["Paper_key"] == paper_row["Paper_key"]]
         wrong = sum(1 for v in mine if v["correct"] == "no")
@@ -472,14 +534,22 @@ def report(interactive=False, sample=20):
               f"   ({', '.join(f'{n} {r}' for r, n in reasons.most_common()) or 'none'})")
         print(f"    plausible        {len(rows) - len(implausible)}/{len(rows)}"
               f"   ({len(implausible)} flagged, {share:.1f}%)")
-        print(f"    tables skipped   {len(unhandled)}")
+        statuses = Counter(r.get("status") for r in ledger)
+        print(f"    tables           {len(ledger)}: "
+              + ", ".join(f"{k} {v}" for k, v in sorted(statuses.items())))
         print(f"    spot check       {len(mine)} row(s) reviewed covering {values_seen} "
               f"value(s), {wrong} wrong"
               f"{'' if mine else '   (none yet -- run with --review)'}")
 
-        accepted = (not mismatches and wrong == 0 and share < 2.0
+        # A paper with no values is accepted only when every table was explicitly
+        # judged to hold no DES data. "0/0 fidelity" used to read as a pass, so seven
+        # papers that had extracted nothing were reported as accepted.
+        has_data = bool(rows) or no_data_verdict
+        accepted = (has_data and not mismatches and wrong == 0 and share < 2.0
                     and len(mine) >= min(sample, len(source_rows)))
-        print(f"    accepted         {accepted}")
+        why = "" if has_data else "   (no values extracted, and not every table was " \
+                                  "judged free of DES data)"
+        print(f"    accepted         {accepted}{why}")
         all_ok &= accepted
         for m in mismatches[:5]:
             print(f"      MISMATCH {m['Measurement_key']}: {m['problem']} "

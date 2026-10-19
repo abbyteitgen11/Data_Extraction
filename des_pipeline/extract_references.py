@@ -42,7 +42,10 @@ def parse_bibliography(reference_elements, dialect):
 # `paper` is a required argument everywhere -- a default would be an invitation to
 # reintroduce exactly the cross-paper bleed this replaced.
 def cache_path(paper):
-    return config.PAPERS_DIR / paper.slug / "reference_map.json"
+    # In the shared data/ tree whatever the run tag: a Crossref match does not depend on
+    # which model read the paper, and re-resolving 1,159 references per model would be
+    # an hour of network for nothing.
+    return config.REFERENCE_MAP_DIR / paper.slug / "reference_map.json"
 
 
 def _migrate_legacy(paper, refs):
@@ -525,6 +528,39 @@ def to_rows(reference_map, owner_key):
             match_basis=meta.get("match_basis") or "",
             metadata_source="crossref" if meta.get("_enriched") else "xml",
             title_agreement=meta.get("title_agreement"),
+            match_confidence=match_confidence(meta),
             raw=meta.get("raw", ""),
         ))
     return rows
+
+
+def match_confidence(meta):
+    """How far to trust a reference's DOI: high | medium | low | none.
+
+    Crossref's `match_score` is a Lucene relevance score, not a confidence -- it grows
+    with query length, so a title-less "journal volume page" query scores 20-40 even
+    when it is exactly right. Reading the raw score made 43 of Azad's 111 references
+    look doubtful when 99 have a DOI. The basis and the field check say more:
+
+      high    the paper printed the DOI itself, or a title match whose title agrees
+      medium  a journal/volume/page match whose year and volume-or-page agree
+      low     a match with nothing independent to confirm it
+      none    no DOI found
+    """
+    if not meta.get("doi"):
+        return "none"
+    basis = str(meta.get("match_basis") or "")
+    agreement = meta.get("title_agreement")
+    if basis == "inline_doi":
+        return "high"
+    if not basis:                         # cached before match_basis was recorded
+        if agreement is not None:
+            return "high" if float(agreement) >= 0.5 else "low"
+        return "medium"
+    if basis.startswith("title"):
+        if agreement is not None and float(agreement) >= 0.5:
+            return "high"
+        return "medium" if basis.endswith("+fields") else "low"
+    if basis.startswith("journal_volume_page"):
+        return "medium" if basis.endswith("+fields") else "low"
+    return "low"

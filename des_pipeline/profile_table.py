@@ -25,13 +25,13 @@ import re
 
 from pydantic import ValidationError
 
-from . import config
+from . import config, units
 from .extract_text_llm import cached_call_llm
 from .schema import TableProfile
 
-PROMPT = """You are labelling the COLUMNS of one table from a chemistry paper about
-deep eutectic solvents (DES). You never read data out of the table: you say what each
-column means, and code reads the values.
+PROMPT = """You are labelling the COLUMNS of one table from a chemistry paper that \
+involves deep eutectic solvents (DES). You never read data out of the table: you say what \
+each column means, and code reads the values.
 
 {card}
 
@@ -40,91 +40,97 @@ Return, for EVERY column index 0..{n_columns} exactly once, in order:
   index            the column number.
   header           the header text at that index, copied character-for-character from
                    above. Do not tidy, translate or expand it. This is checked.
-  role             component | ratio | reference | property | condition | context | ignore
-  property         when role is property, which of: {properties}.
-                   null otherwise. A property column that is not in that list gets
-                   role "ignore" -- do not force it into the nearest one.
+  role             mixture | component | ratio | water | reference | property |
+                   other_quantity | condition | context | ignore
+                     mixture         each cell names a WHOLE DES: a formula with its
+                                     ratio, or a code the paper uses for one.
+                     component       each cell names ONE constituent of the DES.
+                     ratio           the mixing ratio of the DES's constituents.
+                     water           the water content the DES was MADE with.
+                     reference       bracketed numbers pointing at the bibliography.
+                     property        a measured property from this list: {properties}.
+                     other_quantity  a numeric measured quantity that is NOT in that
+                                     list. Name it in context_field. Never force a
+                                     quantity into the nearest property name.
+                     condition       the temperature or pressure AT WHICH the other
+                                     columns were measured.
+                     context         descriptive information about the row.
+                     ignore          anything else (row numbers, blank columns).
+  property         when role is property, which one from the list. null otherwise.
   unit_as_written  the unit exactly as the header or sub-header prints it. null if none.
   component_role   HBA, HBD or either, when role is component.
-  context_field    when role is context, a short snake_case name for what it records.
+  context_field    for context and other_quantity: a short snake_case name.
   multi_valued     true when one cell holds several values.
 
 Also return:
-  relevant               false when the table has no DES data at all.
-  content_types          a LIST of every kind of data this table holds. One table often
-                         holds several, and naming only the best one throws the rest
-                         away:
+  relevant               true only when the ROWS are deep eutectic solvents (or the
+                         table defines, measures or applies DES). false for tables of
+                         instrument settings, analytical figures of merit, statistics,
+                         reagents, biological results, or anything without DES rows.
+  involves_ionic_liquids true when the rows are ionic liquids rather than DES, or
+                         include them.
+  des_vs_il_ambiguous    true when the table mixes ionic liquids and DES and does not say
+                         which row is which.
+  content_types          a LIST of every kind of data this table holds:
                            des_properties    measured physical properties of DES
                            des_application   a DES used FOR something (substrate,
                                              technique, yield, product)
-                           des_definitions   names/abbreviates DES, no measurements
+                           des_definitions   says what each DES is made of
                            component_properties  properties of single pure compounds
                            other             anything else
                          A table with a composition, a measured density AND the yield it
-                         achieved is all three of the first three. Return every one that
-                         applies, not the closest single label.
-                         Fitted equation parameters (columns like A, B, C, r2, E, eta0)
-                         are "other" -- they are coefficients, not measurements, even
-                         though every cell is a number.
+                         achieved is all three of the first three.
+                         These are always "other", even though every cell is a number:
+                           fitted equation or model parameters (A, B, r2, Ea, eta0);
+                           design-of-experiment matrices, ANOVA, regression coefficients;
+                           group-contribution or atomic-fragment tables;
+                           simulation or computed results (MD, DFT, COSMO, H-bond counts);
+                           calibration, LOD, recovery and other analytical-method data.
   layout                 wide_per_mixture | paneled_by_mixture.
                          DEFAULT TO wide_per_mixture -- nearly every table is one row
                          per DES with its properties in fixed columns.
                          Choose paneled_by_mixture ONLY if BOTH are true:
                            (a) the column headers repeat a group, e.g. reading
-                               "T, lambda, T, lambda, T, lambda" rather than naming
+                               "T, value, T, value, T, value" rather than naming
                                six different things, AND
                            (b) a SPANNING ROW (marked as such below) names the DES for
                                each group, because no column holds the DES name.
-                         If any column holds the DES name or abbreviation, the layout is
-                         wide_per_mixture.
   implied_components     components in every mixture that no column lists, when the
-                         CAPTION says so: "PTSA based DES" beside an HBA-only table means
-                         PTSA. Leave empty unless the caption states it -- do not infer
-                         from the paper's title or subject.
+                         CAPTION says so ("X based DES" beside a table listing only the
+                         other constituent). Leave empty unless the caption states it.
   implied_from           the caption words that justify implied_components.
   reason                 one sentence.
   header_row_count       how many leading rows are header, not data.
-                         When the card says NO HEADER MARKUP, this is what recovers the
-                         table: say how many of the leading rows shown are really the
-                         header, and label the columns from them. 0 if the table truly
-                         starts with data.
+                         When the card says NO HEADER MARKUP, say how many of the leading
+                         rows shown are really the header, and label the columns from
+                         them. 0 if the table truly starts with data.
   footnote_markers       one entry per marker the legend defines, with its meaning and,
-                         for a temperature marker, the temperature in Celsius.
-                         Empty list when the table has no legend.
-  missing_value_tokens   the strings this table PRINTS IN PLACE OF a value: "-", "n/a",
-                         "nd", or a legend-defined token like "DT" meaning the value was
-                         reported at several temperatures. These belong here, NOT in
-                         footnote_markers -- a footnote marker annotates a value that is
-                         present, a missing-value token replaces one that is not.
+                         for a temperature marker, the temperature in Celsius. Only
+                         markers the LEGEND above actually defines. Empty if no legend.
+  missing_value_tokens   the strings this table prints IN PLACE OF a value: "-", "n/a",
+                         "nd", or a token its legend defines as "not measured". Not
+                         footnote markers, which annotate a value that is present.
   default_temperature_C  the temperature unmarked values were measured at, if the
                          caption or legend says. null otherwise.
 
 Rules:
   - NEVER copy, transcribe, average or convert a data value. Indices and labels only.
   - Emit exactly one record per column index. Do not skip empty-looking columns.
-  - A column of bracketed numbers pointing at the bibliography is role "reference".
-  - Symbols: Tm is melting point, rho density, eta viscosity, kappa conductivity,
-    gamma surface tension, nD refractive index, Tb boiling point, lambda thermal
-    conductivity.
-  - Conductivity and Thermal_conductivity are DIFFERENT properties. The unit decides:
-    mS/cm or S/m is electrical Conductivity; W/(m K) is Thermal_conductivity.
-  - A "component" is a constituent OF THE SOLVENT ITSELF. In a des_application table,
-    a substrate, reagent, feedstock, product, biomass source or removed compound is what
-    the DES ACTS ON, not what it is made of: role "context", not "component".
-    An esterification table listing HBA | Alcohol | Acid describes a two-component DES
-    (the HBA plus whatever the caption implies) reacting an alcohol with an acid --
-    the alcohol and the acid are role "context", named alcohol and acid.
-    If WHAT THE PAPER SAYS ABOUT THIS TABLE is shown above, use it to decide: it usually
-    states which columns are the solvent's own components.
-  - A column counting WATER EQUIVALENTS ("H2O" holding 1, 2, 3) is not a name and not a
-    plain context field: give it role "context" with context_field "water_equivalents",
-    so code can read the count as part of the composition.
-  - "condition" is for a column giving the temperature or pressure AT WHICH the other
-    columns were measured -- a "T/K" column beside a viscosity column.
-    A melting point or boiling point is ALSO a temperature, but it IS the measured
-    quantity, so it is role "property" with property Melting_point / Boiling_point.
-    If a temperature column has no other property column depending on it, it is a
-    property, not a condition.
+  - Symbols: Tm melting point, rho density, eta viscosity, kappa or sigma (in S/cm)
+    conductivity, gamma surface tension, nD refractive index, Tb boiling point, lambda
+    thermal conductivity, Tg glass transition, Td or Tdec decomposition temperature.
+  - The UNIT decides between similar properties: mS/cm is Conductivity, W/(m K) is
+    Thermal_conductivity. A unit that is not the property's own (a pressure, an energy,
+    a percentage) means the column is other_quantity.
+  - A component is a constituent OF THE SOLVENT ITSELF. A drug, solute, substrate,
+    reagent, feedstock, product, analyte or biomass that the DES acts on is "context",
+    never "component". If WHAT THE PAPER SAYS ABOUT THIS TABLE is shown above, use it.
+  - A column counting WATER EQUIVALENTS ("H2O" holding 1, 2, 3) is role "context" with
+    context_field "water_equivalents". A column giving water as a percentage or mass
+    fraction of the DES is role "water".
+  - A melting point or boiling point is ALSO a temperature, but it IS the measured
+    quantity: role "property". A temperature column with no other property column
+    depending on it is a property, not a condition.
 """
 
 
@@ -251,8 +257,14 @@ def _numeric_fraction(table, index, profile, sample=250):
     profile a table of eutectic types, the model called the "Formula" column --
     holding "Cat+X- zMClx" -- a melting point, and echoed the header correctly while
     doing it. Numbers are something we can check ourselves.
+
+    It reads cells with the EXTRACTOR's own parser. It used to use `clean_number`, which
+    rejects "1.0101 ± 0.02", so every column written with uncertainties was demoted to
+    context after the model had labelled it correctly -- Alotaibi's and Anđelović's whole
+    property tables were lost that way. A check that disagrees with the reader it guards
+    rejects exactly the cells the reader would have handled.
     """
-    from . import xml_utils
+    from .extract_table import parse_measurement_cell
 
     missing = set(profile.missing_value_tokens) | set(config.DASH)
     markers = {m.marker for m in profile.footnote_markers}
@@ -264,13 +276,17 @@ def _numeric_fraction(table, index, profile, sample=250):
         if not text or text in missing:
             continue
         checked += 1
-        # A leading footnote marker is part of the notation, not the number.
+        # A footnote marker is part of the notation, not the number -- leading or trailing.
         stripped = text
         for marker in markers:
             if marker and stripped.startswith(marker):
                 stripped = stripped[len(marker):]
                 break
-        if xml_utils.clean_number(stripped) is not None:
+            if marker and stripped.endswith(marker) and len(marker) <= 2:
+                stripped = stripped[:-len(marker)]
+                break
+        parsed = parse_measurement_cell(stripped, row[index].markers, profile)
+        if parsed.value is not None or parsed.low is not None:
             numeric += 1
     return (numeric / checked if checked else 0.0), checked
 
@@ -278,10 +294,11 @@ def _numeric_fraction(table, index, profile, sample=250):
 def validate(profile, table):
     """-> list of problems. Empty means the profile is safe to extract with.
 
-    Two checks, both against data we already hold rather than anything the model
+    The checks are all against data we already hold rather than anything the model
     asserts: the echoed header must match the printed header (catching a map that has
-    drifted by a column), and a column labelled as a property must actually contain
-    numbers (catching a plausible-looking but wrong label).
+    drifted by a column), a property column must hold numbers and carry a unit that
+    belongs to that property (`repair` has already demoted the ones that do not), and
+    markers and implied components must be traceable to the legend and caption.
     """
     problems = []
     indices = [c.index for c in profile.columns]
@@ -295,14 +312,11 @@ def validate(profile, table):
 
     for column in profile.columns:
         printed = " ".join(table.column(column.index))
-        if norm(column.header) and norm(column.header) not in norm(printed):
+        if norm(column.header) and norm(column.header) not in norm(printed) \
+                and norm(printed):
             problems.append(f"col {column.index}: model echoed {column.header!r} but "
                             f"the header reads {printed!r}")
         if column.role != "property":
-            continue
-        if column.property not in config.PROPERTY_NAMES:
-            problems.append(f"col {column.index}: role=property but property="
-                            f"{column.property!r}")
             continue
         fraction, checked = _numeric_fraction(table, column.index, profile)
         if checked >= 5 and fraction < 0.5:
@@ -310,7 +324,6 @@ def validate(profile, table):
                 f"col {column.index} ({column.header!r}) is labelled "
                 f"{column.property} but only {fraction:.0%} of {checked} filled cells "
                 f"are numbers -- it does not hold measurements")
-
         problems += _unit_conflict(column, table)
 
     for marker in profile.footnote_markers:
@@ -528,34 +541,84 @@ def _fix_ratio_columns(profile, table):
 
 
 def repair(profile, table):
-    """Demote labels that cannot be right, rather than failing the whole table.
+    """Demote labels that cannot be right, rather than failing the whole table. In place.
 
-    A property column has to hold numbers, and that is the ONLY reason one is demoted
-    here now. This used to demote every property column in any table not labelled
-    `des_properties`, on the reasoning that nothing reads properties out of an
-    application table -- which was true while `record_type` forced a table to be one
-    thing. It no longer is: a table can declare both, and Solcan's and Alotaibi's do, so
-    demoting on the label alone would throw away exactly the measurements this change
-    exists to keep.
+    Every demotion is evidence-based and reported (the notes go into the table ledger):
 
-    The numeric check stands on its own evidence and is kept. It is what caught
-    "Yield model substrate (%)" being labelled Refractive_index -- a real quantity, but
-    not one in the vocabulary, so the model picked the nearest name.
+      * a property column whose cells are not numbers -> context;
+      * a property column with no property name, or whose printed unit measures a
+        different quantity (a pressure labelled Density, a percentage labelled pH) ->
+        other_quantity. These used to FAIL the table, which lost every good column in
+        it along with the one bad one;
+      * a Polarity_ET30 column that is really a Kamlet-Taft alpha/beta/pi* -> other_quantity;
+      * a footnote marker the legend does not define -> dropped (the model sometimes
+        returns markers from its instructions rather than from this table);
+      * a context column naming each row's DES, in a table with no component column ->
+        mixture, so the rows have an identity.
     """
-    notes = _fix_condition_columns(profile, table)
+    notes = _fix_numeric_name_columns(profile, table)
+    notes += _fix_condition_columns(profile, table)
     notes += _fix_ratio_columns(profile, table)
     for column in profile.columns:
         if column.role != "property":
             continue
-        fraction, checked = _numeric_fraction(table, column.index, profile)
-        if checked < 5 or fraction >= 0.5:
+        name = column.context_field or _snake(" ".join(table.column(column.index))
+                                              or column.header)
+        if column.property not in config.PROPERTY_NAMES:
+            notes.append(f"col {column.index} ({column.header!r}) labelled property with "
+                         f"no property name -- read as other_quantity")
+            column.role, column.context_field, column.property = "other_quantity", name, None
             continue
-        notes.append(f"col {column.index} ({column.header!r}) labelled "
-                     f"{column.property} but only {fraction:.0%} of {checked} filled "
-                     f"cells are numbers -- read as context")
-        column.role = "context"
-        column.context_field = column.context_field or _snake(column.header)
-        column.property = None
+        fraction, checked = _numeric_fraction(table, column.index, profile)
+        if checked >= 5 and fraction < 0.5:
+            notes.append(f"col {column.index} ({column.header!r}) labelled "
+                         f"{column.property} but only {fraction:.0%} of {checked} filled "
+                         f"cells are numbers -- read as context")
+            column.role, column.context_field, column.property = "context", name, None
+            continue
+        printed = " ".join(table.column(column.index))
+        conflict = units.unit_conflict(column.unit_as_written or _unit_in(printed),
+                                       column.property)
+        if conflict:
+            notes.append(f"col {column.index} ({column.header!r}) labelled "
+                         f"{column.property}, but {conflict} -- read as other_quantity")
+            column.role, column.context_field, column.property = "other_quantity", name, None
+            continue
+        if column.property == "Polarity_ET30":
+            basis, _status = units.basis_of(column.property,
+                                            f"{printed} {column.unit_as_written or ''}")
+            if basis and basis != "ET30":
+                notes.append(f"col {column.index} ({column.header!r}) is Kamlet-Taft "
+                             f"{basis}, not E_T(30) -- read as other_quantity")
+                column.role, column.property = "other_quantity", None
+                column.context_field = f"kamlet_taft_{basis}"
+
+    # A temperature the legend never states is not trusted -- but it costs the marker,
+    # not the table. Failing the whole table over it lost Azad's and Dinh's tables
+    # because the model read "a: standard uncertainty of T is 0.1 K" as a temperature.
+    # The value keeps no marker temperature (it reads as unstated), which is the honest
+    # answer. A hand-pinned profile never reaches this function.
+    for message in _marker_temperature_problems(profile, table):
+        marker = re.match(r"marker '([^']*)'", message)
+        for m in profile.footnote_markers:
+            if marker and m.marker == marker.group(1) and m.meaning == "temperature":
+                m.meaning, m.temperature_C = "other", None
+                notes.append(f"{message[:120]} -- marker kept, temperature dropped")
+    defined = [m for m in profile.footnote_markers
+               if not m.marker or m.marker in (table.footnotes or "")]
+    dropped = [m.marker for m in profile.footnote_markers if m not in defined]
+    if dropped:
+        notes.append(f"dropped footnote marker(s) {', '.join(map(repr, dropped))}: "
+                     f"the table's legend does not define them")
+        profile.footnote_markers = defined
+    notes += _fix_mixture_columns(profile, table)
+    # An implied component the caption does not state is dropped, not fatal: Azad's
+    # model-parameter tables were failed outright because the model "implied" water and
+    # the dissolved drug. The rest of the profile is still checkable on its own.
+    if profile.implied_components and _implied_problems(profile, table):
+        notes.append(f"implied component(s) {', '.join(profile.implied_components)} not "
+                     f"stated by the caption -- dropped")
+        profile.implied_components, profile.implied_from = [], ""
     return profile, notes
 
 
@@ -606,28 +669,34 @@ _QUANTITY_HEADER = re.compile(
 
 
 def property_candidates(table, profile, paper):
-    """Numeric columns that look like properties but are not in the vocabulary. -> rows.
+    """Numeric columns of DES data that the vocabulary does not cover. -> rows.
 
-    The answer to "I don't know what properties the other papers have": the corpus says,
-    with the header it printed, the unit it printed and three of its own values, and
-    promoting one is then an edit to config.PROPERTIES and nothing else.
+    The answer to "what properties do the other papers have?": the corpus says, with
+    the header it printed, the unit it printed and three of its own values. Promoting
+    one is then an edit to config.PROPERTIES and nothing else.
+
+    Only `other_quantity` columns (and numeric context columns the model did not name)
+    in tables whose rows are DES -- a candidate from a corrosion-inhibitor table or an
+    analytical-method table is not a DES property, and listing it trains nobody. A name
+    that is already a property is not a candidate.
     """
-    from . import xml_utils
-
     out = []
+    vocabulary = {re.sub(r"[^a-z]", "", n.lower()) for n in config.PROPERTY_NAMES}
     for column in profile.columns:
-        if column.role in ("property", "component", "ratio", "reference"):
+        if column.role not in ("other_quantity", "context"):
             continue
         printed = " ".join(table.column(column.index)) or column.header or ""
-        if not _QUANTITY_HEADER.search(printed):
+        if column.role == "context" and not _QUANTITY_HEADER.search(printed):
+            continue
+        name = column.context_field or _snake(printed)
+        if re.sub(r"[^a-z]", "", name.lower()) in vocabulary:
             continue
         values = [row[column.index].text.strip() for row in table.rows
                   if column.index < len(row) and row[column.index].text.strip()
                   and row[column.index].text.strip() not in config.DASH]
-        if len(values) < 4:
+        if len(values) < 2:
             continue
-        numeric = sum(1 for v in values if xml_utils.clean_number(v) is not None
-                      or v[:1].isdigit())
+        numeric = sum(1 for v in values if v[:1].isdigit() or v[:1] in "-−.<>~")
         if numeric / len(values) < 0.6:
             continue
         out.append({
@@ -636,10 +705,10 @@ def property_candidates(table, profile, paper):
             "Table_id": table.id,
             "table_label": table.label,
             "column": column.index,
+            "name": name,
             "header": printed[:120],
             "unit_as_written": (column.unit_as_written or "")[:40],
             "role_given": column.role,
-            "context_field": column.context_field or "",
             "n_values": len(values),
             "examples": " | ".join(values[:3])[:120],
             "caption": table.caption[:160],
@@ -647,13 +716,22 @@ def property_candidates(table, profile, paper):
     return out
 
 
-def discover_properties(tables, profiles, paper):
-    """Collect property candidates across one paper's tables. -> rows."""
+def discover_properties(tables, profiles, paper, des_tables=None):
+    """Property candidates across one paper's tables. -> rows.
+
+    `des_tables`: the ids of tables that actually produced DES rows. Candidates come
+    only from those, when given.
+    """
     out = []
     for table in tables:
         profile = profiles.get(table.id)
-        if profile is not None and profile.relevant:
-            out += property_candidates(table, profile, paper)
+        if profile is None or not profile.relevant:
+            continue
+        if des_tables is not None and table.id not in des_tables:
+            continue
+        if "des_properties" not in profile.content_types:
+            continue
+        out += property_candidates(table, profile, paper)
     return out
 
 
@@ -662,13 +740,41 @@ def _overrides_path(paper):
     return config.PAPERS_DIR / getattr(paper, "slug", "unknown") / "table_profiles.json"
 
 
+# Set by run_pipeline --ignore-human-profiles, so a model comparison profiles every
+# table with the model under test, including the ones a human has pinned.
+IGNORE_HUMAN_PROFILES = False
+
+
 def load_overrides(paper):
+    """table id -> saved profile record. Human pins in the shared tree always count.
+
+    A tagged run (runs/<tag>/) writes its own table_profiles.json, but a profile a human
+    pinned with "source": "human" lives in data/papers/<slug>/ and is a person's
+    verdict, not a model's, so every run honours it unless told not to.
+    """
+    out = {}
     path = _overrides_path(paper)
-    return json.loads(path.read_text()) if path.exists() else {}
+    if path.exists():
+        out = json.loads(path.read_text())
+    shared = config.HUMAN_PROFILES_DIR / getattr(paper, "slug", "unknown") / \
+        "table_profiles.json"
+    if not IGNORE_HUMAN_PROFILES and shared.exists() and shared != path:
+        for table_id, record in json.loads(shared.read_text()).items():
+            if record.get("source") == "human":
+                out[table_id] = record
+    if IGNORE_HUMAN_PROFILES:
+        out = {k: v for k, v in out.items() if v.get("source") != "human"}
+    return out
 
 
-def save_profiles(profiles, paper, cards):
-    """Record every profile so it can be read, corrected, and pinned by hand."""
+def save_profiles(profiles, paper, cards, repairs=None, problems=None):
+    """Record every profile -- failed ones too -- so it can be read, corrected, pinned.
+
+    A failed profile used to be left out of this file, so a table that failed
+    validation appeared in tables_unhandled.csv and nowhere else, and the two files
+    each looked incomplete. Every table the model was asked about is now here, with
+    `status` saying whether it was used.
+    """
     path = _overrides_path(paper)
     path.parent.mkdir(parents=True, exist_ok=True)
     existing = load_overrides(paper)
@@ -678,7 +784,10 @@ def save_profiles(profiles, paper, cards):
         out[table_id] = {
             # "human" means: use this verbatim and never call the model again.
             "source": was.get("source", "llm"),
+            "status": "used" if not (problems or {}).get(table_id) else "failed",
             "card_sha256": cards.get(table_id, ""),
+            "repairs": (repairs or {}).get(table_id, []),
+            "problems": (problems or {}).get(table_id, []),
             "profile": profile.model_dump(),
         }
     path.write_text(json.dumps(out, indent=2, ensure_ascii=False))
@@ -720,7 +829,7 @@ def worth_profiling(table):
 
 
 def profile_table(table, paper=None, backend=None, refresh=False, paragraphs=None):
-    """-> (TableProfile | None, problems, was_cached).
+    """-> (TableProfile | None, problems, was_cached, digest, repairs).
 
     Mutates `table` when its header had to be recovered from the data rows -- the same
     Table object is what `extract_table` reads, so the promotion has to happen here,
@@ -737,11 +846,11 @@ def profile_table(table, paper=None, backend=None, refresh=False, paragraphs=Non
         else:
             profile = TableProfile(**override["profile"])
             table.promote_header(profile.header_row_count)
-            return profile, [], True, digest
+            return profile, [], True, digest, []
 
     usable, why = worth_profiling(table)
     if not usable:
-        return None, [f"not profiled: {why}"], True, digest
+        return None, [f"not profiled: {why}"], True, digest, []
 
     prompt = PROMPT.format(card=card, n_columns=table.n_columns - 1,
                            properties=", ".join(config.PROPERTY_NAMES))
@@ -753,7 +862,8 @@ def profile_table(table, paper=None, backend=None, refresh=False, paragraphs=Non
     try:
         profile = TableProfile.model_validate_json(raw)
     except ValidationError as exc:
-        return None, [f"output did not validate: {exc.errors()[0]['msg']}"], was_cached, digest
+        return (None, [f"output did not validate: {exc.errors()[0]['msg']}"], was_cached,
+                digest, [])
 
     moved = table.promote_header(profile.header_row_count)
     if moved:
@@ -762,20 +872,23 @@ def profile_table(table, paper=None, backend=None, refresh=False, paragraphs=Non
     profile, repairs = repair(profile, table)
     for note in repairs:
         print(f"      {note}")
-    return profile, validate(profile, table), was_cached, digest
+    return profile, validate(profile, table), was_cached, digest, repairs
 
 
 def profile_tables(tables, paper=None, backend=None, refresh=False, paragraphs=None):
-    """-> ({table id: TableProfile}, {table id: problems})."""
-    profiles, problems, cards, hits, skipped = {}, {}, {}, 0, 0
+    """-> ({id: TableProfile}, {id: problems}, {id: repair notes}, {id: failed profile})."""
+    profiles, problems, cards, repairs, failed = {}, {}, {}, {}, {}
+    hits = skipped = 0
     for table in tables:
         # The digest comes back from profile_table rather than being recomputed here.
         # Rebuilding the card cost a second full render of every table, and after header
         # promotion it no longer even described the same table.
-        profile, issues, was_cached, digest = profile_table(
+        profile, issues, was_cached, digest, notes = profile_table(
             table, paper, backend, refresh, paragraphs)
         hits += was_cached
         cards[table.id] = digest
+        if notes:
+            repairs[table.id] = notes
         name = table.label or table.id
         if profile is None:
             problems[table.id] = issues
@@ -787,6 +900,7 @@ def profile_tables(tables, paper=None, backend=None, refresh=False, paragraphs=N
             continue
         if issues:
             problems[table.id] = issues
+            failed[table.id] = profile
             print(f"    {name:<12} {len(issues)} problem(s) -- not extracting")
             for issue in issues[:3]:
                 print(f"                 {issue}")
@@ -798,8 +912,90 @@ def profile_tables(tables, paper=None, backend=None, refresh=False, paragraphs=N
               f"{'  cached' if was_cached else ''}")
         if kinds:
             print(f"                 properties: {kinds}")
-    if paper is not None and profiles:
-        save_profiles(profiles, paper, cards)
+    if paper is not None and (profiles or failed):
+        save_profiles({**failed, **profiles}, paper, cards, repairs, problems)
     print(f"  profiles: {hits} cached, {len(tables) - hits} fresh"
           f"{f', {skipped} skipped without a call' if skipped else ''}")
-    return profiles, problems
+    return profiles, problems, repairs, failed
+
+
+def _unit_in(printed):
+    """The bracketed unit in a printed header: 'Pc (Bar)' -> 'Bar'. -> str."""
+    match = re.search(r"\(([^()]{1,20})\)\s*$|/\s*([^/]{1,20})$", str(printed or ""))
+    if not match:
+        return ""
+    return (match.group(1) or match.group(2) or "").strip()
+
+
+_MIXTURE_FIELD = re.compile(r"\bdes\b|mixture|solvent|electrolyte|sample|system|"
+                            r"composition|name|nades", re.I)
+
+
+_TEMPERATURE_HEADER = re.compile(r"^\s*\(?\s*(k|°c|℃|c|°f)\s*\)?\s*$|\bt\s*/|^t\b|"
+                                 r"temperature", re.I)
+
+
+def _fix_numeric_name_columns(profile, table):
+    """A column of NUMBERS cannot name a DES or a component.
+
+    Shown Fan's paneled table (a spanning row naming each DES, then T | lambda pairs),
+    the model labelled the T/K columns "mixture" -- and 60 thermal conductivities lost
+    their measuring temperature. If a name column is mostly numbers, it is a condition
+    when its header is a temperature, and context otherwise.
+    """
+    from .extract_table import parse_measurement_cell
+
+    notes = []
+    for column in profile.columns:
+        if column.role not in ("mixture", "component"):
+            continue
+        cells = [r[column.index].text.strip() for r in table.rows
+                 if column.index < len(r) and r[column.index].text.strip()
+                 and r[column.index].text.strip() not in config.DASH]
+        if len(cells) < 3:
+            continue
+        numeric = sum(1 for c in cells if parse_measurement_cell(c).value is not None)
+        if numeric / len(cells) < 0.6:
+            continue
+        printed = f"{' '.join(table.column(column.index))} {column.unit_as_written or ''}"
+        if _TEMPERATURE_HEADER.search(printed.strip()) or \
+                units.dimension_of(column.unit_as_written or "") == "temperature":
+            column.role = "condition"
+        else:
+            column.role = "context"
+            column.context_field = column.context_field or _snake(printed)
+        notes.append(f"col {column.index} ({column.header!r}) labelled a name but holds "
+                     f"numbers -- read as {column.role}")
+    return notes
+
+
+def _fix_mixture_columns(profile, table):
+    """Give the rows an identity when the model labelled the DES-name column 'context'.
+
+    Alotaibi's Table 2 is "DES | Density | Viscosity | ...", with the DES written as
+    a code (CE, CEM1, ...); Dinh's Table 3 is "electrolytes | d | sigma | eta" with
+    "DES 1:4". The model called those first columns context, so every row had a value
+    and no mixture, and the table extracted nothing. A context column whose header names
+    the DES and whose cells are words is the mixture column.
+    """
+    roles = {c.role for c in profile.columns}
+    if roles & {"mixture", "component"} or not profile.relevant \
+            or not set(profile.content_types) & {"des_properties", "des_application"}:
+        return []
+    for column in profile.columns:
+        if column.role != "context":
+            continue
+        printed = f"{' '.join(table.column(column.index))} {column.context_field or ''}"
+        if not _MIXTURE_FIELD.search(printed):
+            continue
+        cells = [r[column.index].text.strip() for r in table.rows
+                 if column.index < len(r) and r[column.index].text.strip()]
+        if not cells:
+            continue
+        wordy = sum(1 for c in cells if re.search(r"[A-Za-z]{2}", c))
+        if wordy / len(cells) < 0.6:
+            continue
+        column.role = "mixture"
+        return [f"col {column.index} ({column.header!r}) names each row's DES -- read "
+                f"as mixture"]
+    return []

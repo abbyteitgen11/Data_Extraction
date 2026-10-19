@@ -72,6 +72,15 @@ class _MixtureRowFields(BaseModel):
     Mixture: str = ""
     Ratio_flag: str = ""
     Component_flag: str = ""
+    # --- how the composition was established (composition.py) ---
+    Components_written: str = ""         # ";"-joined, as the paper wrote them
+    Ratio_molar: str = ""                # over ALL components, water included, if known
+    Ratio_source: str = ""               # as_written | computed | inferred | coefficients
+    Composition_basis: str = ""          # molar | wt | vol | ""
+    Water_fraction: Optional[float] = None   # 0.2 for "+20% water"
+    Water_basis: str = ""                # wt | vol | mol
+    DES_code: str = ""                   # the paper's own name for it: "CEM5", "DES1"
+    Composition_note: str = ""
     DOI: str = ""                        # the review; kept for backwards compatibility
     Ref: str = ""                        # the raw citation cell, e.g. "1,26-28"
 
@@ -112,7 +121,8 @@ config.PROPERTIES, appended by create_model so the vocabulary has one declaratio
 # "assumed 25 C" any more: `config.DEFAULT_TEMP` used to supply one and it invented a
 # condition the paper never stated.
 TEMPERATURE_SOURCES = ("cell_inline", "marker", "condition_column", "column_header",
-                       "caption_default", "unstated")
+                       "caption_default", "unstated",
+                       "not_applicable")   # the value IS a temperature (melting point)
 
 # What keeps a table measurement out of the graph, in precedence order. Same shape as
 # COMPONENT_PROPERTY_STATUS_ORDER below, for the same reason: the row is always written
@@ -195,6 +205,8 @@ class ReferenceRow(BaseModel):
                                          # cannot be computed without a title at all.
     metadata_source: str = "xml"         # "crossref" once the enrich pass has run
     title_agreement: Optional[float] = None   # XML vs Crossref word overlap; low = suspect
+    match_confidence: str = ""           # high | medium | low | none -- see
+                                         # extract_references.match_confidence
     raw: str = ""
 
 
@@ -213,13 +225,53 @@ class FigureRow(BaseModel):
 
 
 class TableRow(BaseModel):
-    """A table the pipeline has no parser for. -> data/tables_unhandled.csv"""
+    """A table the pipeline has no parser for. -> tables_unhandled.csv (legacy view)"""
 
     table_id: str
     label: str = ""
     caption: str = ""
     n_rows: int = 0
     status: str = "needs_human"
+
+
+# What happened to a table, decided by CODE. Every table in a paper gets exactly one.
+TABLE_STATUSES = (
+    "extracted",          # at least one value, mixture, definition or application row
+    "no_rows",            # profiled and relevant, but every row was refused (see why)
+    "not_relevant",       # the profile says it holds no DES data
+    "not_des",            # every row it would give failed the "is this a DES" test
+    "failed",             # the profile failed validation; nothing extracted
+    "not_profiled",       # never sent to the model (an image, empty, no numbers or names)
+)
+
+
+class TableLedgerRow(BaseModel):
+    """One row per table in the paper -- ALL of them. -> data/papers/<slug>/tables.csv
+
+    This replaces reading two files (table_profiles.json for the successes,
+    tables_unhandled.csv for the failures) to find out what happened to a table, which
+    is why each looked incomplete on its own.
+    """
+
+    Paper_key: str = ""
+    table_id: str
+    label: str = ""
+    caption: str = ""
+    n_rows: int = 0
+    n_columns: int = 0
+    status: str = ""                      # one of TABLE_STATUSES
+    why: str = ""                         # code's explanation of the status
+    content_types: str = ""               # "+"-joined, from the profile
+    involves_ionic_liquids: Optional[bool] = None
+    n_values: int = 0                     # measurements written
+    n_mixtures: int = 0
+    n_definitions: int = 0
+    n_applications: int = 0
+    n_rows_refused: int = 0               # rows that failed the DES test, etc.
+    columns: str = ""                     # "0:component | 1:property=Density | ..."
+    demoted: str = ""                     # what code changed in the model's labels
+    problems: str = ""                    # validation problems, when status=failed
+    model_reason: str = ""                # the MODEL's one-line reason -- not checked
 
 
 class ComponentRow(BaseModel):
@@ -295,7 +347,8 @@ class ApplicationRow(BaseModel):
     Paper_DOI: str = ""
     Table_id: str = ""                   # "" for a prose row; Section_id carries it
     Source_row: Optional[int] = None
-    Domain: str = ""                     # esterification, biodiesel, ...
+    Domain: str = ""                     # one of config.APPLICATION_DOMAIN_NAMES
+    Domain_detail: str = ""              # the paper's own wording for the use
     Table_caption: str = ""
     Component_1: Optional[str] = None
     Component_2: Optional[str] = None
@@ -312,7 +365,7 @@ class ApplicationRow(BaseModel):
     # application can confuse the solvent with what the solvent acted on and nothing
     # structural stops it. Keeping the origin on the row means a query can exclude them
     # in one clause instead of having to guess.
-    Extractor: str = "table"             # table | prose
+    Extractor: str = "table"             # table | prose | paper
     Section_id: str = ""                 # prose only
     Section_title: str = ""              # prose only
     Role: str = ""                        # solvent | catalyst | extractant | ...
@@ -324,12 +377,38 @@ class ApplicationRow(BaseModel):
     quote_found: bool = True              # ...and is it really in the section? (prose)
     duplicate_of: str = ""                # a table Application_key this restates
     status: str = "ok"                    # ok | unverified | duplicate | unresolved_components
+                                          # | not_des | not_in_dictionary
+    DES_code: str = ""                    # the paper's own name for the DES, if any
+    Ratio_molar: str = ""
+    Water_fraction: Optional[float] = None
 
     Source_ref_numbers: str = ""
     Source_DOIs: str = ""
     Source_paper_keys: str = ""
     Source_titles: str = ""
     Source_years: str = ""
+
+
+class DictionaryRow(BaseModel):
+    """One DES or abbreviation the paper defines. -> data/papers/<slug>/des_dictionary.csv
+
+    Built BEFORE any extraction, so every route resolves "CEM5", "DES 1:4" or "ChCl"
+    the same way, from the paper's own words.
+    """
+
+    Paper_key: str = ""
+    kind: str = ""                        # mixture | alias
+    code: str = ""                        # "CEM5", "[ChCl][Gl]3", "ChCl"
+    components: str = ""                  # ";"-joined; for an alias, the full name
+    components_written: str = ""
+    ratio_raw: str = ""
+    ratio_molar: str = ""
+    water_fraction: Optional[float] = None
+    water_basis: str = ""
+    source: str = ""                      # definitions_table | glossary | text | model
+    evidence: str = ""                    # the text that defines it
+    verified: bool = True                 # the evidence was found in the paper
+    note: str = ""
 
 
 class ColumnSpec(BaseModel):
@@ -340,24 +419,30 @@ class ColumnSpec(BaseModel):
     header: str = Field(
         description="The header text at that index, copied character-for-character. "
                     "Do not tidy or translate it.")
-    role: Literal["component", "ratio", "reference", "property",
-                  "condition", "context", "ignore"] = Field(
-        description="What the column holds. 'component' = a chemical name; 'ratio' = "
-                    "the mixing ratio; 'reference' = a citation into the bibliography; "
-                    "'property' = a measured physical property; 'condition' = a "
+    role: Literal["mixture", "component", "ratio", "water", "reference", "property",
+                  "other_quantity", "condition", "context", "ignore"] = Field(
+        description="What the column holds. 'mixture' = each cell names a WHOLE DES "
+                    "(a formula like 'ChCl:Gly (1:2)' or a code like 'DES1'); "
+                    "'component' = ONE constituent of the DES per cell; 'ratio' = the "
+                    "mixing ratio; 'water' = the water content of the DES as made; "
+                    "'reference' = a citation into the bibliography; 'property' = a "
+                    "measured physical property from the list; 'other_quantity' = a "
+                    "numeric measured quantity NOT in the list; 'condition' = a "
                     "temperature or pressure the measurements were made at; 'context' "
-                    "= descriptive non-numeric data; 'ignore' = anything else.")
+                    "= descriptive data; 'ignore' = anything else.")
     property: Optional[PropertyName] = Field(
         description="Which property, when role is 'property'. null otherwise. If the "
-                    "column is a property that is not in the list, use role 'ignore'.")
+                    "column is a quantity that is not in the list, use role "
+                    "'other_quantity' and name it in context_field.")
     unit_as_written: Optional[str] = Field(
         description="The unit exactly as the header or sub-header prints it, e.g. "
                     "'g cm-3', '(mPa s)'. null when the table states none.")
     component_role: Optional[Literal["HBA", "HBD", "either"]] = Field(
         description="For a component column: hydrogen-bond acceptor, donor, or either.")
     context_field: Optional[str] = Field(
-        description="For a context column, a short snake_case name for what it "
-                    "records, e.g. natural_source, target_compound, technique.")
+        description="For a context or other_quantity column, a short snake_case name "
+                    "for what it records, e.g. natural_source, target_compound, "
+                    "conversion_pct, critical_pressure.")
     multi_valued: bool = Field(
         description="True when one cell of this column holds several values, e.g. on "
                     "separate lines or separated by slashes.")
@@ -396,6 +481,14 @@ class TableProfile(BaseModel):
 
     relevant: bool = Field(
         description="False when the table carries no deep-eutectic-solvent data.")
+    involves_ionic_liquids: bool = Field(
+        default=False,
+        description="True when the rows are (or include) ionic liquids rather than "
+                    "DES.")
+    des_vs_il_ambiguous: bool = Field(
+        default=False,
+        description="True when the table mixes ionic liquids and DES and does not say "
+                    "which row is which.")
     content_types: list[ContentType] = Field(
         description="EVERY kind of data this table holds -- a list, because one table "
                     "often holds more than one. A table giving each DES a composition "
@@ -583,10 +676,13 @@ class LLMMeasurement(BaseModel):
 
     # --- the measurement ---
     property: PropertyName
-    value: Optional[float] = None        # None when the text only ranks or compares
-    unit: Optional[str] = None           # canonicalised to the Table 2 spelling
+    value: Optional[float] = None        # canonical unit (converted by units.py)
+    unit: Optional[str] = None           # canonical unit
+    value_as_written: Optional[float] = None
     unit_raw: Optional[str] = None       # exactly as the model wrote it
     temperature_C: Optional[float] = None
+    Solute: str = ""                     # what dissolved, for Solubility -- never a component
+    DES_code: str = ""
 
     # --- provenance ---
     source_text: str = ""                # the model's quote
@@ -608,7 +704,8 @@ class LLMMeasurement(BaseModel):
 
 # What keeps a prose row out of the graph, in precedence order. First match wins.
 # Only "ok" is loaded.
-STATUS_ORDER = ("qualitative", "unverified", "duplicate", "unresolved_components", "ok")
+STATUS_ORDER = ("qualitative", "quote_not_found", "value_not_in_quote", "no_des_in_quote",
+                "unhandled_unit", "unverified", "duplicate", "unresolved_components", "ok")
 
 
 class LLMExtraction(BaseModel):
@@ -703,3 +800,57 @@ class LLMMeasurementDraft(BaseModel):
 
 
 LLMExtraction.model_rebuild()
+
+
+class PaperDESDraft(BaseModel):
+    """One DES the paper itself prepares, measures, uses or tabulates."""
+
+    code: Optional[str] = Field(
+        description="The paper's own name or code for this DES, exactly as written "
+                    "('DES1', 'CEM5', 'ChCl:U'). null when it has none.")
+    components: list[str] = Field(
+        description="Its constituents, HBA first, EXACTLY as the paper writes them "
+                    "(abbreviations included). Never a solute, drug, substrate or "
+                    "analyte the DES acts on. Water is a component only if the DES "
+                    "is made with it.")
+    molar_ratio: Optional[str] = Field(
+        description="As written, e.g. '1:2'. null when not stated.")
+    water_percent: Optional[float] = Field(
+        description="Water content of the DES as made, in percent, if stated.")
+    evidence: str = Field(
+        description="The verbatim words that define it, under 200 characters.")
+
+
+class PaperApplicationDraft(BaseModel):
+    """One use the paper reports for its DES."""
+
+    use: str = Field(
+        description="What the DES was used for, in the paper's own words: "
+                    "'solubilising the antifungal drug fluconazole', 'glycerol removal "
+                    "from biodiesel'.")
+    des: list[str] = Field(
+        description="Which of the DES listed above were used for it: their code, or "
+                    "their components joined with ':'. Only DES actually USED for this, "
+                    "not ones merely cited or compared.")
+    role: Optional[str] = Field(
+        description="What the DES did: solvent, extractant, electrolyte, catalyst, "
+                    "sorbent, ... null if not stated.")
+    target: Optional[str] = Field(
+        description="What the DES acted on: the drug, analyte, feedstock or material. "
+                    "null if not stated.")
+    evidence: str = Field(
+        description="The verbatim words that state this use, under 200 characters.")
+
+
+class PaperOverview(BaseModel):
+    """One call per paper: which DES it is about, and what it used them for."""
+
+    des_is_subject: bool = Field(
+        description="True when deep eutectic solvents are a main subject: the paper "
+                    "prepares, measures or uses them, or reviews them as its topic. "
+                    "False when DES are only mentioned in passing.")
+    des: list[PaperDESDraft]
+    applications: list[PaperApplicationDraft]
+
+
+PaperOverview.model_rebuild()

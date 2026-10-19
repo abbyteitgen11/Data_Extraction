@@ -26,16 +26,19 @@ import hashlib
 import json
 import math
 import re
+import threading
 import time
 from collections import Counter
 
 from pydantic import ValidationError
 
-from . import config, xml_utils
+from . import config, units, xml_utils
+from .composition import des_problem, is_water
 from .enrich_components import (_norm_key, component_index, resolve_components,
                                 resolve_phrase)
 from .extract_references import sources
 from .schema import STATUS_ORDER, ApplicationRow, LLMExtraction, LLMMeasurement
+from .textmatch import normalise, number_in, quote_found
 
 PROMPT = """You extract two things from one section of a chemistry paper about deep \
 eutectic solvents (DES): property MEASUREMENTS, and APPLICATIONS -- what a DES was \
@@ -43,97 +46,61 @@ used for.
 
 The section is titled "{title}", so the measurements it describes are most likely \
 {property_hint}.
-
-Return TWO lists. Either may be empty; most sections fill only one.
+{defined}
+Return TWO lists. Either may be empty; most sections fill only one. An empty list is \
+the right answer for most sentences.
 
 === measurements ===
 
-Return one record per (DES, property) pair the text reports. Emit EVERY field of \
-every record, using null where the text does not state it.
+One record per (DES, property, number) the text states. A record needs ALL of:
+  - a SPECIFIC DES named in the same sentence -- by its formula, its full component
+    names, or a code the paper defines. "DESs", "these solvents", "the mixtures" or
+    "binary DES systems" are NOT specific: such a sentence gives no record, however
+    many numbers it contains. Never supply a DES the sentence does not name.
+  - a number the sentence states for that DES.
 
-  components     The chemicals in the DES, HBA first, then the HBD(s).
-                 EXPAND EVERY ABBREVIATION to the full chemical name:
-                   "ChCl" -> "Choline chloride"
-                   "EG"   -> "Ethylene glycol"
-                   "TBAB" -> "Tetrabutylammonium bromide"
-                 If this paper spells the abbreviation out, use the paper's wording.
-                 If you do not know what an abbreviation stands for, copy it
-                 verbatim. NEVER guess a chemical from the letters.
-  molar_ratio    The mixing ratio exactly as written: "1:2", "1:1.5", "1:1:1".
-                 It usually sits in brackets right after the components:
-                 "ChAc:EG(1:2, 23 C)" -> "1:2".
+  components     The DES's constituents as the sentence writes them, HBA first. Keep
+                 abbreviations as written ("ChCl", "TBAB"); do not expand them.
+                 Never include a drug, solute or substrate dissolved IN the DES.
+  molar_ratio    As written ("1:2"), only if this sentence states it. Otherwise null.
   property       One of: {properties}.
-  value          The number stated in the text, or null.
-                 USE null when the text only ranks or compares DESs and gives no
-                 number ("A > B > C", "higher than", "increases with").
-                 NEVER invent, estimate, average or calculate a number.
-  unit           The unit exactly as written: "C", "g/cm3", "mPa.s", "mS/cm",
-                 "mN/m". Refractive index is dimensionless: use null.
-  temperature_C  The temperature the measurement was made at, if stated.
-                 CAUTION: for a melting point the number IS the temperature -- put
-                 it in `value` and leave temperature_C null, unless a separate
-                 measuring temperature is also given.
-  ref_numbers    The bracketed citation THIS number is attributed to, as written:
-                 "113", "73,80", "26-28". Take the citation nearest the number,
-                 not every citation in the sentence. null if there is none.
-  source_text    The clause containing the number, copied verbatim. Keep it SHORT --
-                 at most about 150 characters. Quote just enough to show where the
-                 number came from; do not copy a whole paragraph.
+  value          The number as written. null if the sentence only ranks or compares.
+                 NEVER invent, estimate, average or convert a number.
+  unit           The unit exactly as written. null for a dimensionless property.
+  temperature_C  The measuring temperature, only if separately stated. For a melting
+                 or boiling point the number IS the temperature: leave this null.
+  ref_numbers    The bracketed citation nearest the number, as written, or null.
+  source_text    The sentence or clause holding the DES and the number, copied
+                 CHARACTER FOR CHARACTER, at most about 150 characters. Do not add a
+                 citation that is not inside that span, and do not paraphrase.
 
-Rules:
-  - Only record what the text states. Never carry a value from one DES to another.
-  - Citation numbers in square brackets, years and page numbers are NOT data.
-  - If the section states no DES measurements, return an empty list.
+When one sentence gives several DES and several values ("A and B have densities of x
+and y, respectively"), emit one record per DES, each with its own value, in order.
+Emit each (DES, property, value) ONCE, however many times the text repeats it.
 
-Example measurement -- illustration only, this sentence is NOT in the text below:
-  "TBAB:Gly (1:3, viscosity 47.3 mPa.s at 30 C) [999]"
-  -> {{"components": ["Tetrabutylammonium bromide", "Glycolic acid"],
-       "molar_ratio": "1:3", "property": "Viscosity", "value": 47.3,
-       "unit": "mPa.s", "temperature_C": 30.0, "ref_numbers": "999",
-       "source_text": "TBAB:Gly (1:3, viscosity 47.3 mPa.s at 30 C) [999]"}}
+Example -- illustration only, this sentence is NOT in the text below:
+  "TPAB:Gly (1:3) has a viscosity of 47.3 mPa s at 30 C [999]"
+  -> {{"components": ["TPAB", "Gly"], "molar_ratio": "1:3", "property": "Viscosity",
+       "value": 47.3, "unit": "mPa s", "temperature_C": 30.0, "ref_numbers": "999",
+       "source_text": "TPAB:Gly (1:3) has a viscosity of 47.3 mPa s at 30 C [999]"}}
 
 === applications ===
 
-Return one record per (DES, use) pair the text reports: a DES used AS something, or
-used FOR something.
+One record per (DES, use) the text states: a named DES used AS or FOR something.
 
-  components     The DES itself, HBA first, full chemical names. Same rule as above.
-  molar_ratio    As written, or null.
-  domain         What it was used for, in the paper's own words: "lignin extraction",
-                 "biodiesel purification", "CO2 capture", "metal leaching".
-  role           What the DES itself did: solvent, catalyst, extractant, electrolyte,
-                 pretreatment, antisolvent. null if the text does not say.
-  target         What the DES acted ON -- the substrate, feedstock, analyte, material
-                 or compound removed.
+  components     The DES's constituents as written, HBA first. Same rules as above.
+  molar_ratio    As written, only if this sentence states it. Otherwise null.
+  domain         What it was used for, in the paper's own words.
+  role           solvent, catalyst, extractant, electrolyte, sorbent, ... or null.
+  target         What the DES acted ON: the drug, substrate, feedstock, analyte or
+                 material. This is NEVER a component of the DES.
+  outcome, outcome_unit, outcome_metric
+                 A yield / efficiency / recovery number if stated, else null.
+  ref_numbers    The citation for this claim, or null.
+  source_text    The clause stating it, copied character for character, short.
 
-                 THE COMMONEST MISTAKE IS PUTTING THE TARGET IN components. The DES is
-                 what the solvent is MADE OF; the target is what it was applied to.
-                 "ChCl:urea was used to extract lignin from birch sawdust"
-                     components = ["Choline chloride", "Urea"]
-                     target     = "lignin from birch sawdust"
-                 Lignin is NOT a component of the solvent. Neither is the alcohol or
-                 the acid in an esterification, nor the metal in a leaching study.
-  outcome        The number saying how well it worked -- a yield, efficiency, recovery
-                 or conversion. null if the text gives none. NEVER invent one.
-  outcome_unit   Its unit as written, usually "%". null if there is no number.
-  outcome_metric What that number measures, as written: "lignin yield", "extraction
-                 efficiency", "removal rate". null if there is no number.
-  ref_numbers    The citation this claim is attributed to, as written. null if none.
-  source_text    The clause stating it, verbatim and SHORT (about 150 characters).
-
-Rules:
-  - A DES merely NAMED, characterised or measured is not an application. There must be
-    a use: something it dissolved, extracted, catalysed, separated or was a medium for.
-  - Do not invent a domain for a DES the section only lists.
-  - If the section describes no use of any DES, return an empty list.
-
-Example application -- illustration only, this sentence is NOT in the text below:
-  "ChCl:lactic acid (1:2) removed 87% of the lignin from oak sawdust [42]"
-  -> {{"components": ["Choline chloride", "Lactic acid"], "molar_ratio": "1:2",
-       "domain": "lignin removal", "role": "solvent", "target": "oak sawdust",
-       "outcome": 87.0, "outcome_unit": "%", "outcome_metric": "lignin removal",
-       "ref_numbers": "42",
-       "source_text": "removed 87% of the lignin from oak sawdust [42]"}}
+A DES merely named, characterised or measured is not an application. A sentence about
+DES in general names no DES and gives no record.
 
 TEXT:
 {text}
@@ -151,9 +118,112 @@ def _ollama_options():
     }
 
 
-def call_llm(prompt, schema_json, backend=None):
+class BudgetExceeded(RuntimeError):
+    """The run tag's spend reached DES_BUDGET_USD. Every answer so far is cached."""
+
+
+_USAGE_LOCK = threading.Lock()
+_SPENT = None                      # running total for this process, seeded from the CSV
+
+
+def _spent_so_far():
+    global _SPENT
+    if _SPENT is None:
+        _SPENT = 0.0
+        if config.USAGE_CSV.exists():
+            import csv
+
+            with open(config.USAGE_CSV, newline="") as handle:
+                for row in csv.DictReader(handle):
+                    try:
+                        _SPENT += float(row.get("cost_usd") or 0)
+                    except ValueError:
+                        pass
+    return _SPENT
+
+
+def log_usage(backend, model, section_id, input_tokens, output_tokens, seconds,
+              cache_read=0, cache_write=0, stop_reason=""):
+    """Append one row to USAGE_CSV: what a fresh model call cost in tokens, $ and time.
+
+    This is what makes models comparable on cost and speed, not just accuracy. Cached
+    answers are never logged -- they cost nothing -- so the file is the real bill.
+    """
+    global _SPENT
+    price_in, price_out = config.ANTHROPIC_PRICES.get(model, (0.0, 0.0)) \
+        if backend == "anthropic" else (0.0, 0.0)
+    # Cache reads bill at ~0.1x and writes at ~1.25x the input price.
+    cost = ((input_tokens or 0) * price_in + (output_tokens or 0) * price_out
+            + (cache_read or 0) * price_in * 0.1
+            + (cache_write or 0) * price_in * 1.25) / 1e6
+    row = {"time": time.strftime("%Y-%m-%d %H:%M:%S"), "run_tag": config.RUN_TAG,
+           "backend": backend, "model": model, "call": section_id,
+           "input_tokens": input_tokens or 0, "output_tokens": output_tokens or 0,
+           "cache_read_tokens": cache_read or 0, "cache_write_tokens": cache_write or 0,
+           "seconds": round(seconds, 2), "cost_usd": round(cost, 6),
+           "stop_reason": stop_reason}
+    with _USAGE_LOCK:
+        import csv
+
+        config.USAGE_CSV.parent.mkdir(parents=True, exist_ok=True)
+        new = not config.USAGE_CSV.exists()
+        with open(config.USAGE_CSV, "a", newline="") as handle:
+            writer = csv.DictWriter(handle, fieldnames=list(row))
+            if new:
+                writer.writeheader()
+            writer.writerow(row)
+        _SPENT = _spent_so_far() + cost
+
+
+def _strict_schema(schema):
+    """A pydantic JSON schema made acceptable to Anthropic structured outputs.
+
+    Every object gets additionalProperties: false, and pydantic's `default` keys are
+    dropped (the grammar does not use them, and every field we send is required).
+    """
+    if isinstance(schema, dict):
+        out = {k: _strict_schema(v) for k, v in schema.items() if k != "default"}
+        if out.get("type") == "object" and "properties" in out:
+            out.setdefault("additionalProperties", False)
+            out["required"] = list(out["properties"])
+        return out
+    if isinstance(schema, list):
+        return [_strict_schema(v) for v in schema]
+    return schema
+
+
+def _anthropic_request(prompt, schema_json):
+    """The Messages API request for one extraction call. -> (method name, kwargs).
+
+    Structured outputs (output_config.format), not a forced tool call: Sonnet 5.5 and
+    Opus 5.5 reject tool_choice "tool" with a 400. Effort is the depth control on the
+    5.x models (Opus 5.5 cannot switch thinking off; low effort keeps a labelling task
+    cheap); Haiku 4.5 takes neither effort nor adaptive thinking, so it gets neither.
+    The 5.x requests also opt into server-side refusal fallbacks.
+    """
+    model = config.ANTHROPIC_MODEL
+    kwargs = {
+        "model": model,
+        "max_tokens": config.ANTHROPIC_MAX_TOKENS,
+        "messages": [{"role": "user", "content": prompt}],
+    }
+    output_config = {"format": {"type": "json_schema", "schema": _strict_schema(schema_json)}}
+    is_5x = any(model.startswith(m) for m in ("claude-opus-5", "claude-sonnet-5",
+                                              "claude-fable-5"))
+    if is_5x and config.ANTHROPIC_EFFORT:
+        output_config["effort"] = config.ANTHROPIC_EFFORT
+    kwargs["output_config"] = output_config
+    if model in ("claude-opus-5-5", "claude-sonnet-5-5", "claude-fable-5-1"):
+        kwargs["betas"] = ["server-side-fallback-2026-07-01"]
+        kwargs["fallbacks"] = "default"
+        return "beta", kwargs
+    return "standard", kwargs
+
+
+def call_llm(prompt, schema_json, backend=None, section_id=""):
     """Send one prompt, return the raw JSON string. Backend chosen by config/env."""
     backend = backend or config.LLM_BACKEND
+    started = time.time()
     if backend == "ollama":
         from ollama import chat
 
@@ -168,29 +238,58 @@ def call_llm(prompt, schema_json, backend=None):
         if response.done_reason == "length":
             print(f"    warning: hit num_predict ({config.OLLAMA_NUM_PREDICT}); "
                   f"the JSON is probably truncated")
+        log_usage(backend, config.OLLAMA_MODEL, section_id,
+                  getattr(response, "prompt_eval_count", 0) or 0,
+                  getattr(response, "eval_count", 0) or 0, time.time() - started,
+                  stop_reason=response.done_reason or "")
         return response.message.content
 
     if backend == "anthropic":
         import anthropic
 
-        client = anthropic.Anthropic()
-        message = client.messages.create(
-            model=config.ANTHROPIC_MODEL,
-            max_tokens=8000,
-            tools=[{
-                "name": "record_measurements",
-                "description": "Record the DES measurements found in the text.",
-                "input_schema": schema_json,
-            }],
-            tool_choice={"type": "tool", "name": "record_measurements"},
-            messages=[{"role": "user", "content": prompt}],
-        )
+        if config.BUDGET_USD and _spent_so_far() >= config.BUDGET_USD:
+            raise BudgetExceeded(f"spent ${_spent_so_far():.2f} of the "
+                                 f"${config.BUDGET_USD:.2f} budget for run "
+                                 f"{config.RUN_TAG or '(untagged)'}")
+        client = anthropic.Anthropic(max_retries=4)
+        kind, kwargs = _anthropic_request(prompt, schema_json)
+        if kind == "beta":
+            message = client.beta.messages.create(**kwargs)
+        else:
+            message = client.messages.create(**kwargs)
+        usage = message.usage
+        log_usage(backend, config.ANTHROPIC_MODEL, section_id,
+                  usage.input_tokens, usage.output_tokens, time.time() - started,
+                  getattr(usage, "cache_read_input_tokens", 0) or 0,
+                  getattr(usage, "cache_creation_input_tokens", 0) or 0,
+                  message.stop_reason or "")
+        if message.stop_reason == "refusal":
+            print(f"    {section_id}: the model declined; treated as an empty answer")
+            return "{}"
+        if message.stop_reason == "max_tokens":
+            print(f"    warning: {section_id} hit max_tokens; the JSON is probably cut off")
         for block in message.content:
-            if block.type == "tool_use":
-                return json.dumps(block.input)
+            if block.type == "text":
+                return block.text
         return "{}"
 
     raise ValueError(f"unknown LLM backend {backend!r} (expected 'ollama' or 'anthropic')")
+
+
+def map_calls(fn, items, backend=None):
+    """fn over items, in order. Parallel for the API backend; sequential for ollama.
+
+    A local ollama serves one request at a time, so threads would only queue. The API
+    serves many, and a paper's sections are independent.
+    """
+    backend = backend or config.LLM_BACKEND
+    items = list(items)
+    if backend != "anthropic" or config.ANTHROPIC_CONCURRENCY <= 1 or len(items) < 2:
+        return [fn(item) for item in items]
+    from concurrent.futures import ThreadPoolExecutor
+
+    with ThreadPoolExecutor(max_workers=config.ANTHROPIC_CONCURRENCY) as pool:
+        return list(pool.map(fn, items))
 
 
 # ---------- response cache ----------
@@ -207,7 +306,8 @@ def cache_key(prompt, schema_json, backend=None):
         "prompt": prompt,
         "schema": schema_json,
         "model": config.OLLAMA_MODEL if backend == "ollama" else config.ANTHROPIC_MODEL,
-        "options": _ollama_options() if backend == "ollama" else {"max_tokens": 8000},
+        "options": _ollama_options() if backend == "ollama" else
+        {"max_tokens": config.ANTHROPIC_MAX_TOKENS, "effort": config.ANTHROPIC_EFFORT},
         "think": config.OLLAMA_THINK if backend == "ollama" else None,
     }
     blob = json.dumps(payload, sort_keys=True, ensure_ascii=False)
@@ -226,7 +326,7 @@ def cached_call_llm(prompt, schema_json, section_id="", backend=None, refresh=Fa
     if path.exists() and not refresh:
         return path.read_text(encoding="utf-8"), True
 
-    raw = call_llm(prompt, schema_json, backend=backend)
+    raw = call_llm(prompt, schema_json, backend=backend, section_id=section_id)
     config.LLM_CACHE_DIR.mkdir(parents=True, exist_ok=True)
     path.write_text(raw, encoding="utf-8")
     return raw, False
@@ -338,6 +438,9 @@ def _table_index(long_csv=None, table_csv=None):
 
     index = {}
     for r in long_all:
+        # A range-only cell ("3200-3500") has no Value; there is nothing to match.
+        if r.get("Value") is None or r.get("Value") == "":
+            continue
         key = (r["Property"], components_by_row.get(r["Row_id"], frozenset()))
         index.setdefault(key, []).append((r["Measurement_key"], float(r["Value"])))
     return index
@@ -490,13 +593,25 @@ def normalize_components(names, section_text=""):
 
 # ---------- one section ----------
 def _status_for(row):
-    """What keeps this row out of the graph. First match wins; see schema.STATUS_ORDER."""
+    """What keeps this row out of the graph. First match wins; see schema.STATUS_ORDER.
+
+    The quote is checked FIRST and the number is checked IN THE QUOTE. The number used
+    to be checked anywhere in the section, and the quote not at all, so a row whose
+    quote the model had paraphrased -- or invented -- passed as long as its number
+    happened to occur somewhere in the section (10 of 14 accepted rows, once).
+    """
     if row.value is None:
         return "qualitative"            # the text ranked, it did not measure
+    if not row.quote_found:
+        return "quote_not_found"        # the quote is not in the section
     if not row.verified:
-        return "unverified"             # the number is not in the section text
+        return "value_not_in_quote"     # the number is not in that quote
+    if not row.components_resolved and not row.components_written:
+        return "no_des_in_quote"        # the quote names no specific DES
+    if row.unit and row.unit.startswith("!"):
+        return "unhandled_unit"
     if row.duplicate_of:
-        return "duplicate"              # Table 2 already has it
+        return "duplicate"              # a table already has it
     if row.component_status != "resolved":
         return "unresolved_components"  # we will not guess at a chemical name
     return "ok"
@@ -524,12 +639,16 @@ def is_application_section(title):
 
 
 def extract_section(section_id, title, text, paper_doi="", reference_map=None,
-                    index=None, backend=None, allow_lookup=False, refresh_llm=False):
+                    index=None, backend=None, allow_lookup=False, refresh_llm=False,
+                    dictionary=None, resolve=None):
     """-> (measurements, applications, elapsed_seconds, was_cached) for one section."""
     name = property_for_title(title)
     hint = name or "any of the properties listed"
+    defined = _dictionary_hint(dictionary)
     prompt = PROMPT.format(title=title, property_hint=hint, text=text,
-                           properties=", ".join(config.PROPERTY_NAMES))
+                           properties=", ".join(config.PROPERTY_NAMES),
+                           defined=(f"\nDES THIS PAPER DEFINES (use these codes when the "
+                                    f"text uses them):\n{defined}\n" if defined else ""))
 
     started = time.time()
     raw, was_cached = cached_call_llm(prompt, LLMExtraction.model_json_schema(),
@@ -546,62 +665,82 @@ def extract_section(section_id, title, text, paper_doi="", reference_map=None,
     except ValidationError as exc:
         hint_text = ""
         if not raw.rstrip().endswith("}"):
-            # Now that one response carries two lists it is longer, and a cut-off
-            # response loses the measurements as well as the applications. If this
-            # starts happening the fix is a second call per section, not a bigger
-            # budget -- see the OLLAMA_NUM_PREDICT note in config.py.
-            hint_text = f" -- output looks cut off; try a larger num_predict"
+            hint_text = " -- output looks cut off; try a larger num_predict"
         print(f"    {section_id} {title!r}: output did not validate "
               f"({exc.errors()[0]['msg']}){hint_text}")
         return [], [], elapsed, was_cached
 
     normalised_text = re.sub(r"\s+", " ", text)
-    rows = []
+    rows, seen = [], set()
     for draft in drafts:
-        written = normalize_components(draft.components, text)
-        model_resolved, model_unresolved, _ = resolve_components(
-            written, index, allow_lookup=allow_lookup)
+        quote = re.sub(r"\s+", " ", draft.source_text or "").strip()
+        found = quote_found(quote, text)
+        comp = grounded_composition(draft.components, quote, draft.value, dictionary,
+                                    resolve, index)
 
-        # The paper's own formula beats the model's expansion. Only when the quote
-        # contains no formula at all do we fall back to what the model said.
-        from_text = components_from_source_text(draft.source_text, draft.value,
-                                                model_resolved, index)
-        if from_text:
-            resolved, unresolved, components_source = from_text
-            components_written = ";".join(
-                t for _raw, toks in formula_clauses(draft.source_text) for t in toks
-            )[:200]
-        else:
-            resolved, unresolved = model_resolved, model_unresolved
-            components_source, components_written = "model", ""
-        component_status = ("resolved" if resolved and not unresolved
-                            else "partial" if resolved else "unresolved")
+        # Solubility describes a SOLUTE in the DES. A name the model put among the
+        # components that is not part of any DES the paper defines is the solute.
+        solute = ""
+        if draft.property in config.SOLUTE_PROPERTIES and dictionary is not None:
+            members = {normalise(c) for e in dictionary.mixtures.values()
+                       for c in e.components}
+            outsiders = [c for c in comp.components if normalise(c) not in members
+                         and not is_water(c)]
+            if outsiders and len(comp.components) - len(outsiders) >= 2:
+                solute = "; ".join(outsiders)
+                comp.components = [c for c in comp.components if c not in outsiders]
 
-        ratio = (draft.molar_ratio or "").strip() or None
-        # Same naming convention as extract_table.parse_table2, which is what makes a
-        # prose measurement attach to the Mixture node the table already created.
-        mixture = f"{':'.join(resolved)} ({ratio})" if resolved and not unresolved and ratio else ""
+        # Units through units.py, as the table route does: K -> C, Pa s -> mPa s. A
+        # unit that measures something else entirely keeps the row out of the graph.
+        written_value, unit_raw = draft.value, draft.unit
+        value, unit = draft.value, canonical_unit(draft.unit, draft.property)
+        if draft.value is not None:
+            conflict = units.unit_conflict(unit_raw or "", draft.property)
+            converted, canonical, status = units.to_canonical(draft.value, unit_raw or "",
+                                                              draft.property)
+            if conflict or status:
+                unit = f"!{unit_raw}"           # marks unhandled_unit for _status_for
+            else:
+                value, unit = converted, canonical
+        temperature = draft.temperature_C
+        if draft.property in config.PHASE_TRANSITION_PROPERTIES:
+            temperature = None
+
+        key = (normalise(quote), draft.property, f"{draft.value}",
+               frozenset(normalise(c) for c in comp.components))
+        if key in seen:
+            continue                       # the same claim, emitted twice
+        seen.add(key)
+
+        resolved = [c for c in comp.components if c]
+        unresolved = [w for w in comp.notes if w.startswith("unresolved:")]
+        component_status = ("unresolved" if not resolved else
+                            "partial" if unresolved else "resolved")
+        ratio = comp.ratio_raw or None
+        mixture = comp.label() if resolved and not unresolved else ""
 
         ref_numbers, ref_source = harvest_refs(draft, text)
         cited = sources(ref_numbers, reference_map, paper_doi)
 
         row = LLMMeasurement(
-            components=";".join(written),
-            components_written=components_written,
-            components_source=components_source,
+            components=";".join(draft.components),
+            components_written=";".join(comp.components_written)[:200],
+            components_source=comp.source or "",
             components_resolved=";".join(resolved),
-            unresolved_components=";".join(unresolved),
+            unresolved_components=";".join(u.split(":", 1)[1].strip() for u in unresolved),
             component_status=component_status,
             molar_ratio=ratio,
             Mixture=mixture,
             property=draft.property,
-            value=draft.value,
-            unit=canonical_unit(draft.unit, draft.property),
-            unit_raw=draft.unit,
-            temperature_C=draft.temperature_C,
-            source_text=draft.source_text or "",
-            quote_found=bool(draft.source_text)
-            and re.sub(r"\s+", " ", draft.source_text).strip() in normalised_text,
+            value=value,
+            unit=unit,
+            value_as_written=written_value,
+            unit_raw=unit_raw,
+            temperature_C=temperature,
+            Solute=solute,
+            DES_code=comp.code,
+            source_text=quote,
+            quote_found=found,
             section_id=section_id,
             section_title=title,
             Source_ref_numbers=",".join(str(n) for n in ref_numbers),
@@ -609,66 +748,72 @@ def extract_section(section_id, title, text, paper_doi="", reference_map=None,
             Source_paper_keys=cited["key"],
             ref_source=ref_source,
             Paper_DOI=paper_doi,
-            verified=verified(draft.value, text) if draft.value is not None else False,
+            verified=number_in(written_value, quote) if written_value is not None else False,
         )
-        # Content-derived so re-loading is idempotent. Includes the components because
-        # the same value recurs in one section for different DESs (melting point -10.0).
         stem = "+".join(sorted(resolved)) or "?"
-        value = f"{draft.value:g}" if draft.value is not None else "none"
-        row.Measurement_key = f"P-{section_id}:{draft.property}:{stem}:{value}"
+        shown = f"{draft.value:g}" if draft.value is not None else "none"
+        row.Measurement_key = f"P-{section_id}:{draft.property}:{stem}:{shown}"
         rows.append(row)
 
     applications = _application_rows(application_drafts, section_id, title,
                                      normalised_text, paper_doi, reference_map,
-                                     index, allow_lookup)
+                                     index, allow_lookup, dictionary, resolve)
     return rows, applications, elapsed, was_cached
 
 
 def _application_rows(drafts, section_id, title, normalised_text, paper_doi,
-                      reference_map, index, allow_lookup):
+                      reference_map, index, allow_lookup, dictionary=None, resolve=None):
     """Prose application drafts -> list[ApplicationRow].
 
-    The same three guards the measurement route uses, for the same reason -- prose is
-    the least constrained thing the model reads, and a table at least has columns:
-
-      * the quote must really be in the section (`quote_found`);
-      * component names resolve against the corpus vocabulary, and an unresolved one is
-        recorded rather than guessed at;
-      * the status decides what loads, and nothing unverified does.
+    The same guards as the measurement route: the quote must really be in the section;
+    the DES must be named IN the quote (or be one the paper defines); a molar ratio is
+    kept only if the quote states it -- the model was supplying ratios no text gave.
     """
     from .extract_applications import domain_of
 
-    out = []
+    out, seen = [], set()
     for n, draft in enumerate(drafts, 1):
-        written = normalize_components(draft.components, normalised_text)
-        resolved, unresolved, _ = resolve_components(written, index,
-                                                     allow_lookup=allow_lookup)
         quote = re.sub(r"\s+", " ", draft.source_text or "").strip()
-        found = bool(quote) and quote[:80].lower() in normalised_text.lower()
+        found = quote_found(quote, normalised_text)
+        comp = grounded_composition(draft.components, quote, None, dictionary,
+                                    resolve, index)
+        stated = draft.molar_ratio and normalise(draft.molar_ratio).replace(" ", "") in \
+            normalise(quote).replace(" ", "")
+        if draft.molar_ratio and not stated and comp.ratio_raw == draft.molar_ratio:
+            comp.ratio_raw, comp.ratio_molar = "", ""
+        if stated and not comp.ratio_raw:
+            comp.ratio_raw = draft.molar_ratio
+
+        key = (normalise(quote), frozenset(normalise(c) for c in comp.components))
+        if key in seen:
+            continue
+        seen.add(key)
 
         numbers = xml_utils.expand_ref_field(draft.ref_numbers or "")
         cited = sources(numbers, reference_map, paper_doi)
-
-        components = (resolved + [None, None, None])[:3]
-        ratio = (draft.molar_ratio or "").strip()
-        names = ":".join(c for c in components if c)
-        status = "ok"
+        (c1, c2, c3), _parts, flag = comp.slots()
+        unresolved = [w for w in comp.notes if w.startswith("unresolved:")]
         if not found:
             status = "unverified"
-        elif unresolved or not names:
+        elif not comp.components:
+            status = "no_des_in_quote"
+        elif des_problem(comp, dictionary):
+            status = "not_des"
+        elif unresolved:
             status = "unresolved_components"
-
+        else:
+            status = "ok"
+        domain, detail = domain_of(draft.domain, draft.target, quote)
         out.append(ApplicationRow(
             Application_key=f"P-{section_id}:{n:03d}",
             Paper_key=paper_doi, Paper_DOI=paper_doi,
-            Domain=domain_of(draft.domain or "", ""),
-            Table_caption=(draft.domain or "")[:300],
-            Component_1=components[0], Component_2=components[1],
-            Component_3=components[2],
-            Ratio_raw=ratio,
-            Mixture=f"{names} ({ratio})" if ratio else names,
-            Components_written=";".join(written),
-            Component_flag="quaternary+" if len(resolved) > 3 else "",
+            Domain=domain, Domain_detail=(draft.domain or detail)[:200],
+            Table_caption="",
+            Component_1=c1, Component_2=c2, Component_3=c3,
+            Ratio_raw=comp.ratio_raw,
+            Mixture=comp.label(),
+            Components_written=";".join(comp.components_written),
+            Component_flag=flag,
             Detail=" | ".join(
                 f"{k}={v}" for k, v in (("role", draft.role), ("target", draft.target),
                                         ("metric", draft.outcome_metric)) if v)[:500],
@@ -677,6 +822,8 @@ def _application_rows(drafts, section_id, title, normalised_text, paper_doi,
             Outcome=draft.outcome, Outcome_unit=(draft.outcome_unit or "")[:20],
             Outcome_metric=(draft.outcome_metric or "")[:80],
             source_text=quote[:300], quote_found=found, status=status,
+            DES_code=comp.code, Ratio_molar=comp.ratio_molar,
+            Water_fraction=comp.water_fraction,
             Source_ref_numbers=",".join(str(x) for x in numbers),
             Source_DOIs=cited["doi"], Source_paper_keys=cited["key"],
             Source_titles=cited["title"], Source_years=cited["year"],
@@ -706,12 +853,17 @@ def choose_sections(sections, only_property_sections=True):
 
 
 def run(sections, paper_doi="", reference_map=None, only_property_sections=True,
-        backend=None, allow_lookup=True, refresh_llm=False):
-    """Extract from every routed prose section. -> (measurements, applications)."""
+        backend=None, allow_lookup=True, refresh_llm=False, dictionary=None, resolve=None,
+        paper_slug=""):
+    """Extract from every routed prose section. -> (measurements, rejected, applications).
+
+    `rejected` holds the rows with no number at all (the text ranked or compared), kept
+    out of sections_llm.csv so that file holds only real candidates.
+    """
     chosen = choose_sections(sections, only_property_sections)
     if not chosen:
         print("  no matching prose sections (use --all-sections to widen)")
-        return [], []
+        return [], [], []
 
     index = component_index()
 
@@ -720,19 +872,29 @@ def run(sections, paper_doi="", reference_map=None, only_property_sections=True,
     if backend_name == "ollama":
         detail = (f" ({config.OLLAMA_MODEL}, think={config.OLLAMA_THINK}, "
                   f"num_ctx={config.OLLAMA_NUM_CTX})")
+    else:
+        detail = f" ({config.ANTHROPIC_MODEL})"
     print(f"  {len(chosen)} section(s) via {backend_name}{detail}")
 
+    def one(item):
+        sid, title, text = item
+        # The paper's slug in the call id, so usage.csv attributes every call to its
+        # paper (section ids like "sec2.1" repeat across papers).
+        call_id = f"{paper_slug}-{sid}" if paper_slug else sid
+        return item, extract_section(
+            call_id, title, text, paper_doi, reference_map=reference_map, index=index,
+            backend=backend, allow_lookup=allow_lookup, refresh_llm=refresh_llm,
+            dictionary=dictionary, resolve=resolve)
+
     rows, applications, total_seconds, hits = [], [], 0.0, 0
-    for sid, title, text in chosen:
-        found, used_for, elapsed, was_cached = extract_section(
-            sid, title, text, paper_doi, reference_map=reference_map, index=index,
-            backend=backend, allow_lookup=allow_lookup, refresh_llm=refresh_llm)
+    for (sid, title, _text), (found, used_for, elapsed, was_cached) in \
+            map_calls(one, chosen, backend_name):
         total_seconds += elapsed
         hits += was_cached
-        ok = sum(1 for r in found if r.verified)
+        ok = sum(1 for r in found if r.quote_found and r.verified)
         timing = "  cached" if was_cached else f"{elapsed:6.1f}s"
         print(f"    {sid} {title[:30]:<32} {timing}  "
-              f"{len(found):>3} found, {ok:>3} verified"
+              f"{len(found):>3} found, {ok:>3} quoted+verified"
               f"{f', {len(used_for)} application(s)' if used_for else ''}")
         rows += found
         applications += used_for
@@ -741,6 +903,10 @@ def run(sections, paper_doi="", reference_map=None, only_property_sections=True,
     for n, row in enumerate(rows, 1):
         row.Row_id = f"P-{n:04d}"
         row.status = _status_for(row)
+        if row.unit and row.unit.startswith("!"):
+            row.unit = row.unit[1:] or None
+    measured = [r for r in rows if r.status != "qualitative"]
+    rejected = [r for r in rows if r.status == "qualitative"]
 
     counts = Counter(r.status for r in rows)
     print(f"\n  cache: {hits} hit, {len(chosen) - hits} fresh")
@@ -750,18 +916,6 @@ def run(sections, paper_doi="", reference_map=None, only_property_sections=True,
             note = " -> graph" if status == "ok" else ""
             print(f"    {status:<24}{counts[status]:>4}{note}")
 
-    refs = Counter(r.ref_source for r in rows)
-    print(f"  references: " + ", ".join(f"{k} {v}" for k, v in refs.most_common()))
-
-    sources = Counter(r.components_source for r in rows)
-    print(f"  components read from: " + ", ".join(f"{k} {v}" for k, v in sources.most_common()))
-
-    unresolved = sorted({n for r in rows for n in r.unresolved_components.split(";") if n})
-    if unresolved:
-        print(f"  unresolved component names ({len(unresolved)}): {', '.join(unresolved)}")
-        print(f"  -> add them to {config.COMPONENT_ALIASES.name}, or run "
-              f"--steps aliases for candidates")
-
     if applications:
         mark_duplicate_applications(applications)
         used = Counter(a.status for a in applications)
@@ -770,7 +924,7 @@ def run(sections, paper_doi="", reference_map=None, only_property_sections=True,
               f"({quoted} with the quote found in the section)")
         for status, n in used.most_common():
             print(f"    {status:<24}{n:>4}{' -> graph' if status == 'ok' else ''}")
-    return rows, applications
+    return measured, rejected, applications
 
 
 def mark_duplicate_applications(applications):
@@ -797,3 +951,136 @@ def mark_duplicate_applications(applications):
         if key in seen and app.status == "ok":
             app.duplicate_of = seen[key]
             app.status = "duplicate"
+
+
+def _dictionary_hint(dictionary, limit=1500):
+    """The paper's own DES, for the prompt, so the model can name them by code."""
+    if dictionary is None or not dictionary.mixtures:
+        return ""
+    lines = []
+    for comp in dictionary.mixtures.values():
+        if comp.code:
+            lines.append(f"  {comp.code} = {comp.label()}")
+    text = "\n".join(lines)
+    return text[:limit]
+
+
+def all_formulas(quote):
+    """Every DES formula in a quote, in reading order. -> [(position, [tokens])].
+
+    `formula_clauses` keeps one formula per clause; a "respectively" sentence names
+    several in one clause ("ChCl:Phenol and ChCl:O-cresol ... 1.097 and 1.078 g/cm3,
+    respectively"), and their ORDER is what assigns the numbers.
+    """
+    out = []
+    cleaned = _PARENS.sub(lambda m: " " * len(m.group(0)),
+                          _CITATION_REF.sub(lambda m: " " * len(m.group(0)), quote))
+    for match in re.finditer(r"[A-Za-z\[][\w\[\]\-,.+()]*?(?:\s?:\s?[A-Za-z\[][\w\[\]\-,.+]*)+",
+                             cleaned):
+        tokens = [t.strip(" ,.;-") for t in match.group(0).split(":")]
+        if len(tokens) >= 2 and all(re.search(r"[A-Za-z]{2}", t) for t in tokens):
+            out.append((match.start(), tokens[:4]))
+    if not out:
+        for raw, tokens in formula_clauses(quote):
+            out.append((quote.find(raw), tokens))
+    return out
+
+
+_NUMBER_IN_TEXT = re.compile(r"(?<![\w.:])-?\d+(?:\.\d+)?(?![\w:]|\s*:\s*\d)")
+
+
+def _value_numbers(quote):
+    """The numbers in a quote that could be values: not ratios, not citations."""
+    cleaned = _CITATION_REF.sub(" ", quote.replace("−", "-"))
+    cleaned = re.sub(r"\d+(?:\.\d+)?(?:\s*:\s*\d+(?:\.\d+)?)+", " ", cleaned)
+    return [float(m.group(0)) for m in _NUMBER_IN_TEXT.finditer(cleaned)]
+
+
+def grounded_composition(model_components, quote, value, dictionary, resolve, index):
+    """The DES a quote is about, read from the QUOTE. -> Composition.
+
+    The model's own component list is used only for names that are actually written in
+    the quote. When a sentence talks about DES in general, the model used to supply a
+    specific one (ChCl:urea, ChCl:EG) that the sentence never mentions; now such a row
+    has no components and is refused as `no_des_in_quote`.
+
+    Order of evidence: a code the paper defines ("DES5", "CEM1"); a formula written in
+    the quote ("ChCl:Urea (1:2)") -- for a "respectively" sentence, the formula whose
+    position matches the value's position; the model's names, where the quote names them.
+    """
+    from .composition import Composition, compose, parse_mixture
+
+    quote = str(quote or "")
+    if dictionary is not None:
+        for token in re.findall(r"[A-Za-z][A-Za-z0-9\-]*\d+|\bDESs?\b", quote):
+            comp = dictionary.lookup(token)
+            if comp is not None:
+                comp.source = "dictionary"
+                return comp
+
+    formulas = all_formulas(quote)
+    if formulas:
+        chosen = formulas[0][1]
+        if len(formulas) > 1:
+            numbers = _value_numbers(quote)
+            respectively = re.search(r"\brespectively\b", quote, re.I)
+            wanted = None if value is None else float(value)
+            if respectively and wanted is not None and len(numbers) >= len(formulas):
+                tail = numbers[-len(formulas):]
+                for i, number in enumerate(tail):
+                    if math.isclose(number, wanted, rel_tol=1e-6, abs_tol=1e-9):
+                        chosen = formulas[i][1]
+                        break
+            else:
+                # the formula nearest BEFORE the value
+                position = _position_of(quote, value)
+                before = [f for f in formulas if position is None or f[0] <= position]
+                chosen = (before[-1] if before else formulas[0])[1]
+        written = ":".join(chosen)
+        ratio = re.search(r"\(\s*(\d+(?:\.\d+)?(?:\s*:\s*\d+(?:\.\d+)?)+)", quote)
+        comp = parse_mixture(written, dictionary, resolve)
+        if ratio and not comp.ratio_raw:
+            comp = compose([written], ratio.group(1), "", dictionary=dictionary,
+                           resolve=resolve)
+        comp.source = "source_text"
+        return _mark_unresolved(comp, index)
+
+    q = normalise(quote)
+    written_abbreviations = set()
+    if dictionary is not None:
+        for abbr, full in dictionary.aliases.items():
+            if re.search(rf"(?<!\w){re.escape(abbr)}(?!\w)", quote, re.I):
+                written_abbreviations.add(normalise(full))
+    # A model name counts only if the quote writes it, or writes the paper's own
+    # abbreviation for it. Nothing is added that the quote does not name.
+    named = [c for c in (model_components or [])
+             if c and (normalise(c) in q or normalise(c) in written_abbreviations)]
+    if len(named) >= 2:
+        comp = compose(named, "", "", dictionary=dictionary, resolve=resolve)
+        comp.source = "model_names_in_quote"
+        return _mark_unresolved(comp, index)
+    return Composition(written=quote[:80], source="none")
+
+
+def _position_of(quote, value):
+    if value is None:
+        return None
+    for form in {f"{value:g}", f"{value}"}:
+        i = quote.replace("−", "-").find(form)
+        if i >= 0:
+            return i
+    return None
+
+
+def _mark_unresolved(comp, index):
+    """Note components that neither the paper nor the corpus can name."""
+    if index is None:
+        return comp
+    from .enrich_components import resolve_component
+
+    for written, name in zip(comp.components_written, comp.components):
+        if written == name and not is_water(name):
+            found, _how = resolve_component(name, index, allow_lookup=False)
+            if not found:
+                comp.note(f"unresolved: {name}")
+    return comp

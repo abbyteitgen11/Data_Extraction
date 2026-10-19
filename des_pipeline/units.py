@@ -231,3 +231,62 @@ def basis_of(prop, printed):
         if re.search(pattern, text):
             return basis, ""
     return "", "ambiguous_basis"
+
+
+# What a unit measures, when it plainly measures something no DES property is. These
+# are the units models have been seen forcing into the vocabulary: a critical pressure in
+# bar labelled Density, a conversion in % labelled pH, a solvation energy in kcal/mol
+# labelled Solubility, a cavity volume in cubic angstroms labelled Solubility.
+_DIMENSIONS = (
+    ("pressure", r"^(bar|kbar|mbar|kpa|mpa|gpa|pa|atm|psi|mmhg|torr)$"),
+    ("energy", r"kcal|kj|^j$|jmol|j/mol|^ev$|kt$"),
+    ("percentage", r"%|percent|ppm|ppb"),
+    ("length/area/volume", r"^(å|a|å3|a3|å2|a2|nm|pm|μm|um|mm|cm|m|nm2|nm3|å\^3|ang.*)$"),
+    ("wavenumber", r"cm-1$|cm\^-1$"),
+    ("time", r"^(s|sec|min|h|hr|hours?|days?)$"),
+    ("mass", r"^(g|mg|kg|μg|ug|da|kda|g/mol|gmol-1)$"),
+    ("voltage", r"^(v|mv)$"),
+    ("concentration", r"^(m|mm|mol/l|moll-1|mmol/l|mg/l|μg/l|ug/l)$"),
+    ("temperature", r"^(k|°c|c|℃|°f|f)$"),
+)
+
+
+def dimension_of(unit_as_written):
+    """A coarse name for what a unit measures. -> str, or "" when unrecognised."""
+    key = _key(unit_as_written)
+    for name, pattern in _DIMENSIONS:
+        if re.search(pattern, key):
+            return name
+    return ""
+
+
+def unit_conflict(unit_as_written, prop):
+    """Does the printed unit contradict the property? -> reason, or "" when it fits.
+
+    Converts-cleanly and no-unit-at-all both fit. A unit naming a related quantity the
+    converter refuses on purpose (cSt for viscosity) also fits: the value is kept and
+    flagged `unhandled_unit` later, which is the right outcome. What does NOT fit is a
+    unit that plainly measures something else -- a pressure, an energy, a percentage --
+    because then the column is a different quantity and every value in it would land in
+    the wrong distribution.
+    """
+    written = _key(unit_as_written)
+    if not written or written in ("-", "nd", "n", "nd20", "nd25", "ph", "dimensionless",
+                                  "unitless", "a.u.", "au"):
+        return ""
+    _value, _unit, status = to_canonical(1.0, unit_as_written, prop)
+    if not status:
+        canonical = config.PROPERTY_UNITS.get(prop, "")
+        if canonical or not dimension_of(unit_as_written):
+            return ""
+    elif written in FOREIGN_UNITS.get(prop, {}):
+        return ""
+    dimension = dimension_of(unit_as_written)
+    canonical = config.PROPERTY_UNITS.get(prop, "")
+    expected = "temperature" if prop in config.PHASE_TRANSITION_PROPERTIES else \
+        (dimension_of(canonical) or ("dimensionless" if not canonical else canonical))
+    if dimension and dimension != expected:
+        wanted = "dimensionless" if not canonical else f"measured in {canonical}"
+        return (f"the unit {unit_as_written!r} measures {dimension}, but {prop} is "
+                f"{wanted}")
+    return ""

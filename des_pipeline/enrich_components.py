@@ -534,6 +534,9 @@ def load_aliases(path=None):
             if record.get("name")}
 
 
+_NOTED = set()
+
+
 def component_index(path=None, alias_path=None):
     """Build the lookup used by resolve_component().
 
@@ -547,6 +550,8 @@ def component_index(path=None, alias_path=None):
     df = pd.DataFrame(store.read_all("mixtures"))
     counts = Counter()
     for column in ("Component_1", "Component_2", "Component_3"):
+        if column not in df.columns:          # a fresh run tag with no mixtures yet
+            continue
         counts.update(str(v).strip() for v in df[column].dropna() if str(v).strip())
 
     canonical = {}
@@ -557,10 +562,12 @@ def component_index(path=None, alias_path=None):
         alnum.setdefault(_alnum_key(name), name)
 
     aliases = load_aliases(alias_path)
-    for abbr, full in aliases.items():
-        if _norm_key(full) not in canonical:
-            print(f"    note: alias {abbr!r} -> {full!r} is not a Table 2 component "
-                  f"(fine if it is prose-only, but check the spelling)")
+    unused = [abbr for abbr, full in aliases.items() if _norm_key(full) not in canonical]
+    if unused and _NOTED.isdisjoint(unused):
+        _NOTED.update(unused)
+        print(f"    note: {len(unused)} alias(es) name no component in the corpus tables "
+              f"yet ({', '.join(unused[:6])}{'...' if len(unused) > 6 else ''}) -- fine "
+              f"if prose-only, but check the spelling")
     # Prose-only components PubChem confirmed on an earlier run, so a second run
     # resolves them without touching the network.
     prose_vocabulary = {}

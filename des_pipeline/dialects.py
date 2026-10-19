@@ -278,7 +278,19 @@ class Elsevier:
 
     @staticmethod
     def glossary(root):
-        return []                                        # Elsevier has no glossary element
+        """The paper's own abbreviation list, when it has one. -> [(abbr, full name)]."""
+        return glossary_pairs(root)
+
+    @staticmethod
+    def abstract(root):
+        found = root.findall(".//abstract")
+        if not found:
+            found = root.findall(".//description")[:1]      # <coredata><dc:description>
+        return " ".join(xml_utils.text(a) for a in found)
+
+    @staticmethod
+    def keywords(root):
+        return [xml_utils.text(k) for k in root.findall(".//keywords//keyword")]
 
     PARAGRAPH_TAG = "para"
 
@@ -412,6 +424,8 @@ class JATS:
             caption = xml_utils.text(wrap.find("caption"))
             foot = wrap.find(".//table-wrap-foot")
             footnotes = xml_utils.text(foot) if foot is not None else ""
+            label, caption, footnotes = JATS._group_context(wrap, label, caption,
+                                                           footnotes)
 
             if not found:
                 # A picture of a table. Recorded so `unhandled` can list it for
@@ -460,6 +474,37 @@ class JATS:
                     element=wrap, header_missing=not header_rows,
                 ))
         return out
+
+    @staticmethod
+    def _group_context(wrap, label, caption, footnotes):
+        """A sub-table inherits its group's label and caption. -> (label, caption, foot).
+
+        JATS can wrap several <table-wrap>s in one <table-wrap-group>, and the label and
+        caption then sit on the GROUP: Azad's Tables 6 and 7 are ten unlabelled
+        sub-tables whose only caption is the group's. Read alone they had no label, no
+        caption and nothing to tell the model what they were.
+        """
+        group = wrap.getparent()
+        while group is not None and group.tag != "table-wrap-group":
+            group = group.getparent()
+        if group is None:
+            return label, caption, footnotes
+        group_label = xml_utils.text(group.find("label"))
+        if not group_label:
+            match = re.search(r"(\d+)$", group.get("id", ""))
+            group_label = f"Table {match.group(1)}" if match else ""
+        group_caption = xml_utils.text(group.find("caption"))
+        members = [w for w in group.iter("table-wrap")]
+        position = members.index(wrap) if wrap in members else 0
+        letter = "abcdefghijklmnopqrstuvwxyz"[position % 26]
+        if not label and group_label:
+            label = f"{group_label} ({letter})" if len(members) > 1 else group_label
+        if group_caption and group_caption not in caption:
+            caption = f"{group_caption} {caption}".strip()
+        foot = group.find("table-wrap-foot")
+        if foot is not None and not footnotes:
+            footnotes = xml_utils.text(foot)
+        return label, caption, footnotes
 
     @staticmethod
     def figures(root):
@@ -558,7 +603,18 @@ class JATS:
 
     @staticmethod
     def glossary(root):
-        return root.findall(".//glossary//def-item")
+        """The paper's own abbreviation list. -> [(abbreviation, full name)]."""
+        return glossary_pairs(root)
+
+    @staticmethod
+    def abstract(root):
+        article = JATS._article(root)
+        scope = article if article is not None else root
+        return " ".join(xml_utils.text(a) for a in scope.findall(".//front//abstract"))
+
+    @staticmethod
+    def keywords(root):
+        return [xml_utils.text(k) for k in root.findall(".//front//kwd")]
 
     PARAGRAPH_TAG = "p"
 
@@ -575,6 +631,71 @@ class JATS:
         tag = "para" if scope.find(".//para") is not None else "p"
         return [xml_utils.text(el) for el in scope.findall(f".//{tag}")]
 
+
+
+# A heading that introduces an abbreviation list, whatever element it sits in.
+_GLOSSARY_TITLE = re.compile(r"abbreviation|acronym|nomenclature|symbols", re.I)
+
+
+def _looks_like_abbreviation(text):
+    """'ChCl', '[BMIM][Br]', '(+)CSA', 'DES5' -- short, and not a sentence."""
+    text = text.strip()
+    return 0 < len(text) <= 24 and len(text.split()) <= 3
+
+
+def _ordered_pair(a, b):
+    """Two cells of a glossary row -> (abbreviation, full name), whichever way round.
+
+    Papers print both orders: Marco-Velasco puts the full name first and the
+    abbreviation second. The abbreviation is the short one.
+    """
+    a, b = a.strip(), b.strip()
+    if not a or not b:
+        return None
+    if _looks_like_abbreviation(a) and (len(a) < len(b) or not _looks_like_abbreviation(b)):
+        return a, b
+    if _looks_like_abbreviation(b):
+        return b, a
+    return None
+
+
+def glossary_pairs(root):
+    """Every (abbreviation, full name) the paper's own glossary states. -> list.
+
+    Three encodings turn up, and the old reader knew only the first, so it found nothing
+    in the one paper here that has a glossary (Marco-Velasco's is an <array>):
+      * JATS <def-list>/<def-item> with <term> and <def>;
+      * a two-column <array> or <table> inside <glossary>, or inside a section headed
+        "Abbreviations";
+      * Elsevier <glossary-entry> with <glossary-heading> and <glossary-definition>.
+    """
+    scopes = list(root.iter("glossary"))
+    for sec in list(root.iter("sec")) + list(root.iter("section")):
+        title = sec.find("title")
+        if title is None:
+            title = sec.find("section-title")
+        if title is not None and _GLOSSARY_TITLE.search(xml_utils.text(title)):
+            scopes.append(sec)
+
+    out, seen = [], set()
+
+    def add(pair):
+        if pair and pair[0].lower() not in seen:
+            seen.add(pair[0].lower())
+            out.append(pair)
+
+    for scope in scopes:
+        for item in scope.iter("def-item"):
+            add(_ordered_pair(xml_utils.text(item.find(".//term")),
+                              xml_utils.text(item.find(".//def"))))
+        for entry in scope.iter("glossary-entry"):
+            add(_ordered_pair(xml_utils.text(entry.find(".//glossary-heading")),
+                              xml_utils.text(entry.find(".//glossary-definition"))))
+        for tr in scope.iter("tr"):
+            cells = [xml_utils.text(c) for c in tr if c.tag in ("td", "th")]
+            if len(cells) == 2:
+                add(_ordered_pair(*cells))
+    return out
 
 
 DIALECTS = (Elsevier, JATS)

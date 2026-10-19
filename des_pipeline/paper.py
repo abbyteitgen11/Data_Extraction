@@ -11,6 +11,7 @@ provisional, rather than borrowing someone else's identity.
 """
 import json
 import re
+import unicodedata
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -28,9 +29,30 @@ def normalise_doi(value):
     return s.lower()
 
 
+# Letters NFKD does not decompose into a base letter plus an accent, so a plain strip
+# of combining marks would drop them entirely ("Anđelović" -> "Anelovic").
+_TRANSLITERATE = {"đ": "d", "Đ": "D", "ł": "l", "Ł": "L", "ø": "o", "Ø": "O",
+                  "æ": "ae", "Æ": "AE", "œ": "oe", "Œ": "OE", "ß": "ss", "þ": "th",
+                  "ı": "i"}
+
+
+def ascii_slug(text):
+    """'Jablonský_2019' -> 'Jablonsky_2019', 'Anđelović_2022' -> 'Andelovic_2022'.
+
+    Replacing every non-ASCII character with "_" (what this used to do) turned three
+    of the ten selected surnames into "Jablonsk_", "Barbar_" and "An_elovi_": still
+    unique, but unreadable, and one more accented surname away from a collision.
+    Transliterating keeps the name a human would type.
+    """
+    text = "".join(_TRANSLITERATE.get(ch, ch) for ch in str(text or ""))
+    text = unicodedata.normalize("NFKD", text)
+    text = "".join(ch for ch in text if not unicodedata.combining(ch))
+    return re.sub(r"[^A-Za-z0-9_.-]", "_", text)
+
+
 def slug_of(path):
     """A filesystem-safe stem for per-paper directories and cache filenames."""
-    return re.sub(r"[^A-Za-z0-9_.-]", "_", Path(path).stem)
+    return ascii_slug(Path(path).stem)
 
 
 @dataclass(frozen=True)
