@@ -110,6 +110,38 @@ def caption_mixes_il_and_des(table):
     return bool(_IL_CAPTION.search(caption)) and bool(_DES_WORDS.search(caption))
 
 
+_LEGEND_ITEM = re.compile(r"^\s*(\[?[A-Za-z0-9\[\]()+,.'-]{1,16}?)\s*[–—=:]\s*"
+                          r"([A-Za-z0-9][^–—=:]{2,80})$")
+
+
+def legend_definitions(legend):
+    """'U–Urea, Gly–Glycerol, ChCl–Choline chloride' -> [(abbr, full name)].
+
+    A table legend that lists abbreviations, separated by an en/em dash, '=' or ':'
+    (never a plain hyphen, which is inside chemical names). Items are split on ', ' or
+    '; ' only where the next item again has the 'ABBR–' shape, because full names can
+    contain commas ("2,2,2-Trifluoroacetamide").
+    """
+    text = str(legend or "")
+    if not re.search(r"[–—=]", text):
+        return []
+    # A caption lists them in parentheses: "... at 298 K (AA = acetamide; U = urea)".
+    text = re.sub(r"(?:(?<=\s)|^)\(\s*(?=\[?[A-Za-z0-9\[\]()+,.'-]{1,16}?\s*[–—=])", "; ", text)
+    pieces = re.split(r"[,;]\s+(?=\[?[A-Za-z0-9\[\]()+,.'-]{1,16}?\s*[–—=:])", text)
+    out = []
+    for piece in pieces:
+        match = _LEGEND_ITEM.match(piece.strip().rstrip("."))
+        if not match:
+            continue
+        abbr, full = match.group(1).strip(), match.group(2).strip()
+        if full.count(")") > full.count("("):
+            full = full[:full.rindex(")")].strip()
+        if len(abbr) < len(full) and re.search(r"[a-z]{3}", full) \
+                and not re.fullmatch(r"\d+(\.\d+)?", abbr):
+            out.append((abbr, full))
+    return out
+
+
 def code_key(text):
     """'[ChCl][Gl]3' -> 'chclgl3', 'DES 1' -> 'des1', 'CEM5' -> 'cem5'."""
     return re.sub(r"[^a-z0-9]", "", str(text or "").lower())
@@ -129,9 +161,44 @@ class PaperDictionary:
         self.overview_text = ""     # what the overview call read, for verifying quotes
 
     # --- building ---
+    def identity(self, comp):
+        """(component set, ratio) -- what makes two entries the same DES."""
+        names = frozenset(self.name_key(c) for c in comp.components
+                          if c and not is_water(c))
+        ratio = re.sub(r"\s+", "", comp.ratio_molar or comp.ratio_raw or "")
+        # Water and additives are part of what the DES is: Solcan's N12 and N13 share
+        # components and HBA:HBD ratio and differ only in water content.
+        water = (round(comp.water_fraction, 4) if comp.water_fraction is not None
+                 else "present" if any(is_water(c) for c in comp.components) else None)
+        additives = tuple(sorted((k.lower(), round(v[0], 4)) for k, v in comp.additives.items()))
+        return names, ratio, water, additives
+
     def add_mixture(self, code, comp, source, evidence="", verified=True, note=""):
         comp = copy.deepcopy(comp)
         comp.code, comp.source = (code or "").strip(), source
+        if verified:
+            # The same DES written two ways ("ChCl/U" from a table, "choline chloride:
+            # urea" from the overview) is one entry: the new code points at the first.
+            ident = self.identity(comp)
+            if len(ident[0]) >= 2:
+                for existing in self.mixtures.values():
+                    if self.identity(existing) == ident and existing.code != comp.code:
+                        key = code_key(comp.code)
+                        if key:
+                            self.mixtures.setdefault(key, existing)
+                        existing.note(f"also written as {comp.code!r} ({source})")
+                        # The code keeps its own row, so every name the paper uses for
+                        # the DES is listed -- but it resolves to the one entry.
+                        self.rows.append(DictionaryRow(
+                            Paper_key=self.paper_key, kind="mixture", code=comp.code,
+                            components=";".join(existing.components),
+                            components_written=";".join(comp.components_written),
+                            ratio_raw=existing.ratio_raw, ratio_molar=existing.ratio_molar,
+                            water_fraction=existing.water_fraction,
+                            water_basis=existing.water_basis, source=source,
+                            evidence=str(evidence or "")[:300], verified=True,
+                            note=f"same DES as {existing.code!r}"))
+                        return existing
         self.rows.append(DictionaryRow(
             Paper_key=self.paper_key, kind="mixture", code=comp.code,
             components=";".join(comp.components),
@@ -229,6 +296,49 @@ class PaperDictionary:
                 return True
         return False
 
+    def best_match(self, comp):
+        """The dictionary DES this composition is. -> (entry, ratio_agrees) or (None, False)."""
+        if comp.code:
+            entry = self.lookup(comp.code)
+            if entry is not None:
+                return entry, True
+        ident = self.identity(comp)
+        names, ratio = ident[0], ident[1]
+        if len(names) < 2:
+            return None, False
+        candidates = [e for e in self.mixtures.values() if self.identity(e)[0] == names]
+        if not candidates:
+            return None, False
+        # Same water and additives first: N12 and N13 differ only in water content.
+        candidates.sort(key=lambda e: self.identity(e)[2:] != ident[2:])
+        for entry in candidates:
+            if ratio and self.identity(entry)[1] == ratio:
+                return entry, True
+        no_ratio = [e for e in candidates if not self.identity(e)[1]]
+        return (no_ratio or candidates)[0], not ratio
+
+    def canonicalize(self, comp):
+        """Give a row's DES the names (and, when the ratio agrees, the code) the paper
+        itself defines. In place; returns comp.
+
+        A row read as "choline chloride:U" and the dictionary entry "Choline chloride:
+        Urea" (code ChCl/U) are one DES, and the data should say so: same names, same
+        code, so it joins the rest of the paper's data on that DES.
+        """
+        entry, ratio_agrees = self.best_match(comp)
+        if entry is None:
+            return comp
+        by_key = {self.name_key(c): c for c in entry.components if c}
+        comp.components = [by_key.get(self.name_key(c), c) if not is_water(c) else c
+                           for c in comp.components]
+        if entry.code and (ratio_agrees or not comp.ratio_raw) and not comp.code:
+            comp.code = entry.code
+        if not comp.ratio_raw and entry.ratio_raw:
+            comp.ratio_raw, comp.parts = entry.ratio_raw, list(entry.parts)
+            comp.ratio_molar = entry.ratio_molar
+            comp.ratio_source = comp.ratio_source or "dictionary"
+        return comp
+
     @property
     def has_definitions(self):
         """Does the paper define at least one real DES (not just abbreviations)?"""
@@ -236,8 +346,25 @@ class PaperDictionary:
                    for m in self.mixtures.values())
 
     def resolve(self, name):
-        """An abbreviation this paper defines -> its full name, or None."""
-        return self.aliases.get(str(name or "").strip().lower())
+        """An abbreviation this paper defines -> its full name, or None.
+
+        Matched ignoring hyphens, spaces and dots too: a legend defines "MeU" and the
+        table cells write "Me-U".
+        """
+        key = str(name or "").strip().lower()
+        if key in self.aliases:
+            return self.aliases[key]
+        squeezed = re.sub(r"[\s.\-–\[\]]", "", key)
+        if not squeezed:
+            return None
+        for abbr, full in self.aliases.items():
+            if re.sub(r"[\s.\-–\[\]]", "", abbr) == squeezed:
+                return full
+        # A stereo prefix on a defined abbreviation: "D-Glu" with "Glu–Glucose".
+        stereo = re.fullmatch(r"((?:d|l|dl|r|s|\(±\)|\([rs+-]\))-)(.+)", key)
+        if stereo and stereo.group(2) in self.aliases:
+            return stereo.group(1).upper() + self.aliases[stereo.group(2)]
+        return None
 
     def resolver(self, base=None):
         """A name resolver: this paper's own aliases first, then `base` (corpus-wide)."""
@@ -367,12 +494,26 @@ def build(paper, root, dialect, sections, tables, profiles, index=None, backend=
         else:
             d.add_alias(abbr, full, "glossary", f"{abbr}: {full}")
 
+    # 1b. abbreviation lists in table legends: "U–Urea, Gly–Glycerol, ChCl–Choline
+    #     chloride" (Jablonský Table 2 defines every abbreviation its rows use this way)
+    #     or in the caption: "(AA = acetamide; MA = malic acid)" (Jablonský Table 3)
+    for table in tables:
+        for abbr, full in (legend_definitions(table.footnotes)
+                           + legend_definitions(table.caption)):
+            if abbr.lower() not in d.aliases:
+                d.add_alias(abbr, full, "legend", f"{table.label}: {abbr}–{full}")
+
     # 2. "Full name (ABBR)" written in the running text and the abstract
     abstract = dialect.abstract(root) if hasattr(dialect, "abstract") else ""
     for found in harvest_definitions(list(sections) + [("abstract", "", abstract)],
                                      paper.key):
         if found["status"] == "candidate" and found["abbreviation"].lower() not in d.aliases:
             d.add_alias(found["abbreviation"], found["name"], "text", found["evidence"])
+
+    # 2b. single-letter abbreviations ("urea (U)", "glycerol (G)")
+    for abbr, full in single_letter_aliases([abstract] + [t for _s, _ti, t in sections]):
+        if abbr.lower() not in d.aliases:
+            d.add_alias(abbr, full, "text", f"{full} ({abbr})")
 
     resolve = d.resolver(global_alias_resolver())
 
@@ -422,8 +563,88 @@ def build(paper, root, dialect, sections, tables, profiles, index=None, backend=
             d.add_mixture(code, comp, "model", draft.evidence, verified=verified,
                           note=note)
 
+    _keep_des_aliases(d, tables, profiles, sections, abstract)
     _set_family(d)
     return d, overview
+
+
+_SINGLE_LETTER = re.compile(r"\b((?:[A-Za-z][\w\-,]*\s+){0,2}[A-Za-z][\w\-,]*)\s*\(\s*([A-Z])\s*\)")
+_CHEMICAL_WORD = re.compile(
+    r"(acid|chloride|bromide|iodide|fluoride|nitrate|sulfate|sulphate|phosphate|acetate|"
+    r"glycol|glycerol|urea|amine|amide|ammonium|phosphonium|imidazolium|choline|betaine|"
+    r"anol|diol|triol|ol|ine|ate|ide|ose|one)$", re.I)
+
+
+def chemical_name(text):
+    """Does this read like a chemical name? PubChem cache first, then its ending."""
+    from .composition import _cid_names
+
+    t = str(text or "").strip().lower()
+    if not t or len(t.split()) > 5:
+        return False
+    if t in _cid_names():
+        return True
+    last = re.split(r"[\s-]+", t)[-1]
+    return len(last) >= 4 and bool(_CHEMICAL_WORD.search(last))
+
+
+def single_letter_aliases(texts):
+    """'urea (U)', 'glycerol (G)' -> [(abbr, name)]. Schwartz-Hearst needs 2+ letters.
+
+    The letter must be the initial of the name's first word, and the name must read
+    as a chemical, so enumerations like "(a)" and "(B)" never qualify.
+    """
+    out = []
+    for text in texts:
+        for match in _SINGLE_LETTER.finditer(str(text or "")):
+            words, letter = match.group(1).split(), match.group(2)
+            for start in range(len(words)):
+                name = " ".join(words[start:]).strip(" ,")
+                if name[:1].lower() == letter.lower() and chemical_name(name):
+                    out.append((letter, name))
+                    break
+    return out
+
+
+def _keep_des_aliases(d, tables, profiles, sections, abstract):
+    """Keep only abbreviations the paper uses for a DES constituent. In place.
+
+    The abbreviation harvest finds every "Full name (ABBR)" in the paper, and most are
+    not chemistry at all -- PWF (pure water flux), SLM, EMVs, SIBs -- or are chemistry
+    unrelated to any DES (CO2, CH4). They are harmless to extraction but fill
+    des_dictionary.csv. An abbreviation is kept when it appears in a DES context: a
+    component or mixture cell of a table, a DES formula in the text ("ChCl:U", "U/Gly"),
+    or the code or written components of a DES the paper defines. Resolution still
+    sees every candidate; only the file is filtered.
+    """
+    context = []
+    for table in tables:
+        profile = profiles.get(table.id)
+        if profile is None:
+            continue
+        cols = [c.index for c in profile.columns if c.role in ("component", "mixture")]
+        context += [row[i].text for row in table.rows for i in cols if i < len(row)]
+    for comp in d.mixtures.values():
+        context += [comp.code or "", comp.written or ""] + list(comp.components_written)
+    formulas = [m.group(0) for _sid, _t, text in sections
+                for m in re.finditer(r"[\w\[\]()+-]+\s*[:/]\s*[\w\[\]()+-]+(?:\s*[:/]\s*"
+                                     r"[\w\[\]()+-]+)*", str(text or ""))]
+    haystack = " | ".join(context + formulas)
+    squeezed = re.sub(r"[\s.\-–]", "", haystack.lower())
+    kept = []
+    for row in d.rows:
+        if row.kind != "alias" or row.source == "definitions_table":
+            kept.append(row)
+            continue
+        abbr = re.escape(row.code)
+        if re.search(rf"(?<![\w]){abbr}(?![\w])", haystack) or (
+                len(row.code) >= 3
+                and re.sub(r"[\s.\-–]", "", row.code.lower()) in squeezed):
+            kept.append(row)
+    dropped = len(d.rows) - len(kept)
+    if dropped:
+        print(f"    {dropped} abbreviation(s) unrelated to any DES left out of the dictionary")
+    d.rows = kept
 
 
 def _is_generic(name):
@@ -436,16 +657,28 @@ def _set_family(d):
     Entries that themselves say only "DES" (Dinh's "DES 1:4 + 10 %wt EC") are ignored
     when finding the family, then rewritten with its components.
     """
-    families = {}
-    for comp in d.mixtures.values():
-        if any(_is_generic(c) for c in comp.components):
-            continue
+    from collections import Counter
+
+    # The family is the component set most of the paper's DES-coded entries share
+    # ("DES1:4", "DES 1:2" -> LiTFSI:TFA). A single other entry -- Dinh's conventional
+    # EC-DMC electrolyte -- no longer prevents finding it.
+    entries = [c for c in {id(v): v for v in d.mixtures.values()}.values()
+               if not any(_is_generic(x) for x in c.components)]
+    coded = [c for c in entries if re.search(r"\bDES", c.code or "", re.I)] or entries
+    counts, first = Counter(), {}
+    for comp in coded:
         names = frozenset(normalise(c) for c in comp.components if not is_water(c))
         if len(names) >= 2:
-            families.setdefault(names, comp)
-    if len(families) != 1:
+            counts[names] += 1
+            first.setdefault(names, comp)
+    if not counts:
         return
-    only = next(iter(families.values()))
+    ranked = counts.most_common(2)
+    if len(ranked) > 1 and ranked[0][1] == ranked[1][1]:
+        return                                # a tie: no single family
+    if len(counts) > 1 and ranked[0][1] < 2:
+        return                                # several sets, none repeated
+    only = first[ranked[0][0]]
     base = [c for c in only.components if not is_water(c)]
     d.family = Composition(written="DES", components=base,
                            components_written=list(base), source="family")

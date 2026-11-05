@@ -219,6 +219,12 @@ def check_plausibility(rows):
             out.append({**_ident(row), "Mixture": row.get("Mixture"),
                         "Value": value, "Unit": row.get("Unit"),
                         "note": f"outside the plausible range {low} to {high}"})
+        elif str(row.get("plausible")).lower() == "false":
+            # Flagged at extraction: an implausible measuring temperature, or a
+            # melting-type value that looks like unconverted kelvin.
+            out.append({**_ident(row), "Mixture": row.get("Mixture"),
+                        "Value": value, "Unit": row.get("Unit"),
+                        "note": row.get("plausibility_note") or "flagged implausible"})
     return out
 
 

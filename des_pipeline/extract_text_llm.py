@@ -118,28 +118,9 @@ def _ollama_options():
     }
 
 
-class BudgetExceeded(RuntimeError):
-    """The run tag's spend reached DES_BUDGET_USD. Every answer so far is cached."""
-
+from .budget import BudgetExceeded  # noqa: E402  (re-exported for run_pipeline)
 
 _USAGE_LOCK = threading.Lock()
-_SPENT = None                      # running total for this process, seeded from the CSV
-
-
-def _spent_so_far():
-    global _SPENT
-    if _SPENT is None:
-        _SPENT = 0.0
-        if config.USAGE_CSV.exists():
-            import csv
-
-            with open(config.USAGE_CSV, newline="") as handle:
-                for row in csv.DictReader(handle):
-                    try:
-                        _SPENT += float(row.get("cost_usd") or 0)
-                    except ValueError:
-                        pass
-    return _SPENT
 
 
 def log_usage(backend, model, section_id, input_tokens, output_tokens, seconds,
@@ -149,9 +130,11 @@ def log_usage(backend, model, section_id, input_tokens, output_tokens, seconds,
     This is what makes models comparable on cost and speed, not just accuracy. Cached
     answers are never logged -- they cost nothing -- so the file is the real bill.
     """
-    global _SPENT
-    price_in, price_out = config.ANTHROPIC_PRICES.get(model, (0.0, 0.0)) \
-        if backend == "anthropic" else (0.0, 0.0)
+    # The response names the model that answered -- a refusal fallback can be another
+    # one -- possibly with a date suffix, so the price is looked up by prefix.
+    price_in, price_out = next(
+        (v for k, v in config.ANTHROPIC_PRICES.items() if str(model).startswith(k)),
+        (0.0, 0.0)) if backend == "anthropic" else (0.0, 0.0)
     # Cache reads bill at ~0.1x and writes at ~1.25x the input price.
     cost = ((input_tokens or 0) * price_in + (output_tokens or 0) * price_out
             + (cache_read or 0) * price_in * 0.1
@@ -172,7 +155,7 @@ def log_usage(backend, model, section_id, input_tokens, output_tokens, seconds,
             if new:
                 writer.writeheader()
             writer.writerow(row)
-        _SPENT = _spent_so_far() + cost
+    return cost
 
 
 def _strict_schema(schema):
@@ -220,6 +203,25 @@ def _anthropic_request(prompt, schema_json):
     return "standard", kwargs
 
 
+def _send(client, kind, kwargs):
+    """One Messages API request. Parameters the installed SDK predates go in extra_body.
+
+    `output_config` and `fallbacks` are recent request fields; an SDK version without
+    them as named arguments raises TypeError before anything is sent, and the same
+    request then goes out with those fields in the JSON body, which the API accepts.
+    """
+    create = client.beta.messages.create if kind == "beta" else client.messages.create
+    try:
+        return create(**kwargs)
+    except TypeError as exc:
+        newer = {k: kwargs.pop(k) for k in ("output_config", "fallbacks") if k in kwargs}
+        if not newer:
+            raise
+        if kind == "beta" and "betas" in kwargs:
+            pass                               # the betas header is long supported
+        return create(**kwargs, extra_body=newer)
+
+
 def call_llm(prompt, schema_json, backend=None, section_id=""):
     """Send one prompt, return the raw JSON string. Backend chosen by config/env."""
     backend = backend or config.LLM_BACKEND
@@ -247,22 +249,26 @@ def call_llm(prompt, schema_json, backend=None, section_id=""):
     if backend == "anthropic":
         import anthropic
 
-        if config.BUDGET_USD and _spent_so_far() >= config.BUDGET_USD:
-            raise BudgetExceeded(f"spent ${_spent_so_far():.2f} of the "
-                                 f"${config.BUDGET_USD:.2f} budget for run "
-                                 f"{config.RUN_TAG or '(untagged)'}")
-        client = anthropic.Anthropic(max_retries=4)
-        kind, kwargs = _anthropic_request(prompt, schema_json)
-        if kind == "beta":
-            message = client.beta.messages.create(**kwargs)
-        else:
-            message = client.messages.create(**kwargs)
-        usage = message.usage
-        log_usage(backend, config.ANTHROPIC_MODEL, section_id,
-                  usage.input_tokens, usage.output_tokens, time.time() - started,
-                  getattr(usage, "cache_read_input_tokens", 0) or 0,
-                  getattr(usage, "cache_creation_input_tokens", 0) or 0,
-                  message.stop_reason or "")
+        from . import budget
+
+        # Reserve the worst case BEFORE sending; refused here if a cap would be passed.
+        held = budget.reserve(config.ANTHROPIC_MODEL, len(prompt),
+                              config.ANTHROPIC_MAX_TOKENS)
+        cost = 0.0
+        try:
+            client = anthropic.Anthropic(max_retries=4)
+            kind, kwargs = _anthropic_request(prompt, schema_json)
+            message = _send(client, kind, kwargs)
+            usage = message.usage
+            cost = log_usage(backend, getattr(message, "model", None)
+                             or config.ANTHROPIC_MODEL, section_id,
+                             usage.input_tokens, usage.output_tokens,
+                             time.time() - started,
+                             getattr(usage, "cache_read_input_tokens", 0) or 0,
+                             getattr(usage, "cache_creation_input_tokens", 0) or 0,
+                             message.stop_reason or "")
+        finally:
+            budget.settle(held, cost)
         if message.stop_reason == "refusal":
             print(f"    {section_id}: the model declined; treated as an empty answer")
             return "{}"
@@ -677,6 +683,8 @@ def extract_section(section_id, title, text, paper_doi="", reference_map=None,
         found = quote_found(quote, text)
         comp = grounded_composition(draft.components, quote, draft.value, dictionary,
                                     resolve, index)
+        if dictionary is not None:
+            dictionary.canonicalize(comp)
 
         # Solubility describes a SOLUTE in the DES. A name the model put among the
         # components that is not part of any DES the paper defines is the solute.
@@ -777,6 +785,8 @@ def _application_rows(drafts, section_id, title, normalised_text, paper_doi,
         found = quote_found(quote, normalised_text)
         comp = grounded_composition(draft.components, quote, None, dictionary,
                                     resolve, index)
+        if dictionary is not None:
+            dictionary.canonicalize(comp)
         stated = draft.molar_ratio and normalise(draft.molar_ratio).replace(" ", "") in \
             normalise(quote).replace(" ", "")
         if draft.molar_ratio and not stated and comp.ratio_raw == draft.molar_ratio:

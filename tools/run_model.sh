@@ -17,16 +17,21 @@
 set -euo pipefail
 tag="${1:?run tag}"; model="${2:?model id}"; budget="${3:-20}"
 cd "$(dirname "$0")/.."
+PY="${PYTHON:-python}"
 mkdir -p "runs/$tag"
+# Refuse to start if the estimated cost does not fit the month's remaining budget.
+DES_RUN_TAG="$tag" "$PY" tools/preflight.py "$model" --budget "$budget"
 DES_RUN_TAG="$tag" DES_LLM_BACKEND=anthropic DES_ANTHROPIC_MODEL="$model" \
 DES_BUDGET_USD="$budget" \
-  python -u run_pipeline.py --steps refs,table,figures,text,validate \
+  "$PY" -u run_pipeline.py --steps refs,table,figures,text,validate \
     --xml 'xml/*.xml,xml/selected/*.xml' --continue-on-error \
     2>&1 | tee "runs/$tag/run.log"
 echo
-python - "$tag" <<'EOF'
+DES_RUN_TAG="$tag" "$PY" - "$tag" <<'EOF'
 import csv, sys
+from des_pipeline import budget
 rows = list(csv.DictReader(open(f"runs/{sys.argv[1]}/usage.csv")))
 print(f"{len(rows)} calls, ${sum(float(r['cost_usd']) for r in rows):.2f}, "
       f"{sum(float(r['seconds']) for r in rows) / 60:.1f} model-minutes")
+print(budget.status())
 EOF

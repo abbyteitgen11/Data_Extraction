@@ -137,6 +137,18 @@ def test_generic_des_resolves_to_the_family():           # Dinh "DES 1:4 + 10 %w
     assert c.additives == {"EC": (0.1, "wt")} and "EC" in c.components
 
 
+def test_legend_abbreviations():                           # Jablonský Table 2 legend
+    from des_pipeline.paper_dictionary import legend_definitions
+
+    got = dict(legend_definitions(
+        "CF3CONH2–2,2,2-Trifluoroacetamide, 1,3-Me2U–1,3-dimethylurea, CitA–Citric acid, "
+        "ChCl–Choline chloride, Gly–Glycerol, U–Urea"))
+    assert got["U"] == "Urea" and got["Gly"] == "Glycerol"
+    assert got["CF3CONH2"] == "2,2,2-Trifluoroacetamide"
+    assert got["1,3-Me2U"] == "1,3-dimethylurea"
+    assert legend_definitions("aStandard uncertainty of temperature is u(T) = 0.1 K.") == []
+
+
 def test_glossary_reader_handles_array_encoding():       # Marco-Velasco back matter
     from lxml import etree
 
@@ -244,6 +256,17 @@ def test_numeric_name_column_becomes_a_condition():      # Fan T3, qwen3 profile
                              "W·m−1·K−1")])
     profile, notes = repair(profile, table)
     assert profile.columns[0].role == "condition"
+
+
+def test_kelvin_default_temperature_is_converted():     # Jablonský T2 "at 298 K"
+    from des_pipeline.profile_table import repair
+
+    table = _table(["DES", "Density"], [["A:B", "1.1"], ["C:D", "1.2"], ["E:F", "1.3"]])
+    profile = _profile([_col(0, "DES", "mixture"),
+                        _col(1, "Density", "property", "Density", "g/cm3")])
+    profile.default_temperature_C = 298.0
+    profile, notes = repair(profile, table)
+    assert math.isclose(profile.default_temperature_C, 24.85)
 
 
 def test_unit_conflicts():
@@ -368,19 +391,37 @@ def _fake_anthropic(captured, text='{"x": 1}'):
     return types.SimpleNamespace(Anthropic=Client)
 
 
-def test_anthropic_request_shape_and_usage_log(tmp=None):
+def _fresh_budget(tmpdir):
+    """Point the budget ledger at an empty temp folder; return a restore function."""
+    from des_pipeline import budget
+
+    saved = (budget._usage_files, dict(budget._STATE), config.USAGE_CSV,
+             config.BUDGET_USD)
+    config.USAGE_CSV = Path(tmpdir) / "usage.csv"
+    budget._usage_files = lambda: [config.USAGE_CSV] if config.USAGE_CSV.exists() else []
+    budget._STATE.update({"month": None, "month_spent": None, "run_spent": None,
+                          "reserved": 0.0})
+
+    def restore():
+        budget._usage_files = saved[0]
+        budget._STATE.clear()
+        budget._STATE.update(saved[1])
+        config.USAGE_CSV, config.BUDGET_USD = saved[2], saved[3]
+    return restore
+
+
+def test_anthropic_request_shape_and_usage_log():
     import tempfile
 
     from des_pipeline import extract_text_llm as t
 
     captured = []
-    saved = (sys.modules.get("anthropic"), config.USAGE_CSV, config.ANTHROPIC_MODEL,
-             config.BUDGET_USD, t._SPENT)
+    saved = (sys.modules.get("anthropic"), config.ANTHROPIC_MODEL)
     with tempfile.TemporaryDirectory() as tmpdir:
+        restore = _fresh_budget(tmpdir)
         try:
             sys.modules["anthropic"] = _fake_anthropic(captured)
-            config.USAGE_CSV = Path(tmpdir) / "usage.csv"
-            t._SPENT = None
+            config.BUDGET_USD = 0
             schema = {"type": "object", "properties": {"x": {"type": "integer",
                                                              "default": 0}}}
 
@@ -404,23 +445,245 @@ def test_anthropic_request_shape_and_usage_log(tmp=None):
             assert len(rows) == 3                          # header + two calls
             # Sonnet 5.5: 1000 in x $2/M + 200 out x $10/M = $0.004
             assert "0.004" in rows[1]
-
-            config.BUDGET_USD = 0.001                      # already spent more than this
-            try:
-                t.call_llm("hi", schema, backend="anthropic", section_id="s3")
-                raise AssertionError("budget guard did not stop the call")
-            except t.BudgetExceeded:
-                pass
         finally:
             if saved[0] is None:
                 sys.modules.pop("anthropic", None)
             else:
                 sys.modules["anthropic"] = saved[0]
-            (config.USAGE_CSV, config.ANTHROPIC_MODEL, config.BUDGET_USD,
-             t._SPENT) = saved[1:]
+            config.ANTHROPIC_MODEL = saved[1]
+            restore()
+
+
+def test_budget_refuses_before_sending():
+    """Both caps refuse a call whose WORST CASE would pass them -- before it is sent."""
+    import tempfile
+
+    from des_pipeline import budget
+    from des_pipeline import extract_text_llm as t
+
+    captured = []
+    saved = (sys.modules.get("anthropic"), config.ANTHROPIC_MODEL)
+    with tempfile.TemporaryDirectory() as tmpdir:
+        restore = _fresh_budget(tmpdir)
+        try:
+            sys.modules["anthropic"] = _fake_anthropic(captured)
+            config.ANTHROPIC_MODEL = "claude-opus-5-5"
+            # A month that has already spent $69.90 of a $70 cap: the worst case of one
+            # Opus call (16k output tokens x $20/M = $0.32) no longer fits.
+            config.USAGE_CSV.write_text(
+                "time,run_tag,backend,model,call,input_tokens,output_tokens,"
+                "cache_read_tokens,cache_write_tokens,seconds,cost_usd,stop_reason\n"
+                f"{__import__('time').strftime('%Y-%m-%d')} 10:00:00,x,anthropic,"
+                "claude-opus-5-5,c,0,0,0,0,1,69.90,end_turn\n")
+            budget._STATE.update({"month_spent": None, "run_spent": None})
+            try:
+                t.call_llm("hi", {"type": "object", "properties": {}},
+                           backend="anthropic", section_id="s")
+                raise AssertionError("monthly cap did not stop the call")
+            except budget.BudgetExceeded as exc:
+                assert "monthly cap" in str(exc)
+            assert captured == []                          # nothing was sent
+
+            # Per-run cap: plenty of monthly room, but DES_BUDGET_USD = $0.10.
+            config.USAGE_CSV.unlink()
+            budget._STATE.update({"month_spent": None, "run_spent": None,
+                                  "reserved": 0.0})
+            config.BUDGET_USD = 0.10
+            try:
+                t.call_llm("hi", {"type": "object", "properties": {}},
+                           backend="anthropic", section_id="s")
+                raise AssertionError("run cap did not stop the call")
+            except budget.BudgetExceeded as exc:
+                assert "run cap" in str(exc)
+            assert captured == [] and budget._STATE["reserved"] == 0.0
+        finally:
+            if saved[0] is None:
+                sys.modules.pop("anthropic", None)
+            else:
+                sys.modules["anthropic"] = saved[0]
+            config.ANTHROPIC_MODEL = saved[1]
+            restore()
+
+
+def test_reservations_are_released():
+    import tempfile
+
+    from des_pipeline import budget
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        restore = _fresh_budget(tmpdir)
+        try:
+            held = budget.reserve("claude-sonnet-5-5", 3000, 16000)
+            assert math.isclose(held, 1000 * 2e-6 + 16000 * 10e-6)
+            assert budget._STATE["reserved"] > 0
+            budget.settle(held, 0.01)
+            assert budget._STATE["reserved"] == 0.0
+            assert math.isclose(budget.month_spent(), 0.01)
+        finally:
+            restore()
+
+
+# ---------- fixes from the four-model comparison ----------
+def test_cell_lines_split_on_break():                       # Anđelović Table 1 "1:2<break/>1:3"
+    from lxml import etree
+
+    from des_pipeline.dialects import _cell
+
+    cell = _cell(etree.fromstring("<td>1:2<break/>1:3</td>"))
+    assert cell.lines == ("1:2", "1:3") and cell.text == "1:2 1:3"
+    d = PaperDictionary("x")
+    d.add_mixture("ChCl:Gly", compose(["Choline chloride", "Glycerol"], "1:2"),
+                  "definitions_table")
+    assert parse_mixture("ChCl:Gly (1:3)", d).ratio_raw == "1:3"   # the row's own ratio
+
+
+def test_speed_of_sound_is_not_viscosity():                # Azad Table 2 "u (m s−1)"
+    assert units.unit_conflict("m s−1", "Viscosity")
+    assert units.unit_conflict("cm2 s−1", "Density")           # Dinh Table 6
+    assert not units.unit_conflict("mS cm−1", "Conductivity")
+
+
+def test_undefined_superscript_is_stripped():               # Jablonský Table 3 "−54ᵍᵗ"
+    from des_pipeline.extract_table import strip_undefined_superscript
+
+    assert strip_undefined_superscript("−54gt", ("gt",)) == ("−54", "gt")
+    assert strip_undefined_superscript("ChCla", ("a",)) == ("ChCla", "")
+
+
+def test_caption_implied_component_with_typo():             # Canela-Xandri captions
+    from des_pipeline.profile_table import caption_implied
+
+    tables = []
+    for i, cap in enumerate(["PSTA based DES used as reaction medium",
+                             "PTSA based DES in esterification",
+                             "PTSA based DES in lignocellulose fractionation"]):
+        t = _table(["HBA"], [["ChCl"]])
+        t.id, t.caption = f"t{i}", cap
+        tables.append(t)
+    assert set(caption_implied(tables).values()) == {"PTSA"}
+
+
+def test_reagent_columns_are_context():                     # Canela-Xandri Table 2
+    from des_pipeline.profile_table import repair
+
+    table = _table(["Entry", "HBA", "Alcohol", "Acid", "Ref."],
+                   [["2.1", "BTMAC", "MeOH", "Acetic (AA)", "87"]])
+    table.caption = "PSTA based DES used in esterification reactions"
+    profile = _profile([_col(0, "Entry", "context", field="entry"),
+                        _col(1, "HBA", "component"), _col(2, "Alcohol", "component"),
+                        _col(3, "Acid", "component"), _col(4, "Ref.", "reference")])
+    profile.content_types = ["des_application"]
+    profile, notes = repair(profile, table, implied_hint="PTSA")
+    assert [c.role for c in profile.columns][1:4] == ["component", "context", "context"]
+    assert profile.implied_components == ["PTSA"]
+
+
+def test_placeholders_are_not_des():                        # Sadeghi Table 1
+    assert des_problem(parse_mixture("Cat:X− zMClx"))
+    assert not des_problem(parse_mixture("Xylitol:Choline chloride"))
+
+
+def test_single_letter_abbreviations():                     # Azad text
+    from des_pipeline.paper_dictionary import single_letter_aliases
+
+    got = dict(single_letter_aliases(
+        ["oxalic acid (OX), ethylene glycol (EG), glycerol (G) and urea (U) as donors",
+         "shown in Figure (A) and the samples (B)"]))
+    assert got == {"G": "glycerol", "U": "urea"}
+
+
+def test_water_is_written_when_no_molar_ratio():            # Azad Table 2 "0.06%"
+    c = compose(["ChCl", "U"], "1:2", "HBA-HBD (molar ratio)", water_text="0.06%",
+                water_header="Water content")
+    assert c.water_fraction == 0.0006 and "0.06 wt% water" in c.label()
+
+
+def test_rows_take_the_dictionary_names_and_code():         # Azad ChCl/U
+    d = PaperDictionary("x")
+    d.aliases.update({"chcl": "Choline chloride", "u": "Urea"})
+    d.add_mixture("ChCl/U", compose(["Choline chloride", "Urea"], "1:2"), "definitions_table")
+    row = compose(["choline chloride", "U"], "1:2")
+    d.canonicalize(row)
+    assert row.components == ["Choline chloride", "Urea"] and row.code == "ChCl/U"
+    # the same DES under another code: its own row (the paper uses that name), one entry
+    again = d.add_mixture("choline chloride:urea",
+                          compose(["choline chloride", "urea"], "1:2"), "model")
+    assert again.code == d.lookup("choline chloride:urea").code == "ChCl/U"
+    assert [r.code for r in d.rows if r.kind == "mixture"] == ["ChCl/U",
+                                                               "choline chloride:urea"]
+
+
+def test_family_by_majority():                              # Dinh
+    from des_pipeline.paper_dictionary import _set_family
+
+    d = PaperDictionary("x")
+    for ratio in ("1:2", "1:3", "1:4"):
+        d.add_mixture(f"DES{ratio}", compose(["LiTFSI", "trifluoroacetamide"], ratio), "model")
+    d.add_mixture("EC-DMC + LiTFSI", compose(["EC", "DMC"], "1:1"), "model")
+    _set_family(d)
+    assert d.family is not None and d.family.components == ["LiTFSI", "trifluoroacetamide"]
+
+
+def test_reference_numbers_stay_text():                     # "59.0" written by pandas
+    import tempfile
+
+    import pandas as pd
+
+    from des_pipeline import store
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        path = Path(tmpdir) / "x.csv"
+        pd.DataFrame([{"Source_ref_numbers": "59", "Value": 1.5}]).to_csv(path, index=False)
+        df = store._read_csv(path)
+        assert df.Source_ref_numbers[0] == "59" and float(df.Value[0]) == 1.5
+
+
+def test_implausible_measuring_temperature_is_flagged():
+    from des_pipeline.extract_table import _temperature_plausibility
+
+    assert _temperature_plausibility("Density", {"Temperature_C": 298.0, "Value": 1.1})
+    assert not _temperature_plausibility("Density", {"Temperature_C": 25.0, "Value": 1.1})
+    assert _temperature_plausibility("Melting_point",
+                                     {"Value": 285.15, "Unit_as_written": "C"})
 
 
 # ---------- runner ----------
+
+def test_unitless_water_numbers_are_not_percent():          # Canela-Xandri Table 7
+    two = compose(["ChCl", "PTSA"], water_text="2", water_header="H2O")
+    assert two.water_fraction is None and "Water" in two.components
+    listed = compose(["ChCl", "PTSA"], water_text="1,2,3", water_header="H2O")
+    assert listed.water_fraction is None and any("several" in n for n in listed.notes)
+    assert compose(["ChCl", "U"], water_text="0.06%", water_header="Water").water_fraction \
+        == 0.0006
+    assert compose(["ChCl", "U"], water_text="5", water_header="Water (wt)").water_fraction \
+        == 0.05
+
+def test_caption_abbreviations_and_stereo_prefix():         # Jablonský Tables 2-3
+    from des_pipeline.paper_dictionary import legend_definitions
+    pairs = dict(legend_definitions(
+        "Ternary DESs at 298 K (AA = acetamide; MA = malic acid; [BMPI]Br = "
+        "1-butyl-1-methylpyrrolidinium bromide); gt = glass transition temperature."))
+    assert pairs["AA"] == "acetamide" and pairs["MA"] == "malic acid"
+    assert pairs["[BMPI]Br"] == "1-butyl-1-methylpyrrolidinium bromide"
+    legend = dict(legend_definitions("OxA–Oxalic acid, [P(Me)(Ph)3]Br–Methyltriphenyl"
+                                     "phosphonium bromide, P(Bz)(Ph)3]Cl–Benzoyl chloride"))
+    assert legend["OxA"] == "Oxalic acid" and "[P(Me)(Ph)3]Br" in legend
+    d = PaperDictionary("x")
+    d.aliases.update({"glu": "Glucose", "p(bz)(ph)3]cl": "Benzoyl chloride"})
+    assert d.resolve("D-Glu") == "D-Glucose"
+    assert d.resolve("[P(Bz)(Ph)3]Cl") == "Benzoyl chloride"     # bracket lost in print
+
+def test_superscript_defined_in_caption_names_the_property():  # Jablonský "−54ᵍᵗ"
+    from types import SimpleNamespace
+    from des_pipeline.extract_table import marker_property
+    table = SimpleNamespace(caption="Ternary DESs at 298 K (U = urea); gt = glass "
+                                    "transition temperature.", footnotes="")
+    assert marker_property(table, "gt", "Melting_point") == "Glass_transition"
+    assert marker_property(table, "a", "Melting_point") == "Melting_point"
+
+
+
 if __name__ == "__main__":
     failures = 0
     tests = [(name, fn) for name, fn in sorted(globals().items())
@@ -434,3 +697,4 @@ if __name__ == "__main__":
             print(f"  FAIL  {name}: {type(exc).__name__}: {exc}")
     print(f"\n{len(tests) - failures}/{len(tests)} passed")
     sys.exit(1 if failures else 0)
+

@@ -14,6 +14,8 @@ Every row still carries `Paper_key` as a column, so a concatenation is self-desc
 and a mis-filed row is detectable. `write()` asserts that, which is the cheapest
 possible guard against the class of bug above.
 """
+import re
+
 import pandas as pd
 
 from . import config
@@ -35,6 +37,9 @@ KINDS = (
     "tables",              # the ledger: one row per table, whatever happened to it
     "sections_llm_rejected",  # prose rows with no number (rankings, comparisons)
 )
+
+
+_TEXT_COLUMN = re.compile(r"ref|_key|doi|code|row_id|table_id|section_id|^key$", re.I)
 
 
 def paper_dir(paper):
@@ -92,7 +97,12 @@ def _read_csv(path):
     if not path.exists() or path.stat().st_size == 0:
         return None
     try:
-        return pd.read_csv(path)
+        # Identifiers and citation numbers are text. Read as numbers, a reference "59"
+        # came back as 59.0 and was written out again that way, and a DOI or code that
+        # happened to look numeric would lose its leading zeros.
+        columns = pd.read_csv(path, nrows=0).columns
+        text = {c: str for c in columns if _TEXT_COLUMN.search(c)}
+        return pd.read_csv(path, dtype=text)
     except pd.errors.EmptyDataError:
         return None
 

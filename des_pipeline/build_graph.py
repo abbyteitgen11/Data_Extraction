@@ -253,8 +253,12 @@ def _one_measurement(first, members, roles, node_key, rekeyed=None):
             mixtures.append(pair)
         containing = m.get("Paper_key") or m.get("Paper_DOI") or ""
         # A review reports someone else's measurement; a research paper reports its
-        # own, so it is the primary source rather than a review of nobody.
-        target = primary_papers if roles.get(containing) == "primary" else review_papers
+        # own, so it is the primary source rather than a review of nobody -- unless the
+        # value is a literature value it reprinted ("Lit" column, "(ref. 22)"), which
+        # belongs to the cited study.
+        literature = str(m.get("Literature_value")).lower() in ("true", "1")
+        own = roles.get(containing) == "primary" and not literature
+        target = primary_papers if own else review_papers
         if containing and containing not in target:
             target.append(containing)
         for k in _split(m.get("Source_paper_keys")):
@@ -792,7 +796,16 @@ def build(wipe=False, include_prose=True):
         print(f"  merging {len(canonical)} component spelling(s) into "
               f"{len(set(canonical.values()))} canonical name(s)")
 
-    papers = _paper_rows(references)
+    # Paper nodes only for references some loaded data point cites (plus the papers we
+    # extracted from, which are added separately). The rest of each bibliography stays
+    # in references.csv, never looked up and never in the graph.
+    cited_keys = cited | {k for r in long_rows for k in _split(r.get("Source_paper_keys"))}
+    cited_keys |= {k for r in store.read_all("applications")
+                   if (r.get("status") or "ok") == "ok"
+                   for k in _split(r.get("Source_paper_keys"))}
+    papers = _paper_rows([r for r in references if r.get("key") in cited_keys])
+    print(f"  {len(papers)} cited reference(s) become Paper nodes "
+          f"(of {len(references)} in the bibliographies)")
     applications = _application_rows(store.read_all("applications"), roles, canonical)
     mixtures, rekeyed = _mixture_rows(table, components_by_name, roles, canonical)
     measurements = _measurement_rows(long_rows, roles, rekeyed)

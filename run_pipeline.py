@@ -74,11 +74,11 @@ def _run_paper(path, steps, args, network):
 
         print("references:")
         reference_map = refs.parse_bibliography(routed.references, dialect)
-        reference_map = refs.resolve_all(reference_map, pap, network=network)
-        reference_map = refs.enrich_all(reference_map, pap, network=network)
+        # No Crossref search yet: DOIs printed in the XML and earlier lookups only.
+        # Searching happens after extraction, for the references data points cite.
+        reference_map = refs.resolve_all(reference_map, pap, network=False)
+        reference_map = refs.enrich_all(reference_map, pap, network=False)
         routed.review = refs.enrich_review(routed.review, pap, network=network)
-        if "refs" in steps:
-            store.write(refs.to_rows(reference_map, pap.key), "references", pap)
 
     from des_pipeline import paper_dictionary
 
@@ -114,15 +114,21 @@ def _run_paper(path, steps, args, network):
         resolve = dictionary.resolver(paper_dictionary.global_alias_resolver())
 
         paragraphs = dialect.paragraphs(root)
-        mixtures, measurements, skipped, table_stats = tables.extract_tables(
+        mixtures, extras, skipped, table_stats = tables.extract_tables(
             routed.tables, profiles, pap, reference_map, dictionary, resolve, paragraphs)
-        store.write(mixtures, "mixtures", pap, model=tables.MixtureRow)
-        store.write(measurements, "measurements", pap, model=tables.MeasurementRow)
-
         used_for, refused, app_stats = applications.extract_applications(
             routed.tables, profiles, pap, reference_map, dictionary, resolve, paragraphs)
         from_paper = applications.paper_applications(overview, dictionary, pap,
                                                      dictionary.overview_text, resolve)
+
+        # Crossref for the references these rows cite -- and nothing else.
+        cited = refs.cited_numbers(mixtures, used_for) | tables.inline_ref_numbers(extras)
+        reference_map = refs.resolve_cited(reference_map, pap, cited, network=network)
+        refs.refill(mixtures, reference_map, pap.key)
+        refs.refill(used_for, reference_map, pap.key)
+        measurements = tables.finish_measurements(mixtures, extras, pap, reference_map)
+        store.write(mixtures, "mixtures", pap, model=tables.MixtureRow)
+        store.write(measurements, "measurements", pap, model=tables.MeasurementRow)
         if from_paper:
             print(f"    {len(from_paper)} paper-level application link(s), "
                   f"{sum(1 for a in from_paper if a.status == 'ok')} verified")
@@ -168,6 +174,10 @@ def _run_paper(path, steps, args, network):
             only_property_sections=not args.all_sections, allow_lookup=network,
             refresh_llm=args.refresh_llm, dictionary=dictionary, resolve=resolve,
             paper_slug=pap.slug)
+        cited = refs.cited_numbers(rows, used_for)
+        reference_map = refs.resolve_cited(reference_map, pap, cited, network=network)
+        refs.refill(rows, reference_map, pap.key)
+        refs.refill(used_for, reference_map, pap.key)
         store.write(rows, "sections_llm", pap, model=LLMMeasurement)
         store.write(rejected, "sections_llm_rejected", pap, model=LLMMeasurement)
         # Appended to whatever the table and paper routes wrote, not replacing it:
@@ -177,6 +187,9 @@ def _run_paper(path, steps, args, network):
         store.write(keep + [r.model_dump() for r in used_for], "applications", pap,
                     model=_AppRow)
 
+    if reference_map is not None:
+        # Every reference as the paper printed it; only cited ones were looked up.
+        store.write(refs.to_rows(reference_map, pap.key), "references", pap)
     return pap
 
 def _log_timing(slug, steps, seconds):

@@ -16,11 +16,12 @@ backwards-compatible and the original XML metadata is never overwritten.
 """
 import html
 import json
+import re
 import time
 
 import requests
 
-from . import config, paper as paper_mod
+from . import config, paper as paper_mod, xml_utils
 from .schema import ReferenceRow
 
 
@@ -300,7 +301,7 @@ def _title_agreement(a, b):
     return round(len(wa & wb) / len(wa), 3)
 
 
-def resolve_all(reference_map, paper, cache=None, network=True):
+def resolve_all(reference_map, paper, cache=None, network=True, only=None):
     """Fill in DOIs. Entries already flagged _resolved are never re-requested.
 
     A reference that states its own DOI -- JATS `<pub-id pub-id-type="doi">`, which
@@ -319,13 +320,21 @@ def resolve_all(reference_map, paper, cache=None, network=True):
             meta["_resolved"] = True
 
     todo = [n for n, m in reference_map.items() if not m.get("_resolved")]
+    if only is not None:
+        # Only the references some data point cites. The rest of the bibliography
+        # never reaches a data row, and searching Crossref for all of it was ~90% of
+        # the lookups (88% on the 13 validation papers).
+        skipped = len([n for n in todo if n not in only])
+        todo = [n for n in todo if n in only]
+        if skipped:
+            print(f"  resolve: {skipped} uncited reference(s) not looked up")
 
     if not network:
         print(f"  resolve: {len(reference_map) - len(todo)} from cache, "
               f"{len(todo)} unresolved (offline)")
         return reference_map
     if not todo:
-        print(f"  resolve: all {len(reference_map)} references already cached")
+        print(f"  resolve: every needed reference already resolved")
         return reference_map
 
     print(f"  resolve: {len(todo)} of {len(reference_map)} references via Crossref search")
@@ -355,11 +364,13 @@ def resolve_all(reference_map, paper, cache=None, network=True):
     return reference_map
 
 
-def enrich_all(reference_map, paper, cache=None, network=True):
+def enrich_all(reference_map, paper, cache=None, network=True, only=None):
     """Add volume/issue/pages/authoritative authors for every resolved DOI."""
     cache = cache if cache is not None else load_cache(paper, reference_map)
     reference_map = apply_cache(reference_map, cache)
     todo = [n for n, m in reference_map.items() if m.get("doi") and not m.get("_enriched")]
+    if only is not None:
+        todo = [n for n in todo if n in only]
 
     if not network:
         done = sum(1 for m in reference_map.values() if m.get("_enriched"))
@@ -564,3 +575,61 @@ def match_confidence(meta):
     if basis.startswith("journal_volume_page"):
         return "medium" if basis.endswith("+fields") else "low"
     return "low"
+
+
+
+# ---------- only the references that data points cite ----------
+SOURCE_FIELDS = {"doi": "Source_DOIs", "key": "Source_paper_keys", "authors": "Source_authors",
+                 "title": "Source_titles", "journal": "Source_journals",
+                 "volume": "Source_volumes", "issue": "Source_issues",
+                 "pages": "Source_pages", "year": "Source_years"}
+
+
+def _get(row, field):
+    return row.get(field) if isinstance(row, dict) else getattr(row, field, None)
+
+
+def _set(row, field, value):
+    if isinstance(row, dict):
+        if field in row:
+            row[field] = value
+    elif hasattr(row, field):
+        setattr(row, field, value)
+
+
+def ref_numbers_of(row):
+    """The reference numbers a row cites, from its Source_ref_numbers. -> set[int]."""
+    text = str(_get(row, "Source_ref_numbers") or "")
+    text = re.sub(r"(?<=\d)\.0\b", "", text)          # "59.0" written by pandas
+    return set(xml_utils.expand_ref_field(text))
+
+
+def cited_numbers(*groups):
+    """Every reference number cited by any row in the groups. -> set[int]."""
+    out = set()
+    for rows in groups:
+        for row in rows or []:
+            out |= ref_numbers_of(row)
+    return out
+
+
+def resolve_cited(reference_map, paper, numbers, network=True):
+    """Crossref search and metadata for the cited references only. -> reference_map."""
+    if reference_map is None:
+        return reference_map
+    numbers = set(numbers)
+    print(f"  references: {len(numbers)} of {len(reference_map)} cited by data points")
+    reference_map = resolve_all(reference_map, paper, network=network, only=numbers)
+    return enrich_all(reference_map, paper, network=network, only=numbers)
+
+
+def refill(rows, reference_map, owner_key):
+    """Recompute every Source_* field from Source_ref_numbers, after resolution."""
+    for row in rows or []:
+        numbers = sorted(ref_numbers_of(row))
+        if not numbers:
+            continue
+        cited = sources(numbers, reference_map, owner_key)
+        for meta_key, field in SOURCE_FIELDS.items():
+            _set(row, field, cited.get(meta_key, ""))
+    return rows

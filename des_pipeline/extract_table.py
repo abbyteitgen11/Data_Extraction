@@ -159,6 +159,7 @@ class ParsedCell:
     ref_numbers: tuple = ()              # from an inline "(ref. 22)"
     note: str = ""                       # why nothing parsed, for the skipped-cell audit
     status: str = ""                     # keeps the row out of the graph
+    superscript: str = ""                # a trailing superscript the legend left undefined
 
 
 _UNCERTAINTY = re.compile(r"^\s*([-−+]?[\d.,]+)\s*(?:±|\+/-|\+-)\s*([\d.,]+)")
@@ -250,6 +251,42 @@ def parse_measurement_cell(text, markers=(), profile=None):
     return out
 
 
+def strip_undefined_superscript(text, markers):
+    """'−54gt' with superscript 'gt' -> ('−54', 'gt'). -> (text, '') when there is none.
+
+    A superscript the legend never defines still sits in the cell text once flattened,
+    and made Jablonský's freezing points ("−54ᵍᵗ") unreadable for every model. Only a
+    TRAILING superscript is removed, and only when what remains is a number: the
+    superscript is kept as a note, never interpreted.
+    """
+    raw = str(text or "").strip()
+    for marker in sorted((m for m in markers or () if m), key=len, reverse=True):
+        if raw.endswith(marker) and len(raw) > len(marker):
+            rest = raw[:-len(marker)].strip()
+            if re.match(r"^[<>~≈≤≥]?\s*[-−+]?\d", rest):
+                return rest, marker
+    return raw, ""
+
+
+def marker_property(table, marker, default):
+    """The property a cell's superscript says it is, else `default`.
+
+    Jablonský Table 3 prints "−54ᵍᵗ" in its freezing-point column and defines, in the
+    caption rather than the legend, "gt = glass transition temperature": that value is a
+    glass transition. Only a meaning that names a vocabulary property counts.
+    """
+    if not marker:
+        return default
+    text = f"{table.caption or ''} {table.footnotes or ''}"
+    match = re.search(rf"(?<![\w]){re.escape(marker)}\s*[=:–—]\s*([^;,.)]+)", text)
+    if not match:
+        return default
+    for prop, pattern in config.PROPERTY_SECTION_KEYWORDS:
+        if re.search(pattern, match.group(1), re.I) and prop in config.PROPERTY_UNITS:
+            return prop
+    return default
+
+
 def read_value(cell, column, profile):
     """One property cell -> (value, temperature_C, marker, note).
 
@@ -302,6 +339,14 @@ def read_cell(cell, column, profile):
         text = raw[:-len(marker)]
 
     parsed = parse_measurement_cell(text, cell.markers, profile)
+    if parsed.value is None and parsed.low is None:
+        stripped, undefined = strip_undefined_superscript(text, cell.markers)
+        if undefined:
+            parsed = parse_measurement_cell(stripped, (), profile)
+            if parsed.value is not None or parsed.low is not None:
+                parsed.superscript = undefined
+                parsed.note = (f"superscript {undefined!r} not defined by the legend; "
+                               f"read the number without it")
     if parsed.value is None and parsed.low is None:
         return parsed, marker, None, "unstated"
 
@@ -544,6 +589,8 @@ def extract_paneled_table(table, profile, paper, reference_map, dictionary=None,
 
             comp = compose([label], dictionary=dictionary, resolve=resolve,
                            implied=profile.implied_components or ())
+            if dictionary is not None:
+                dictionary.canonicalize(comp)
             problem = _refusal(comp, dictionary, strict)
             if problem:
                 skipped.append({"Table_id": table.id, "Source_row": index,
@@ -603,6 +650,21 @@ def extract_definitions(table, profile, paper, resolve=None, dictionary=None):
         # anywhere in the paper would otherwise resolve to it.
         if not label or not re.search(r"[A-Za-z]", label):
             label = comp.label()
+        variants = [r.strip() for r in comp.ratio_raw.split(",")] \
+            if "several ratios listed" in "; ".join(comp.notes) else []
+        if variants:
+            # "ChCl:Gly" at 1:2 and 1:3 are two DES; the code names both.
+            import copy
+
+            for ratio in variants:
+                one = copy.deepcopy(comp)
+                one.ratio_raw = ratio
+                one.parts = [float(x) for x in ratio.split(":")]
+                one.notes = [n for n in one.notes if "several ratios" not in n]
+                one.ratio_source = "as_written"
+                one.ratio_molar = ratio if len(one.parts) == one.n_non_water else ""
+                out.setdefault(f"{label} ({ratio})", one)
+            continue
         out.setdefault(label, comp)
     return out
 
@@ -683,14 +745,20 @@ def extract_property_table(table, profile, paper, reference_map, dictionary=None
                                     "reason": parsed.note,
                                     "raw": row[column.index].text[:120]})
                 continue
-            fields = measurement_fields(parsed, column, table, column.property,
+            prop = marker_property(table, parsed.superscript, column.property)
+            if prop != column.property:
+                parsed.note = (f"superscript {parsed.superscript!r} marks it as "
+                               f"{prop} (defined in the caption/legend)")
+            fields = measurement_fields(parsed, column, table, prop,
                                         temperature, source, solute)
-            suffix = column.property.lower()
-            record[column.property] = fields["Value"]
+            if parsed.ref_numbers or _LITERATURE.search(_printed(table, column)):
+                fields["Literature_value"] = True
+            suffix = prop.lower()
+            record[prop] = fields["Value"]
             record[f"Units_{suffix}"] = fields["Unit"]
             record[f"Temperature_{suffix}"] = fields["Temperature_C"]
             record[f"Source_col_{suffix}"] = column.index
-            pending[column.property] = fields
+            pending[prop] = fields
             found += 1
         if not found:
             continue
@@ -845,7 +913,7 @@ def dedup_key(components, ratio, prop, value, temperature, primary_doi, solute="
     ])
 
 
-def to_measurements(rows, paper, extras=None):
+def to_measurements(rows, paper, extras=None, reference_map=None):
     """Flatten wide mixture rows into one MeasurementRow per reported value.
 
     `extras` supplies what the wide row has no column for -- the as-written value, the
@@ -887,14 +955,46 @@ def to_measurements(rows, paper, extras=None):
             }
             # A citation written inside the value cell -- "285.15 (ref. 22)" -- attributes
             # that one number, which is more specific than the row's reference column.
+            primary_doi = mixture.Source_DOIs
             if inline_refs:
                 fields["Source_ref_numbers"] = ",".join(str(n) for n in inline_refs)
+                cited = sources(list(inline_refs), reference_map or {}, paper.key)
+                fields["Source_DOIs"], fields["Source_paper_keys"] = cited["doi"], cited["key"]
+                primary_doi = cited["doi"]
+            fields.update(_temperature_plausibility(name, fields))
+            # The datum's identity includes the study it came from, so a literature value
+            # merges with the same value from that study reported anywhere else.
             fields["Dedup_key"] = dedup_key(
                 [mixture.Component_1, mixture.Component_2, mixture.Component_3],
                 mixture.Ratio_molar or mixture.Ratio_raw, name, fields["Value"],
-                fields["Temperature_C"], mixture.Source_DOIs, fields.get("Solute", ""))
+                fields["Temperature_C"], primary_doi, fields.get("Solute", ""))
             out.append(MeasurementRow(**fields))
     return out
+
+
+def _temperature_plausibility(prop, fields):
+    """Catch a kelvin temperature read as Celsius. -> fields to update ({} if fine).
+
+    The measuring temperature of a DES property is never below -100 C or above 200 C
+    in this literature (the 13 validation papers stop at ~150 C); 298 "C" is 298 K that
+    nobody converted. A melting, boiling,
+    decomposition or glass-transition VALUE of 200 C or more written in C (or with no
+    unit) is the same mistake on the value side -- real DES rarely melt that high, and
+    a kelvin header does convert (`units.to_canonical`), so this flags rather than
+    rewrites. Both stay in the data with plausible = False and go to the review queue.
+    """
+    notes = [fields.get("plausibility_note")] if fields.get("plausibility_note") else []
+    t = fields.get("Temperature_C")
+    if t is not None and not -100 <= float(t) <= 200:
+        notes.append(f"measuring temperature {t} C implausible -- kelvin?")
+    value = fields.get("Value")
+    if prop in config.PHASE_TRANSITION_PROPERTIES and value is not None \
+            and float(value) >= 200 and \
+            str(fields.get("Unit_as_written") or "").strip().upper() in ("", "C", "°C", "OC"):
+        notes.append(f"{prop} {value} C written in Celsius: a kelvin value?")
+    if len(notes) == (1 if fields.get("plausibility_note") else 0):
+        return {}
+    return {"plausible": False, "plausibility_note": "; ".join(notes)}
 
 
 def _plausibility(prop, value):
@@ -951,7 +1051,20 @@ def extract_tables(tables, profiles, paper, reference_map, dictionary=None, reso
               f"{f' [{profile.layout}]' if profile.layout != 'wide_per_mixture' else ''}"
               f"{f', {len(refused)} refused (not a DES)' if refused else ''}"
               f"{f', {len(bad) - len(refused)} unreadable' if len(bad) > len(refused) else ''}")
-    measurements = to_measurements(mixtures, paper, extras)
+    # Measurements are built by `finish_measurements` once the cited references have
+    # been resolved, because a datum's identity (Dedup_key) includes its source's DOI.
+    return mixtures, extras, skipped, stats
+
+
+def inline_ref_numbers(extras):
+    """Reference numbers cited inside value cells ("1.1979 (ref. 22)"). -> set[int]."""
+    return {int(n) for fields in (extras or {}).values()
+            for n in (fields.get("_inline_refs") or ())}
+
+
+def finish_measurements(mixtures, extras, paper, reference_map):
+    """The long view, built after reference resolution. -> list[MeasurementRow]."""
+    measurements = to_measurements(mixtures, paper, extras, reference_map)
     held = [m for m in measurements if m.status != "ok"]
     if held:
         import collections
@@ -959,7 +1072,7 @@ def extract_tables(tables, profiles, paper, reference_map, dictionary=None, reso
         why = collections.Counter(m.status for m in held)
         print(f"    {len(held)} measurement(s) written but not loadable: "
               + ", ".join(f"{k} {v}" for k, v in why.most_common()))
-    return mixtures, measurements, skipped, stats
+    return measurements
 
 
 EXTRACTED_TYPES = {"des_properties", "des_application", "des_definitions"}
@@ -990,6 +1103,10 @@ def unhandled(tables, profiles, problems):
                             status=reason))
     return out
 
+
+# A column of values taken from the literature, printed beside the paper's own:
+# Azad's Table 2 sub-headers read "Exp" and "Lit".
+_LITERATURE = re.compile(r"\blit(\.|erature)?\b|\blit\s*value", re.I)
 
 # A context column that is really the water content the DES was made with.
 _WATER_FIELD = re.compile(r"\bwater\b|\bh2o\b|moisture", re.I)
@@ -1041,6 +1158,11 @@ def row_composition(row, table, profile, dictionary=None, resolve=None):
     code_cols = by_role.get("mixture", []) if by_role.get("component") else []
     name_cols = by_role.get("component", []) or by_role.get("mixture", [])
     cells = [row[c.index].text for c in name_cols if c.index < len(row)]
+    if not any(c.strip() and c.strip() not in config.DASH for c in cells) and code_cols:
+        # Component columns exist but this row leaves them empty and writes the DES in
+        # the mixture column instead (Anđelović Table 1: "Choline chloride:glycerol").
+        cells = [row[c.index].text for c in code_cols if c.index < len(row)]
+        code_cols = []
     code = next((row[c.index].text.strip() for c in code_cols
                  if c.index < len(row) and row[c.index].text.strip()
                  and row[c.index].text.strip() not in config.DASH), "")
@@ -1049,7 +1171,15 @@ def row_composition(row, table, profile, dictionary=None, resolve=None):
     for column in by_role.get("ratio", []):
         if column.index >= len(row):
             continue
-        text, this_flag = _strip_ratio_markers(row[column.index], profile)
+        cell = row[column.index]
+        lines = [l.strip() for l in (cell.lines or ()) if l.strip()]
+        if len(lines) > 1 and all(re.fullmatch(r"\d+(\.\d+)?(\s*:\s*\d+(\.\d+)?)+", l)
+                                  for l in lines):
+            # Several ratios on separate lines ("1:2" / "1:3"): several variants of one
+            # DES. Flattened they read "1:21:3"; listed, composition notes them.
+            text, this_flag = "(" + ", ".join(lines) + ")", ""
+        else:
+            text, this_flag = _strip_ratio_markers(cell, profile)
         flag = flag or this_flag
         if text and text not in config.DASH:
             ratio_parts.append(text)
@@ -1069,6 +1199,8 @@ def row_composition(row, table, profile, dictionary=None, resolve=None):
                    implied=profile.implied_components or ())
     if code and not comp.code:
         comp.code = code
+    if dictionary is not None:
+        dictionary.canonicalize(comp)
     return comp, flag
 
 

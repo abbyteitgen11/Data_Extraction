@@ -174,6 +174,10 @@ class MeasurementRow(BaseModel):
     # says nothing and must not merge with another solute's through Dedup_key.
     Solute: str = ""
     Basis: str = ""                         # per_gram | per_mole | ET30 | pi_star | ...
+    # A literature value a research paper prints beside its own ("Lit" column, or a
+    # cell carrying "(ref. 22)"). Loaded, but attributed to the cited paper, never to
+    # the paper that reprinted it.
+    Literature_value: bool = False
 
     Source: str = ""                     # provenance: where in the paper
     Source_ref_numbers: str = ""

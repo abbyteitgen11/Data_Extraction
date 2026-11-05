@@ -238,6 +238,13 @@ def basis_of(prop, printed):
 # bar labelled Density, a conversion in % labelled pH, a solvation energy in kcal/mol
 # labelled Solubility, a cavity volume in cubic angstroms labelled Solubility.
 _DIMENSIONS = (
+    # Quantities DES papers tabulate beside DES properties, none of them DES properties:
+    # Azad's speed of sound (labelled Viscosity), Dinh's Li+ diffusion coefficients and
+    # specific capacities, current densities, molar masses.
+    ("velocity", r"^(m|cm|km)(s-1|/s)$"),
+    ("diffusion coefficient", r"^(cm|m|mm)2(s-1|/s)$"),
+    ("specific capacity", r"^mah(g-1|/g)$|^mahg"),
+    ("current density", r"^(m|μ|u)?a(cm-2|/cm2)$"),
     ("pressure", r"^(bar|kbar|mbar|kpa|mpa|gpa|pa|atm|psi|mmhg|torr)$"),
     ("energy", r"kcal|kj|^j$|jmol|j/mol|^ev$|kt$"),
     ("percentage", r"%|percent|ppm|ppb"),

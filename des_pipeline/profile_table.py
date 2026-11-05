@@ -264,7 +264,7 @@ def _numeric_fraction(table, index, profile, sample=250):
     property tables were lost that way. A check that disagrees with the reader it guards
     rejects exactly the cells the reader would have handled.
     """
-    from .extract_table import parse_measurement_cell
+    from .extract_table import parse_measurement_cell, strip_undefined_superscript
 
     missing = set(profile.missing_value_tokens) | set(config.DASH)
     markers = {m.marker for m in profile.footnote_markers}
@@ -286,6 +286,10 @@ def _numeric_fraction(table, index, profile, sample=250):
                 stripped = stripped[:-len(marker)]
                 break
         parsed = parse_measurement_cell(stripped, row[index].markers, profile)
+        if parsed.value is None and parsed.low is None:
+            rest, undefined = strip_undefined_superscript(stripped, row[index].markers)
+            if undefined:
+                parsed = parse_measurement_cell(rest, (), profile)
         if parsed.value is not None or parsed.low is not None:
             numeric += 1
     return (numeric / checked if checked else 0.0), checked
@@ -422,8 +426,11 @@ def _marker_temperature_problems(profile, table):
         if marker.meaning != "temperature" or marker.temperature_C is None:
             continue
         value = float(marker.temperature_C)
-        # Accept the number however the legend might reasonably write it.
-        spellings = {f"{value:g}", f"{value:.0f}", f"{value:.1f}"}
+        # Accept the number however the legend might reasonably write it -- in C, or in
+        # K (repair() converts a marker the model returned in kelvin).
+        kelvin = value + 273.15
+        spellings = {f"{value:g}", f"{value:.0f}", f"{value:.1f}",
+                     f"{kelvin:g}", f"{kelvin:.0f}", f"{kelvin:.1f}", f"{kelvin:.2f}"}
         if any(re.search(rf"(?<!\d){re.escape(t)}(?!\d)", legend) for t in spellings):
             continue
         problems.append(
@@ -540,7 +547,59 @@ def _fix_ratio_columns(profile, table):
     return notes
 
 
-def repair(profile, table):
+_REAGENT_HEADER = re.compile(r"^\s*(alcohols?|acids?|substrates?|reagents?|reactants?|"
+                             r"feedstocks?|products?|analytes?|drugs?|solutes?|monomers?|"
+                             r"initiators?|biomass( source)?|target( compound)?s?)\b", re.I)
+_BASED_ON = re.compile(r"\b([A-Za-z][A-Za-z0-9+\-]{1,15})[\s-]+based\s+"
+                       r"(?:DESs?|NADESs?|deep\s+eutectic)", re.I)
+
+
+def caption_implied(tables):
+    """What each caption says every DES contains: "PTSA based DES" -> {table id: PTSA}.
+
+    The spelling is the paper's most common one across its captions, so the two
+    "PSTA based DES" captions in Canela-Xandri take the "PTSA" the other five use.
+    """
+    found = {}
+    for table in tables:
+        match = _BASED_ON.search(f"{table.caption} {table.footnotes}")
+        if match and match.group(1).lower() not in ("water", "des", "the", "solvent"):
+            found[table.id] = match.group(1)
+    spellings = {}
+    for name in found.values():
+        spellings.setdefault("".join(sorted(name.lower())), []).append(name)
+    best = {k: max(set(v), key=v.count) for k, v in spellings.items()}
+    return {t: best["".join(sorted(n.lower()))] for t, n in found.items()}
+
+
+def _fix_reagent_columns(profile, table):
+    """A column of what the DES acts ON is not a constituent of the DES.
+
+    Canela-Xandri's Table 2 is "Entry | HBA | Alcohol | Acid | Ref.": the alcohol and
+    the acid are what the esterification consumes. Labelling them components made the
+    solvent BTMAC:MeOH:Acetic acid. In a table with application content, a component
+    column headed alcohol / acid / substrate / product / analyte / drug / solute /
+    monomer / biomass becomes context -- but only while something else still names the
+    DES (another component column, or a caption-implied component).
+    """
+    if "des_application" not in profile.content_types:
+        return []
+    components = [c for c in profile.columns if c.role in ("component", "mixture")]
+    reagents = [c for c in components
+                if _REAGENT_HEADER.search(" ".join(table.column(c.index)) or c.header)]
+    others = [c for c in components if c not in reagents]
+    if not reagents or not (others or profile.implied_components):
+        return []
+    notes = []
+    for column in reagents:
+        column.role = "context"
+        column.context_field = column.context_field or _snake(column.header)
+        notes.append(f"col {column.index} ({column.header!r}) is what the DES acts on, "
+                     f"not a constituent -- read as context")
+    return notes
+
+
+def repair(profile, table, implied_hint=""):
     """Demote labels that cannot be right, rather than failing the whole table. In place.
 
     Every demotion is evidence-based and reported (the notes go into the table ledger):
@@ -556,7 +615,16 @@ def repair(profile, table):
       * a context column naming each row's DES, in a table with no component column ->
         mixture, so the rows have an identity.
     """
-    notes = _fix_numeric_name_columns(profile, table)
+    notes = []
+    if implied_hint and not profile.implied_components:
+        names = [c for c in profile.columns if c.role in ("component", "mixture")]
+        if len(names) <= 1 or "des_application" in profile.content_types:
+            profile.implied_components = [implied_hint]
+            match = _BASED_ON.search(f"{table.caption} {table.footnotes}")
+            profile.implied_from = match.group(0) if match else implied_hint
+            notes.append(f"caption implies {implied_hint!r} in every DES; the model did "
+                         f"not say so -- added")
+    notes += _fix_numeric_name_columns(profile, table)
     notes += _fix_condition_columns(profile, table)
     notes += _fix_ratio_columns(profile, table)
     for column in profile.columns:
@@ -604,6 +672,20 @@ def repair(profile, table):
             if marker and m.marker == marker.group(1) and m.meaning == "temperature":
                 m.meaning, m.temperature_C = "other", None
                 notes.append(f"{message[:120]} -- marker kept, temperature dropped")
+    # A measuring temperature of 200+ "C" is a kelvin value the model did not convert
+    # ("at 298 K" in a caption returned as 298). No DES property table is measured at
+    # 200+ C, so the conversion is safe and is reported.
+    if profile.default_temperature_C is not None and profile.default_temperature_C >= 200:
+        kelvin = profile.default_temperature_C
+        profile.default_temperature_C = round(kelvin - 273.15, 2)
+        notes.append(f"default temperature {kelvin:g} read as kelvin -> "
+                     f"{profile.default_temperature_C:g} C")
+    for m in profile.footnote_markers:
+        if m.meaning == "temperature" and m.temperature_C is not None \
+                and m.temperature_C >= 200:
+            notes.append(f"marker {m.marker!r} temperature {m.temperature_C:g} read as "
+                         f"kelvin -> {m.temperature_C - 273.15:g} C")
+            m.temperature_C = round(m.temperature_C - 273.15, 2)
     defined = [m for m in profile.footnote_markers
                if not m.marker or m.marker in (table.footnotes or "")]
     dropped = [m.marker for m in profile.footnote_markers if m not in defined]
@@ -612,6 +694,7 @@ def repair(profile, table):
                      f"the table's legend does not define them")
         profile.footnote_markers = defined
     notes += _fix_mixture_columns(profile, table)
+    notes += _fix_reagent_columns(profile, table)
     # An implied component the caption does not state is dropped, not fatal: Azad's
     # model-parameter tables were failed outright because the model "implied" water and
     # the dissolved drug. The rest of the profile is still checkable on its own.
@@ -828,7 +911,8 @@ def worth_profiling(table):
     return False, "no numeric cell and no chemical name anywhere in the table"
 
 
-def profile_table(table, paper=None, backend=None, refresh=False, paragraphs=None):
+def profile_table(table, paper=None, backend=None, refresh=False, paragraphs=None,
+                  implied_hint=""):
     """-> (TableProfile | None, problems, was_cached, digest, repairs).
 
     Mutates `table` when its header had to be recovered from the data rows -- the same
@@ -869,7 +953,7 @@ def profile_table(table, paper=None, backend=None, refresh=False, paragraphs=Non
     if moved:
         print(f"      no header markup: promoted {moved} leading row(s) into the header")
 
-    profile, repairs = repair(profile, table)
+    profile, repairs = repair(profile, table, implied_hint)
     for note in repairs:
         print(f"      {note}")
     return profile, validate(profile, table), was_cached, digest, repairs
@@ -877,14 +961,20 @@ def profile_table(table, paper=None, backend=None, refresh=False, paragraphs=Non
 
 def profile_tables(tables, paper=None, backend=None, refresh=False, paragraphs=None):
     """-> ({id: TableProfile}, {id: problems}, {id: repair notes}, {id: failed profile})."""
+    from .extract_text_llm import map_calls
+
     profiles, problems, cards, repairs, failed = {}, {}, {}, {}, {}
     hits = skipped = 0
-    for table in tables:
+    # Each table is independent, so with the API backend they are asked in parallel;
+    # map_calls keeps ollama sequential and returns results in table order.
+    implied = caption_implied(tables)
+    results = map_calls(lambda t: (t, profile_table(t, paper, backend, refresh,
+                                                    paragraphs, implied.get(t.id, ""))),
+                        tables, backend)
+    for table, (profile, issues, was_cached, digest, notes) in results:
         # The digest comes back from profile_table rather than being recomputed here.
         # Rebuilding the card cost a second full render of every table, and after header
         # promotion it no longer even described the same table.
-        profile, issues, was_cached, digest, notes = profile_table(
-            table, paper, backend, refresh, paragraphs)
         hits += was_cached
         cards[table.id] = digest
         if notes:

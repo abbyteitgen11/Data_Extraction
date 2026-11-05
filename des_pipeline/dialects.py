@@ -135,7 +135,10 @@ def _cell(el, break_tag="break"):
         return Cell()
     # <break/> separates several values in one cell; itertext() would fuse them into
     # "ChChl:MA (1:1)ChChl:GLY (1:2)".
-    parts, buffer = [], []
+    # The element's own leading text belongs to the FIRST line. It used to be inserted
+    # after the walk, i.e. into whatever line the last <break/> had started, so
+    # "1:2<break/>1:3" read as the single line "1:21:3".
+    parts, buffer = [], [el.text or ""]
     def walk(node):
         if node.tag == break_tag:
             parts.append("".join(buffer)); buffer.clear()
@@ -148,8 +151,6 @@ def _cell(el, break_tag="break"):
             buffer.append(node.tail)
     for child in el:
         walk(child)
-    if el.text:
-        buffer.insert(0, el.text)
     parts.append("".join(buffer))
 
     lines = tuple(re.sub(r"\s+", " ", p).strip() for p in parts if p and p.strip())

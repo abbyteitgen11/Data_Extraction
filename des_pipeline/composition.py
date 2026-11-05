@@ -63,6 +63,11 @@ _RATIO_HEADER = re.compile(r"ratio", re.I)
 # Group-contribution fragments and other notation that is not a chemical name:
 # "-CH3", ">N-", "=O", "-OH (Alcohol)".
 _FRAGMENT = re.compile(r"^\s*[-–>=<]")
+# Generic symbols a review uses to describe CLASSES of DES ("Cat+X- zMClx", "HBA:HBD"),
+# not compounds: Sadeghi's Table 1 "Types of eutectics" was being read as DES.
+_PLACEHOLDER = re.compile(r"^\s*(cat(ion)?\+?|an(ion)?-?|x\s*[−-]|hb[ad]s?|rz|salts?|"
+                          r"metal( salts?|s)?|z?\s*m\s*cl\s*x.*|y\s*h2o)\s*$|^\s*x\s*[−-]",
+                          re.I)
 # A stoichiometric coefficient on a name: "2PTSA" (see extract_table.split_coefficient).
 _COEFFICIENT = re.compile(r"^(\d{1,2})([A-Za-z\[].*)$")
 
@@ -105,9 +110,19 @@ class Composition:
         return self.ratio_molar or self.ratio_raw
 
     def label(self):
-        names = ":".join(c for c in self.components if c)
+        """'A:B (1:2)'; water or an additive that could not join the molar ratio is
+        written out -- 'A:B (1:2) + 20 wt% water' -- rather than silently dropped."""
+        computed = self.ratio_source == "computed"
+        extra = {} if computed else dict(self.additives)
+        if self.water_fraction is not None and not computed:
+            extra["water"] = (self.water_fraction, self.water_basis)
+        names = ":".join(c for c in self.components
+                         if c and not (c in extra or (is_water(c) and "water" in extra)))
         ratio = self.ratio_molar or self.ratio_raw
-        return f"{names} ({ratio})" if ratio else names
+        text = f"{names} ({ratio})" if ratio else names
+        for name, (fraction, basis) in extra.items():
+            text += f" + {fraction * 100:g} {basis or ''}% {name}".replace("  ", " ")
+        return text
 
     def note(self, text):
         if text not in self.notes:
@@ -159,6 +174,29 @@ def molecular_weight(name):
                 if matched:
                     _MW.setdefault(matched, float(mw))
     return _MW.get(str(name or "").strip().lower())
+
+
+_CID_NAMES = None
+
+
+def _cid_names():
+    """Lower-case names and 5+ character synonyms PubChem knows, from the shared cache."""
+    global _CID_NAMES
+    if _CID_NAMES is None:
+        _CID_NAMES = set()
+        try:
+            cache = json.loads(config.COMPONENT_CACHE.read_text())
+        except (OSError, ValueError):
+            cache = {}
+        for name, row in cache.items():
+            if not row or row.get("lookup_status") != "ok":
+                continue
+            for text in [name, row.get("matched_name") or ""] + \
+                    str(row.get("synonyms") or "").split(";"):
+                text = text.strip().lower()
+                if len(text) >= 5:
+                    _CID_NAMES.add(text)
+    return _CID_NAMES
 
 
 # ---------- splitting a mixture string into names ----------
@@ -296,10 +334,14 @@ def parse_mixture(text, dictionary=None, resolve=None):
         if entry is not None:
             out = copy.deepcopy(entry)
             out.written = raw
-            if comp.ratio_raw and not out.ratio_raw:
+            if comp.ratio_raw and comp.ratio_raw != out.ratio_raw:
+                # The ratio written with the code ("ChCl:Gly (1:2)") is this row's own
+                # and wins over the definition's, which may list several variants.
                 out.ratio_raw = comp.ratio_raw
-                out.parts = _ratio_parts(comp.ratio_raw)
+                out.parts = _ratio_parts(comp.ratio_raw) if not listed else []
+                out.ratio_molar = ""
                 out.ratio_source = "as_written"
+                out.notes = [n for n in out.notes if "several ratios" not in n]
             out.water_fraction = comp.water_fraction if comp.water_fraction is not None \
                 else out.water_fraction
             out.water_basis = comp.water_basis or out.water_basis
@@ -401,6 +443,12 @@ def compose(cells, ratio_text="", ratio_header="", water_text="", water_header="
             out.note(f"{name} implied by the caption")
 
     if ratio_text:
+        listed = _RATIO_LIST.fullmatch(str(ratio_text).strip())
+        if listed:
+            out.ratio_raw = listed.group(1)
+            out.note("several ratios listed; not resolved to one")
+            ratio_text = ""
+    if ratio_text:
         cell = Composition()
         rest = _strip_additives(str(ratio_text), cell)
         if cell.water_fraction is not None:
@@ -422,11 +470,27 @@ def compose(cells, ratio_text="", ratio_header="", water_text="", water_header="
             out.note(f"ratio cell not a molar ratio: {ratio!r}")
 
     if water_text and str(water_text).strip() not in config.DASH:
-        number = xml_utils.clean_number(re.sub(r"[%\s]|wt|w/w|v/v", "", str(water_text)))
-        if number is not None:
-            # A water column holds a percentage unless its numbers say otherwise.
-            out.water_fraction = number / 100 if number > 1 else number
-            out.water_basis = basis_of(f"{water_header} {water_text}")
+        stated = f"{water_header} {water_text}"
+        listed = re.fullmatch(r"\s*\d+(?:\.\d+)?(?:\s*[,;/]\s*\d+(?:\.\d+)?)+\s*",
+                              str(water_text))
+        number = None if listed else xml_utils.clean_number(
+            re.sub(r"[%\s]|wt|w/w|v/v", "", str(water_text)))
+        # A "%" or a weight/volume/mole basis means a fraction, whatever the size of the
+        # number (Azad prints "0.06%"). A bare number at or below 1 is a fraction too.
+        # A bare number above 1 is NOT assumed to be a percent: Canela-Xandri's "H2O"
+        # column holds 1, 2, 3 -- equivalents of water, not 100-300 wt%.
+        percent = bool(re.search(r"%|wt|w/w|v/v|vol|mass|weight|mol\s*frac", stated, re.I))
+        if listed:
+            out.note(f"several water amounts listed: {str(water_text).strip()!r}")
+        elif number is not None and (percent or number <= 1):
+            out.water_fraction = number / 100 if "%" in stated or number > 1 else number
+            out.water_basis = basis_of(stated)
+        elif number is not None:
+            out.note(f"water amount {str(water_text).strip()!r} has no unit "
+                     f"(molar equivalents?); not converted")
+        if (listed or number is not None) and not any(is_water(c) for c in out.components):
+            out.components.append("Water")
+            out.components_written.append("water")
     finish(out)
     return out
 
@@ -469,6 +533,7 @@ def finish(comp):
     if any(w is None for w in weights):
         missing = [c for c, w in zip(base, weights) if w is None]
         comp.note(f"no molecular weight for {', '.join(missing)}; molar ratio not computed")
+        comp.note(_extra_note(extra))
         return comp
     unit_mass = sum(p * w for p, w in zip(parts, weights))
     molar = list(parts)
@@ -476,10 +541,12 @@ def finish(comp):
     for name, (fraction, basis) in extra.items():
         if basis != "wt" or not 0 < fraction < 1:
             comp.note(f"{name} given on a {basis or 'unknown'} basis; molar ratio not computed")
+            comp.note(_extra_note(extra))
             return comp
         mw = molecular_weight(name)
         if mw is None:
             comp.note(f"no molecular weight for {name}; molar ratio not computed")
+            comp.note(_extra_note(extra))
             return comp
         # fraction of the TOTAL mass: m_x = f/(1-f) * (mass of everything else)
         molar.append(fraction / (1 - fraction) * unit_mass / mw)
@@ -490,6 +557,12 @@ def finish(comp):
     comp.ratio_source = "computed"
     comp.note("molar ratio computed from weight fractions with PubChem molecular weights")
     return comp
+
+
+def _extra_note(extra):
+    """'water 20 wt%, EC 10 wt%' -- what could not be put into the molar ratio."""
+    return "kept as written: " + ", ".join(
+        f"{name} {fraction * 100:g} {basis or '?'}%" for name, (fraction, basis) in extra.items())
 
 
 # ---------- is this a DES at all? ----------
@@ -527,6 +600,8 @@ def des_problem(comp, dictionary=None):
         return "no components"
     if any(_FRAGMENT.match(c) for c in names):
         return "a structural fragment, not a compound"
+    if any(_PLACEHOLDER.match(c) for c in names):
+        return "a generic placeholder (Cat, X-, HBD, MClx...), not a compound"
     if is_ionic_liquid_only(comp):
         return "a single ionic liquid, not a DES"
     # Water counts as a constituent when it is listed as one, with its own molar share
