@@ -42,6 +42,8 @@ NOTES = [
     "from it (ledger status 'extracted'), matching 'should be extracted'.",
     "Literature values reprinted in a research paper's table (Lit column or "
     "'(ref. N)') are kept in the data; not in the gold, so unscored extras.",
+    "des_dictionary.csv: a code that is only a generated 'A:B' label is not compared "
+    "(the gold kept the labels of the run it reviewed; Canela PTSA rows).",
     "columns.csv: only columns with a known label (correct/fix) are scored; 'wrong' "
     "marks columns of not-relevant tables (and Sadeghi Table 2 col 2, left unlabelled).",
 ]

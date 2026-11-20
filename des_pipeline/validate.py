@@ -283,7 +283,9 @@ def duplicate_report():
     for key, members in groups.items():
         if len(members) < 2:
             continue
-        values = {round(float(m["Value"]), 6) for m in members}
+        # A range-only row ("10-20") has no single Value.
+        values = {round(float(m["Value"]), 6) for m in members
+                  if m.get("Value") not in (None, "")}
         papers_involved = sorted({m.get("Paper_key") for m in members})
         out.append({
             "Dedup_key": key,

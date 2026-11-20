@@ -19,7 +19,7 @@ from pathlib import Path
 
 from des_pipeline import (config, dialects, paper as paper_mod, profile_table, router,
                           store, xml_utils)
-from des_pipeline.extract_text_llm import BudgetExceeded
+from des_pipeline.extract_text_llm import BudgetExceeded, Deferred
 
 # Steps that run once per paper. Everything else works on the whole corpus by reading
 # store.read_all(), so it must run after all the papers have been processed.
@@ -289,6 +289,10 @@ def main(argv=None):
             except BudgetExceeded as exc:
                 print(f"  STOPPED: {exc}")
                 break
+            except Deferred:
+                # Batch collect mode: this paper's next calls are queued; it continues
+                # from the cache once the batch has answered them.
+                print(f"  DEFERRED {path.name}: waiting on the batch")
             except Exception as exc:
                 if not args.continue_on_error:
                     raise

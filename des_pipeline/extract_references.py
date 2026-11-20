@@ -202,6 +202,12 @@ def _fields_agree(meta, item):
     return "year" in stated and bool({"volume", "page"} & set(stated))
 
 
+# Returned when every retry failed on the network (offline, DNS, timeouts). Unlike a
+# search with no match, it is not an answer, so the reference is left unresolved and
+# the next run asks again.
+NETWORK_FAILED = "network_failed"
+
+
 def crossref_search(meta, session, max_retries=5):
     """Bibliographic search -> (doi, score, basis, fields_agree). Backs off on 429."""
     query, basis = search_query(meta)
@@ -234,7 +240,7 @@ def crossref_search(meta, session, max_retries=5):
             print(f"    lookup error ref {meta['num']} (attempt {attempt + 1}): {exc}")
             time.sleep(wait)
             wait *= 2
-    return None, 0.0, basis, False
+    return None, 0.0, NETWORK_FAILED, False
 
 
 # ---------- 3. Crossref: full metadata for a known DOI ----------
@@ -285,7 +291,7 @@ def crossref_metadata(doi, session, max_retries=3, shared=None):
         if shared is not None:
             shared[key] = fields
         return fields
-    return None
+    return NETWORK_FAILED
 
 
 # ---------- orchestration ----------
@@ -339,9 +345,13 @@ def resolve_all(reference_map, paper, cache=None, network=True, only=None):
 
     print(f"  resolve: {len(todo)} of {len(reference_map)} references via Crossref search")
     session = requests.Session()
+    failed = 0
     for i, num in enumerate(sorted(todo), 1):
         meta = reference_map[num]
         doi, score, basis, agree = crossref_search(meta, session)
+        if basis == NETWORK_FAILED:
+            failed += 1
+            continue
         # Accept on EITHER a strong relevance score or exact bibliographic agreement.
         # The score is tuned for title queries; year+volume+page agreeing is the better
         # evidence when there is no title to query with.
@@ -359,6 +369,8 @@ def resolve_all(reference_map, paper, cache=None, network=True, only=None):
             print(f"    {i}/{len(todo)} resolved (checkpointed)")
 
     save_cache({**cache, **reference_map}, paper)
+    if failed:
+        print(f"  resolve: {failed} lookup(s) failed on the network; left for the next run")
     have = sum(1 for m in reference_map.values() if m.get("doi"))
     print(f"  resolve: {have}/{len(reference_map)} have a DOI (score >= {config.MIN_MATCH_SCORE})")
     return reference_map
@@ -383,11 +395,14 @@ def enrich_all(reference_map, paper, cache=None, network=True, only=None):
     print(f"  enrich:  {len(todo)} DOIs via Crossref works/{{doi}}")
     session = requests.Session()
     shared = load_crossref_cache()
-    reused = 0
+    reused = failed = 0
     for i, num in enumerate(sorted(todo), 1):
         meta = reference_map[num]
         before = len(shared)
         extra = crossref_metadata(meta["doi"], session, shared=shared)
+        if extra == NETWORK_FAILED:
+            failed += 1
+            continue
         reused += int(len(shared) == before and extra is not None)
         if extra:
             meta.update(extra)
@@ -402,6 +417,8 @@ def enrich_all(reference_map, paper, cache=None, network=True, only=None):
 
     save_cache({**cache, **reference_map}, paper)
     save_crossref_cache(shared)
+    if failed:
+        print(f"  enrich:  {failed} lookup(s) failed on the network; left for the next run")
     if reused:
         print(f"  enrich:  {reused} DOI(s) already known from another paper")
     with_vol = sum(1 for m in reference_map.values() if m.get("volume"))
@@ -426,7 +443,7 @@ def enrich_review(review, paper, network=True, cache=None):
     shared = load_crossref_cache()
     extra = crossref_metadata(review["doi"], requests.Session(), shared=shared)
     save_crossref_cache(shared)
-    if not extra:
+    if not extra or extra == NETWORK_FAILED:
         return review
     merged = {
         "authors": extra["cr_authors"] or review.get("authors", ""),
@@ -482,7 +499,9 @@ def paper_key(meta, owner_key):
     if not owner_key:
         raise ValueError("paper_key requires the owning paper's key; a reference must "
                          "never inherit another paper's identity")
-    return meta.get("doi") or f"{owner_key}#ref{meta['num']}"
+    # Normalised: an inline JATS DOI keeps the publisher's case ("10.1039/C1RA00630D")
+    # while Crossref's is lower case, and the two must be one node.
+    return paper_mod.normalise_doi(meta.get("doi")) or f"{owner_key}#ref{meta['num']}"
 
 
 def numbers_for_ids(ref_ids, reference_map):

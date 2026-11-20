@@ -48,7 +48,7 @@ rather than duplicates. ``--wipe`` is therefore optional.
 """
 import pandas as pd
 
-from . import config
+from . import config, units
 from .extract_table import _hash, mixture_key
 from .config import PROPERTY_NAMES
 
@@ -107,6 +107,27 @@ def _split(value):
     return [v for v in str(value).split(config.SOURCE_SEP) if v]
 
 
+_KEY_FIELDS = ("Paper_key", "Paper_DOI", "Source_paper_keys", "Source_DOIs", "key", "doi")
+
+
+def _doi_keys(rows):
+    """Lower-case every DOI used as a key, in place. -> rows.
+
+    DOIs are case-insensitive; CSVs written before paper_key normalised them carry
+    the publisher's case for inline DOIs, which would give one paper two nodes.
+    """
+    from .paper import normalise_doi
+
+    for r in rows:
+        for field in _KEY_FIELDS:
+            v = r.get(field)
+            if isinstance(v, str) and "10." in v:
+                r[field] = config.SOURCE_SEP.join(
+                    normalise_doi(x) if x.startswith("10.") else x
+                    for x in v.split(config.SOURCE_SEP))
+    return rows
+
+
 def _str(value):
     """Stringify a CSV cell without pandas' float artefacts (2002.0 -> '2002')."""
     if value is None:
@@ -126,6 +147,33 @@ def _canonical(name, mapping):
     if not name:
         return name
     return mapping.get(str(name).strip(), name)
+
+
+def _case_merges(names, mapping):
+    """{spelling: surviving spelling} for names that differ only in case. -> dict.
+
+    "L-Proline", "l-Proline" and "l-proline" are one chemical written three ways; no
+    review is needed to say so. The survivor is a name the reviewed map already
+    chose, else the most-used spelling. Names of three characters or fewer are left
+    alone ("CO" and "Co" are different substances).
+    """
+    counts = {}
+    for name in names:
+        if isinstance(name, str) and name.strip():
+            name = mapping.get(name.strip(), name.strip())
+            counts[name] = counts.get(name, 0) + 1
+    groups = {}
+    for name in counts:
+        if len(name) > 3:
+            groups.setdefault(name.lower(), []).append(name)
+    chosen = set(mapping.values())
+    merges = {}
+    for spellings in groups.values():
+        if len(spellings) < 2:
+            continue
+        keep = sorted(spellings, key=lambda n: (n not in chosen, -counts[n], n))[0]
+        merges.update({n: keep for n in spellings if n != keep})
+    return merges
 
 
 # ---------- turn the wide CSV into the nested shape Cypher wants ----------
@@ -282,12 +330,42 @@ def _one_measurement(first, members, roles, node_key, rekeyed=None):
         "source_text": "",
         "plausible": bool(first.get("plausible", True)),
         "plausibility_note": first.get("plausibility_note") or "",
-        "dedup_key": first.get("Dedup_key") or "",
+        "uncertainty": _uncertainty(first),
         "member_keys": member_keys,
         "review_papers": review_papers,
         "source_keys": primary_papers,
         "ref_numbers": ",".join(refs),
     }
+
+
+def _uncertainty(row):
+    """The "± 0.02" of a table cell, in the value's canonical unit. -> float or None.
+
+    The CSV keeps it as printed: in the column's own unit and before the header's
+    multiplier ("10-3 rho"). An uncertainty is a difference, so it is converted as one
+    -- the canonical value of (u) minus that of (0) -- which applies a unit's factor
+    but not its offset: +/- 0.5 K is +/- 0.5 C, not -272.65 C.
+    """
+    u, scale = _number(row.get("Uncertainty")), _number(row.get("Header_scale")) or 1.0
+    if u is None:
+        return None
+    unit, prop = row.get("Unit_as_written") or "", row["Property"]
+    # The factor is measured over 1000 units, because to_canonical rounds to 6
+    # decimals and a small uncertainty converted directly would round to zero.
+    zero, _, bad0 = units.to_canonical(0.0, unit, prop)
+    big, _, bad = units.to_canonical(1000.0, unit, prop)
+    if bad0 or bad or zero is None or big is None:
+        return None
+    return float(f"{abs(u * scale * (big - zero) / 1000):.6g}")
+
+
+def _number(value):
+    """A CSV cell as a float, or None for blank and NaN."""
+    try:
+        f = float(value)
+    except (TypeError, ValueError):
+        return None
+    return None if f != f else f
 
 
 def _int(value):
@@ -390,14 +468,27 @@ def _component_property_rows(properties, canonical=None):
     } for r in properties if r.get("status") == "ok"]
 
 
-def _prose_mixture_key(row):
+def _prose_names(row, canonical=None):
+    return [_canonical(n.strip(), canonical or {})
+            for n in str(row.get("components_resolved") or "").split(";") if n.strip()]
+
+
+def _prose_mixture_key(row, canonical=None):
     """The Mixture key for a prose row, from the same inputs _prose_mixture_rows uses."""
-    names = [n.strip() for n in str(row.get("components_resolved") or "").split(";")
-             if n.strip()]
-    return mixture_key(names, row.get("molar_ratio"))
+    return mixture_key(_prose_names(row, canonical), row.get("molar_ratio"))
 
 
-def _prose_measurement_rows(prose):
+def _prose_source(r, roles):
+    """(review_papers, source_keys) for a prose row, as the table rows decide them:
+    a cited reference is the source; otherwise a research paper is its own source and
+    a review only reports the value."""
+    cited = _split(r.get("Source_paper_keys"))
+    own = r.get("Paper_key") or r["Paper_DOI"]
+    primary = (roles or {}).get(own) == "primary"
+    return ([] if primary else [own]), (cited or ([own] if primary else []))
+
+
+def _prose_measurement_rows(prose, roles=None, canonical=None):
     """Prose rows in the same shape as _measurement_rows, so they share the Cypher."""
     return [{
         "key": _hash([r["Measurement_key"]]),
@@ -405,17 +496,18 @@ def _prose_measurement_rows(prose):
         # The prose CSV has no Mixture_key column, so derive it exactly as
         # _prose_mixture_rows does -- otherwise this creates a second, keyless node
         # for a mixture that already exists.
-        "mixtures": [{"key": _prose_mixture_key(r), "name": r["Mixture"]}],
+        "mixtures": [{"key": _prose_mixture_key(r, canonical), "name": r["Mixture"]}],
         "property": r["property"],
         "value": r["value"],
         "unit": r.get("unit"),
         "temperature_C": r.get("temperature_C"),
         "origin": "prose",
-        "plausible": True, "plausibility_note": "", "dedup_key": "",
+        "plausible": True, "plausibility_note": "", "uncertainty": None,
         "member_keys": [r["Measurement_key"]],
         "source_text": r.get("source_text") or "",   # the sentence it was read from
         "paper_doi": r["Paper_DOI"],
-        "source_keys": _split(r.get("Source_paper_keys")),
+        "review_papers": _prose_source(r, roles)[0],
+        "source_keys": _prose_source(r, roles)[1],
         "ref_numbers": r.get("Source_ref_numbers") or "",
     } for r in prose]
 
@@ -427,11 +519,13 @@ def _prose_mixture_rows(prose, components_by_name, canonical=None):
     seen, rows = set(), []
     for r in prose:
         mixture = r.get("Mixture")
-        if not mixture or mixture in seen:
+        # Deduplicated on the key the measurements attach by: two rows can share a
+        # name but differ in ratio, and a name-only check left the second keyless.
+        key = _prose_mixture_key(r, canonical)
+        if not mixture or key in seen:
             continue
-        seen.add(mixture)
-        names = [_canonical(n.strip(), canonical or {})
-                 for n in str(r.get("components_resolved") or "").split(";") if n.strip()]
+        seen.add(key)
+        names = _prose_names(r, canonical)
         ratios = xml_utils.split_ratio(r.get("molar_ratio"), n=len(names) or 1)
         comps = []
         for i, name in enumerate(names):
@@ -447,7 +541,7 @@ def _prose_mixture_rows(prose, components_by_name, canonical=None):
             })
         rows.append({
             "member_keys": [r.get("Row_id") or ""],
-            "key": mixture_key(names, r.get("molar_ratio")),
+            "key": key,
             "mixture": mixture,
             "ratio_raw": r.get("molar_ratio") or "",
             "components": comps,
@@ -521,7 +615,6 @@ FOREACH (k IN row.source_keys |
 APPLICATIONS_CYPHER = """
 UNWIND $rows AS row
 MERGE (app:Application {domain: row.domain})
-  ON CREATE SET app.example_caption = row.caption
 
 MERGE (mix:Mixture {key: row.mixture_key})
   ON CREATE SET mix.name = row.mixture, mix.ratio_raw = row.ratio_raw,
@@ -587,7 +680,6 @@ def _application_rows(applications, roles=None, canonical=None):
             "key": r["Application_key"],
             "mixture_key": mixture_key([c["name"] for c in comps], r.get("Ratio_molar") or r.get("Ratio_raw")),
             "domain": r.get("Domain") or "unspecified",
-            "caption": r.get("Table_caption") or "",
             "mixture": r["Mixture"],
             "ratio_raw": r.get("Ratio_raw") or "",
             "components": comps,
@@ -702,7 +794,7 @@ MERGE (m:{label} {{key: r.key}})
       m.property = r.property, m.subject = r.subject,
       m.origin = r.origin, m.source_text = r.source_text,
       m.plausible = r.plausible, m.plausibility_note = r.plausibility_note,
-      m.dedup_key = r.dedup_key, m.member_keys = r.member_keys
+      m.uncertainty = r.uncertainty, m.member_keys = r.member_keys
 
 // Attached by name, because the mixture rows have already created every mixture and
 // two papers can name the same one differently. `temperature_C` is deliberately NOT
@@ -732,19 +824,19 @@ FOREACH (k IN r.source_keys |
 def build(wipe=False, include_prose=True):
     from . import store
 
-    table = store.read_all("mixtures")
+    table = _doi_keys(store.read_all("mixtures"))
     # `status` decides what loads (schema.MEASUREMENT_STATUS_ORDER): a value in a unit
     # naming another quantity, with no solute, or stated only as a range stays in the
     # CSV for review and out of the graph.
-    long_rows = [r for r in store.read_all("measurements")
+    long_rows = [r for r in _doi_keys(store.read_all("measurements"))
                  if (r.get("status") or "ok") == "ok"]
-    references = store.read_all("references")
+    references = _doi_keys(store.read_all("references"))
 
     # Only rows the prose route judged loadable: a real number, present in the
     # section text, not already in Table 2, and every component name resolved.
     prose = []
     if include_prose:
-        prose_all = store.read_all("sections_llm")
+        prose_all = _doi_keys(store.read_all("sections_llm"))
         if prose_all:
             prose = [r for r in prose_all if r.get("status") == "ok"]
             print(f"  {len(prose)} prose measurement(s) of {len(prose_all)} rows "
@@ -779,19 +871,29 @@ def build(wipe=False, include_prose=True):
 
     # Which of the papers we extracted from report their own measurements. A research
     # article is the primary source for its data; a review is not.
-    roles = {p["Paper_key"]: p.get("role", "review") for p in store.papers()}
+    corpus_papers = _doi_keys(store.papers())
+    roles = {p["Paper_key"]: p.get("role", "review") for p in corpus_papers}
     corpus = [{"key": p["Paper_key"], "doi": p.get("Paper_DOI") or "",
                "authors": p.get("authors") or "", "title": p.get("title") or "",
                "journal": p.get("journal") or "", "volume": str(p.get("volume") or ""),
                "issue": str(p.get("issue") or ""), "pages": str(p.get("pages") or ""),
                "year": str(p.get("year") or ""), "role": p.get("role", "review")}
-              for p in store.papers()]
+              for p in corpus_papers]
 
     from . import duplicates
 
     # Only groups a human marked `yes` in data/review/component_duplicates.csv. An
     # empty file means nothing merges, which is the safe default.
     canonical = duplicates.canonical_map()
+    names = [r.get(f) for rows in (table, store.read_all("applications"))
+             for r in rows for f in ("Component_1", "Component_2", "Component_3")]
+    names += [n for r in prose for n in str(r.get("components_resolved") or "").split(";")]
+    by_case = _case_merges(names, canonical)
+    if by_case:
+        print(f"  merging {len(by_case)} spelling(s) that differ only in case")
+    # Chained: a reviewed merge first, then its survivor's case variant.
+    canonical = {n: by_case.get(c, c) for n, c in canonical.items()} | {
+        n: c for n, c in by_case.items() if n not in canonical}
     if canonical:
         print(f"  merging {len(canonical)} component spelling(s) into "
               f"{len(set(canonical.values()))} canonical name(s)")
@@ -800,17 +902,18 @@ def build(wipe=False, include_prose=True):
     # extracted from, which are added separately). The rest of each bibliography stays
     # in references.csv, never looked up and never in the graph.
     cited_keys = cited | {k for r in long_rows for k in _split(r.get("Source_paper_keys"))}
-    cited_keys |= {k for r in store.read_all("applications")
+    application_rows = _doi_keys(store.read_all("applications"))
+    cited_keys |= {k for r in application_rows
                    if (r.get("status") or "ok") == "ok"
                    for k in _split(r.get("Source_paper_keys"))}
     papers = _paper_rows([r for r in references if r.get("key") in cited_keys])
     print(f"  {len(papers)} cited reference(s) become Paper nodes "
           f"(of {len(references)} in the bibliographies)")
-    applications = _application_rows(store.read_all("applications"), roles, canonical)
+    applications = _application_rows(application_rows, roles, canonical)
     mixtures, rekeyed = _mixture_rows(table, components_by_name, roles, canonical)
     measurements = _measurement_rows(long_rows, roles, rekeyed)
     prose_mixtures = _prose_mixture_rows(prose, components_by_name, canonical)
-    prose_measurements = _prose_measurement_rows(prose)
+    prose_measurements = _prose_measurement_rows(prose, roles, canonical)
     component_scalars = _component_rows(components_by_name, canonical)
     property_records = _component_property_rows(component_properties, canonical)
 

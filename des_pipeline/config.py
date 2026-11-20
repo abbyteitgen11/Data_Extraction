@@ -373,6 +373,11 @@ ANTHROPIC_CONCURRENCY = int(os.environ.get("DES_ANTHROPIC_CONCURRENCY", 8))
 # A hard stop on spend for one run tag, in US dollars, read from USAGE_CSV. 0 = none.
 # Stopping loses nothing: every answer received so far is in the response cache.
 BUDGET_USD = float(os.environ.get("DES_BUDGET_USD", 0) or 0)
+# Message Batches (tools/run_batch.py): "collect" queues every uncached Anthropic call
+# instead of sending it, and stops that paper; the batch's answers fill the response
+# cache and the next pass gets one stage further. Billed at half the standard price.
+BATCH_MODE = os.environ.get("DES_BATCH_MODE", "")
+BATCH_DISCOUNT = 0.5
 # $ per million tokens (input, output). From the Anthropic price list, 2026-09-25; check
 # it before trusting a cost figure. Thinking tokens are billed as output.
 ANTHROPIC_PRICES = {

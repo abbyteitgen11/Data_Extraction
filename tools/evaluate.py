@@ -268,7 +268,8 @@ def gold_item(task, r, aliases):
     if task == "dictionary":
         if r.get("kind") == "alias":
             return None
-        return {"code": code_key(r.get("code")), "des": des}
+        return {"code": code_key(r.get("code")), "label": _label_like(r.get("code")),
+                "des": des}
     if task == "mixtures":
         return {"des": des}
     if task == "applications":
@@ -312,7 +313,7 @@ def load_pred(tag, slug, meta, aliases):
             continue
         names = [c for c in str(r.get("components") or "").split(";") if c]
         out["dictionary"].append({
-            "code": code_key(r.get("code")),
+            "code": code_key(r.get("code")), "label": _label_like(r.get("code")),
             "des": identity(names, r.get("ratio_molar") or r.get("ratio_raw"), aliases),
             "origin": "text", "show": f"{r.get('code')} = {r.get('components')} "
                                       f"({r.get('ratio_molar') or r.get('ratio_raw')})"})
@@ -394,13 +395,23 @@ def load_pred(tag, slug, meta, aliases):
 
 
 # ---------- matching ----------
+def _label_like(code):
+    """'Choline chloride:Urea (1:2)' -- names joined by ':', not a paper's own code."""
+    head = re.sub(r"\s*\([^)]*\)\s*$", "", str(code or ""))
+    parts = [x for x in head.split(":") if x.strip()]
+    return len(parts) >= 2 and all(re.search(r"[A-Za-z]{2}", x) for x in parts)
+
+
 def _equal(task):
     if task == "dictionary":
         # Same DES, and the codes agree when both have one -- codes are written in
         # different styles ("CEM5" vs "CEM 5"), so a differing code still matches when
         # both sides state a ratio and it agrees.
+        # A "code" that is only the pipeline's generated label ("A:B:C") says nothing
+        # the components do not, and the gold kept the labels of the run it reviewed.
         return lambda p, g: same_des(p["des"], g["des"]) and (
             not p["code"] or not g["code"] or p["code"] == g["code"]
+            or (p.get("label") and g.get("label"))
             or (p["des"][1] is not None and g["des"][1] is not None))
     if task == "mixtures":
         return lambda p, g: same_des(p["des"], g["des"])

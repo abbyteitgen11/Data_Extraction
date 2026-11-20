@@ -684,6 +684,84 @@ def test_superscript_defined_in_caption_names_the_property():  # Jablonský "−
 
 
 
+def test_offline_crossref_lookup_is_not_cached_as_done():    # laptop asleep mid-run
+    import requests
+    from des_pipeline import extract_references as er
+
+    class Offline:
+        def get(self, *a, **k):
+            raise requests.ConnectionError("no network")
+
+    er.time.sleep, sleep = (lambda s: None), er.time.sleep
+    try:
+        meta = {"num": "1", "title": "A deep eutectic solvent study", "authors": "Smith",
+                "year": "2020", "journal": "J Mol Liq"}
+        assert er.crossref_search(meta, Offline())[2] == er.NETWORK_FAILED
+        assert er.crossref_metadata("10.1/x", Offline()) == er.NETWORK_FAILED
+    finally:
+        er.time.sleep = sleep
+
+
+def test_graph_keys_and_prose_links():
+    from des_pipeline import build_graph as bg
+
+    rows = bg._doi_keys([{"key": "10.1039/C1RA00630D", "Source_paper_keys":
+                          "10.1039/C0GC00395F|X_2020#ref3"}])
+    assert rows[0]["key"] == "10.1039/c1ra00630d"
+    assert rows[0]["Source_paper_keys"] == "10.1039/c0gc00395f|X_2020#ref3"
+
+    def prose(mixture, ratio, cited=None):
+        return {"Measurement_key": f"m{ratio}", "Mixture": mixture, "property": "Density",
+                "value": 1.1, "components_resolved": "Choline chloride;Urea",
+                "molar_ratio": ratio, "Paper_DOI": "10.1/p", "Paper_key": "10.1/p",
+                "Source_paper_keys": cited}
+
+    rows = [prose("ChCl:U", "1:2"), prose("ChCl:U", "1:3", "10.1/cited")]
+    roles = {"10.1/p": "primary"}
+    mixtures = bg._prose_mixture_rows(rows, {})
+    measured = bg._prose_measurement_rows(rows, roles)
+    assert {m["key"] for m in mixtures} == {m["mixtures"][0]["key"] for m in measured}
+    assert measured[0]["source_keys"] == ["10.1/p"]          # own data: the paper itself
+    assert measured[1]["source_keys"] == ["10.1/cited"]
+    assert bg._prose_measurement_rows(rows, {"10.1/p": "review"})[0]["review_papers"] \
+        == ["10.1/p"]
+
+
+def test_mixture_cells_from_the_corpus():
+    from des_pipeline.composition import compose, des_problem, parse_mixture as p
+
+    c = p("ChCl/Gly (1:2 mol mol−1) + ZnCl2 (20 mol%")            # PMC10974547
+    assert c.components == ["ChCl", "Gly", "ZnCl2"] and c.ratio_raw == "1:2"
+    c = p("DES#02:Bet:OxA (2:1 30 wt % H2O")                      # PMC10373463
+    assert c.components == ["Bet", "OxA", "Water"] and c.water_fraction == 0.3
+    c = p("Choline chloride:urea (1:2) + 20 wt% H2O)")             # PMC13377926
+    assert c.components[-1] == "Water" and not c.additives
+    for several in ("choline chloride:ethylene glycol 1:2 ChCl:urea 1:2 ChCl:glycerol 1:2",
+                    "menthol:camphor (1:1) and menthol:borneol (1:1)",
+                    "Choline chloride:Urea ChCl:Glycerol ChCl:Formic acid ChCl:Acetic acid"):
+        assert des_problem(p(several)).startswith("several DES"), several
+    for junk in ("Cat+X−:zRZ (1:1)", "solid–liquid extraction:Ethanol",
+                 "Citric acid:Citric acid"):
+        assert des_problem(p(junk)), junk
+    assert not des_problem(p("ChCl:Gly (1:2, 1:3)"))               # ratios of ONE DES
+    assert des_problem(p("ChCl/EG (1:2) ChCl/Gly (1:2) ChCl/U (1:2)")).startswith("several")
+    assert p("ChCl:EG (1:2)-10% water").water_fraction == 0.1
+    assert compose(["thymol", "menthol"], implied=["Monoterpenoid"]).components == \
+        ["thymol", "menthol"]                                       # a class, not a compound
+    implied = compose(["choline chloride", "urea"], implied=["ChCl"],
+                      resolve=lambda n: "choline chloride" if n == "ChCl" else n)
+    assert implied.components == ["choline chloride", "urea"]     # PMC8271379
+
+
+def test_case_variants_merge_but_short_names_do_not():
+    from des_pipeline.build_graph import _case_merges
+
+    merges = _case_merges(["L-Proline", "l-proline", "l-proline", "CO", "Co"], {})
+    assert merges == {"L-Proline": "l-proline"}
+    assert _case_merges(["L-Proline", "l-proline"], {"Proline": "L-Proline"}) == \
+        {"l-proline": "L-Proline"}
+
+
 if __name__ == "__main__":
     failures = 0
     tests = [(name, fn) for name, fn in sorted(globals().items())

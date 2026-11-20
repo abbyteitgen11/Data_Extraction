@@ -119,12 +119,13 @@ def _ollama_options():
 
 
 from .budget import BudgetExceeded  # noqa: E402  (re-exported for run_pipeline)
+from .batch import Deferred  # noqa: E402  (re-exported for run_pipeline)
 
 _USAGE_LOCK = threading.Lock()
 
 
 def log_usage(backend, model, section_id, input_tokens, output_tokens, seconds,
-              cache_read=0, cache_write=0, stop_reason=""):
+              cache_read=0, cache_write=0, stop_reason="", discount=1.0):
     """Append one row to USAGE_CSV: what a fresh model call cost in tokens, $ and time.
 
     This is what makes models comparable on cost and speed, not just accuracy. Cached
@@ -138,7 +139,7 @@ def log_usage(backend, model, section_id, input_tokens, output_tokens, seconds,
     # Cache reads bill at ~0.1x and writes at ~1.25x the input price.
     cost = ((input_tokens or 0) * price_in + (output_tokens or 0) * price_out
             + (cache_read or 0) * price_in * 0.1
-            + (cache_write or 0) * price_in * 1.25) / 1e6
+            + (cache_write or 0) * price_in * 1.25) / 1e6 * discount
     row = {"time": time.strftime("%Y-%m-%d %H:%M:%S"), "run_tag": config.RUN_TAG,
            "backend": backend, "model": model, "call": section_id,
            "input_tokens": input_tokens or 0, "output_tokens": output_tokens or 0,
@@ -269,17 +270,22 @@ def call_llm(prompt, schema_json, backend=None, section_id=""):
                              message.stop_reason or "")
         finally:
             budget.settle(held, cost)
-        if message.stop_reason == "refusal":
-            print(f"    {section_id}: the model declined; treated as an empty answer")
-            return "{}"
-        if message.stop_reason == "max_tokens":
-            print(f"    warning: {section_id} hit max_tokens; the JSON is probably cut off")
-        for block in message.content:
-            if block.type == "text":
-                return block.text
-        return "{}"
+        return answer_text(message, section_id)
 
     raise ValueError(f"unknown LLM backend {backend!r} (expected 'ollama' or 'anthropic')")
+
+
+def answer_text(message, section_id=""):
+    """A Messages API response -> the JSON answer string ("{}" when there is none)."""
+    if message.stop_reason == "refusal":
+        print(f"    {section_id}: the model declined; treated as an empty answer")
+        return "{}"
+    if message.stop_reason == "max_tokens":
+        print(f"    warning: {section_id} hit max_tokens; the JSON is probably cut off")
+    for block in message.content:
+        if block.type == "text":
+            return block.text
+    return "{}"
 
 
 def map_calls(fn, items, backend=None):
@@ -295,7 +301,18 @@ def map_calls(fn, items, backend=None):
     from concurrent.futures import ThreadPoolExecutor
 
     with ThreadPoolExecutor(max_workers=config.ANTHROPIC_CONCURRENCY) as pool:
-        return list(pool.map(fn, items))
+        futures = [pool.submit(fn, item) for item in items]
+        # Wait for every call before raising: in batch collect mode each one queues its
+        # request, and stopping at the first would leave its siblings for a later round.
+        results, deferred = [], None
+        for future in futures:
+            try:
+                results.append(future.result())
+            except Deferred as exc:
+                deferred = exc
+        if deferred is not None:
+            raise deferred
+        return results
 
 
 # ---------- response cache ----------
@@ -332,6 +349,11 @@ def cached_call_llm(prompt, schema_json, section_id="", backend=None, refresh=Fa
     if path.exists() and not refresh:
         return path.read_text(encoding="utf-8"), True
 
+    if config.BATCH_MODE == "collect" and (backend or config.LLM_BACKEND) == "anthropic":
+        from . import batch
+
+        kind, kwargs = _anthropic_request(prompt, schema_json)
+        batch.queue(path, section_id, kind, kwargs)         # raises Deferred
     raw = call_llm(prompt, schema_json, backend=backend, section_id=section_id)
     config.LLM_CACHE_DIR.mkdir(parents=True, exist_ok=True)
     path.write_text(raw, encoding="utf-8")
@@ -706,7 +728,14 @@ def extract_section(section_id, title, text, paper_doi="", reference_map=None,
             conflict = units.unit_conflict(unit_raw or "", draft.property)
             converted, canonical, status = units.to_canonical(draft.value, unit_raw or "",
                                                               draft.property)
-            if conflict or status:
+            # A property reported on several scales (polarity: E_T(30) or Kamlet-Taft
+            # alpha/beta/pi*) needs its scale read from the unit or the quote, as the
+            # table route reads it from the header. Kamlet-Taft is not E_T(30).
+            basis, basis_status = units.basis_of(draft.property,
+                                                 f"{unit_raw or ''} {quote}")
+            if draft.property == "Polarity_ET30" and basis not in ("", "ET30"):
+                basis_status = "other_scale"
+            if conflict or status or basis_status:
                 unit = f"!{unit_raw}"           # marks unhandled_unit for _status_for
             else:
                 value, unit = converted, canonical

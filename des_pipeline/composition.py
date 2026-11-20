@@ -44,8 +44,10 @@ _PCT = (r"(\d+(?:\.\d+)?)\s*(wt\s*\.?\s*%|%\s*wt\.?|%\s*\(?\s*w\s*/\s*w\s*\)?|"
         r"mol\s*\.?\s*%|%\s*\(?\s*mol\s*\)?|%)")
 # "+20% water", "+ 10 %wt EC", "with 5 wt% H2O", "4% water"
 _ADDITIVE_AFTER = re.compile(
-    r"(?:^|[+,;&]|\bwith\b|\band\b)\s*" + _PCT + r"\s*(?:of\s+)?"
+    r"(?:^|[+,;&]|(?<=[A-Za-z0-9)\]])[-–]|\bwith\b|\band\b)\s*" + _PCT + r"\s*(?:of\s+)?"
     r"([A-Za-z][\w\-\[\]()₂]*(?:\s+water)?)?", re.I)
+# "+ ZnCl2 (20 mol%)" -- the additive named before its amount
+_ADDITIVE_BEFORE = re.compile(r"\+\s*([A-Za-z][\w·\-\[\]]*)\s*\(\s*" + _PCT + r"\s*\)?", re.I)
 # "water (20 wt%)", "H2O 20%"
 _WATER_BEFORE = re.compile(r"\b(water|h2o)\s*\(?\s*" + _PCT + r"\s*\)?", re.I)
 
@@ -56,6 +58,25 @@ _RATIO_LIST = re.compile(r"\(\s*(" + _RATIO + r"(?:\s*[,;]\s*" + _RATIO + r")+)\
 # The ratio at the end of a mixture string: "(1:2)", ", 1:2", " 1:2", "(molar ratio 1:2)"
 _RATIO_TAIL = re.compile(r"[\s,;(]*(?:molar\s+ratio\s*[:=]?\s*|ratio\s*[:=]?\s*)?"
                          r"(" + _RATIO + r")\s*\)?\s*$", re.I)
+# A ratio in brackets with text after it, inside or outside the bracket:
+# "ChCl/Gly (1:2 mol mol-1)", "Lactic acid-glucose (5:1) using UAE for 30 min",
+# "Bet:OxA (2:1 30 wt % H2O", "(molarity ratio of 1:2); UAE at room temperature".
+_RATIO_INNER = re.compile(r"\(\s*(?:(?:molar|molarity|mole|mass)?\s*ratio(?:\s+of)?\s*[:=]?\s*)?"
+                          r"(" + _RATIO + r")(?![\d.:])\s*(.*)$", re.I)
+# A paper's code for a DES written as if it were a component: "DES#02:Bet:OxA".
+_CODE_LABEL = re.compile(r"(?:[A-Z]{0,4}DES|DES)\s*[#\-_]?\s*\d+[A-Za-z]?", re.I)
+# Several DES in one cell: a ratio followed by another A:B pair ("ChCl:EG 1:2 ChCl:urea
+# 1:2"), or pairs joined by ";", "and", "or" ("menthol:camphor (1:1) and menthol:borneol").
+# "/" joins two names as often as ":" ("ChCl/EG (1:2) ChCl/Gly (1:2)"); a "/" pair only
+# counts when it carries its own ratio, so "(1:15 g/mL)" is not a second DES.
+_RATIO_THEN_PAIR = re.compile(
+    _RATIO + r"\)?\s*[,;.]?\s*(?:and\s+|or\s+)?"
+    r"(?:[A-Za-z][^:()]*?[A-Za-z)\]]\s*:\s*[A-Za-z(\[]"
+    r"|[^()]*?[A-Za-z)\]]\s*/\s*[A-Za-z(\[][^()]*?\(?\s*" + _RATIO + r")")
+_PAIR = re.compile(r"[A-Za-z)\]]\s*:\s*[A-Za-z(\[]")
+# A component that names a process, not a chemical ("solid-liquid extraction").
+_PROCESS = re.compile(r"extraction|distillation|ultrason|microwave|pretreatment|"
+                      r"\bmethod\b|procedure", re.I)
 # A header saying the column holds HBA:HBD (or the reverse) as one number.
 _HBA_HBD = re.compile(r"hba\s*[:/]\s*hbd|hba\s+to\s+hbd", re.I)
 _HBD_HBA = re.compile(r"hbd\s*[:/]\s*hba|hbd\s+to\s+hba", re.I)
@@ -65,9 +86,13 @@ _RATIO_HEADER = re.compile(r"ratio", re.I)
 _FRAGMENT = re.compile(r"^\s*[-–>=<]")
 # Generic symbols a review uses to describe CLASSES of DES ("Cat+X- zMClx", "HBA:HBD"),
 # not compounds: Sadeghi's Table 1 "Types of eutectics" was being read as DES.
-_PLACEHOLDER = re.compile(r"^\s*(cat(ion)?\+?|an(ion)?-?|x\s*[−-]|hb[ad]s?|rz|salts?|"
-                          r"metal( salts?|s)?|z?\s*m\s*cl\s*x.*|y\s*h2o)\s*$|^\s*x\s*[−-]",
-                          re.I)
+_PLACEHOLDER = re.compile(r"^\s*(cat(ion)?\+?|an(ion)?-?|x\s*[−-]|hb[ad]s?|z?\s*rz|salts?|"
+                          r"metal( salts?|s)?|z?\s*m\s*cl\s*x.*|y\s*h2o|"
+                          r"cat(ion)?\s*\+\s*(x|an(ion)?)\s*[−-]?|"
+                          # a class, not a compound (":Monoterpenoid"). "DES" itself is NOT
+                          # here: "DES 1:4 + 10 %wt EC" is Dinh's own name for a DES.
+                          r"monoterpenoids?|terpenoids?|terpenes?|x)\s*$"
+                          r"|^\s*x\s*[−-]", re.I)
 # A stoichiometric coefficient on a name: "2PTSA" (see extract_table.split_coefficient).
 _COEFFICIENT = re.compile(r"^(\d{1,2})([A-Za-z\[].*)$")
 
@@ -90,6 +115,7 @@ class Composition:
     aliases: dict = field(default_factory=dict)  # "ChCl" -> "Choline Chloride", as written
     code: str = ""                        # the paper's code for it, when one resolved it
     source: str = ""                      # where a dictionary entry came from
+    several: bool = False                 # the text names several DES, not one
     notes: list = field(default_factory=list)
 
     # --- views the CSV writers want ---------------------------------------------------
@@ -199,6 +225,31 @@ def _cid_names():
     return _CID_NAMES
 
 
+def _key(name):
+    return re.sub(r"\W+", "", str(name or "")).lower()
+
+
+def _several_des(text):
+    """Does this text name several DES ("A:B 1:2 C:D 1:3", "A:B (1:1) and A:C (1:1)")?"""
+    text = str(text or "")
+    if _RATIO_LIST.search(text):
+        return False                       # several ratios of ONE DES
+    if _RATIO_THEN_PAIR.search(text):
+        return True
+    pieces = [p for p in re.split(r";|\band\b|\bor\b", text) if p.strip()]
+    return sum(1 for p in pieces if _PAIR.search(p)) >= 2
+
+
+def _flattened_list(pieces):
+    """A list whose line breaks were lost: "ChCl:Urea ChCl:Glycerol ChCl:Formic acid"
+    splits into "Urea ChCl", "Glycerol ChCl" -- one abbreviation ending several pieces."""
+    if len(pieces) < 3:
+        return False
+    last = [p.split()[-1] for p in pieces[1:-1] if len(p.split()) >= 2]
+    return any(last.count(w) >= 2 and re.search(r"[A-Z].*[A-Z]|[A-Z][a-z]*[A-Z]", w)
+               for w in set(last))
+
+
 # ---------- splitting a mixture string into names ----------
 def _letters(text):
     return len(re.findall(r"[A-Za-z]", text))
@@ -285,8 +336,20 @@ def _strip_additives(text, comp):
         comp.water_basis = basis_of(match.group(3))
         work = (work[:match.start()] + work[match.end():]).strip(" +,;")
 
+    def before(match):
+        name, value, unit = match.group(1), match.group(2), match.group(3)
+        if is_water(name):
+            comp.water_fraction, comp.water_basis = float(value) / 100, basis_of(unit)
+        else:
+            comp.additives[name] = (float(value) / 100, basis_of(unit))
+        return " "
+
+    work = _ADDITIVE_BEFORE.sub(before, work)
+
     def repl(match):
         value, unit, name = match.group(1), match.group(2), (match.group(3) or "").strip()
+        while name.endswith(")") and name.count(")") > name.count("("):
+            name = name[:-1].strip()       # "+ 20 wt% H2O)" -- the bracket is the cell's
         basis = basis_of(unit)
         if name and not is_water(name) and not re.match(r"^water\b", name, re.I):
             comp.additives[name] = (float(value) / 100, basis)
@@ -324,9 +387,17 @@ def parse_mixture(text, dictionary=None, resolve=None):
         work = (work[:listed.start()] + work[listed.end():]).strip(" ,;")
     else:
         tail = _RATIO_TAIL.search(work)
+        inner = _RATIO_INNER.search(work)
         if tail and tail.start() > 0:
             comp.ratio_raw = re.sub(r"\s+", "", tail.group(1))
             work = work[:tail.start()].strip(" ,;(")
+        elif inner and inner.start() > 0 and not _several_des(work):
+            # The ratio is followed by a description; what follows is not a component.
+            comp.ratio_raw = re.sub(r"\s+", "", inner.group(1))
+            trailing = _strip_additives("+ " + inner.group(2), comp).strip(" ()+,;.")
+            if trailing:
+                comp.note(f"text after the ratio not read as a component: {trailing!r}")
+            work = work[:inner.start()].strip(" ,;(")
 
     # A code the paper itself defines wins over any parse of the letters.
     if dictionary is not None:
@@ -349,11 +420,22 @@ def parse_mixture(text, dictionary=None, resolve=None):
             finish(out)
             return out
 
+    pieces = split_names(work)
+    if _several_des(raw) or _flattened_list(pieces):
+        comp.several = True
+        comp.note("several DES in one cell; not split")
+
     names, coefficients = [], []
-    for piece in split_names(work):
+    for piece in pieces:
         piece, abbr = clean_name(piece)
         name, coefficient = split_coefficient(piece)
         name = name.strip()
+        if _CODE_LABEL.fullmatch(name) and len(pieces) > 2:
+            comp.note(f"{name!r} is the paper's label for the DES, not a component")
+            continue
+        if name.lower() in (n.lower() for n in names):
+            comp.note(f"{name!r} listed twice; kept once")
+            continue
         if abbr and name:
             comp.aliases[abbr] = name
         if name and not re.search(r"[A-Za-z]", name):
@@ -422,8 +504,16 @@ def compose(cells, ratio_text="", ratio_header="", water_text="", water_header="
         part = parse_mixture(cell, dictionary, resolve)
         if part.code and from_code is None:
             from_code = part
-        out.components += part.components
-        out.components_written += part.components_written or part.components
+        out.several = out.several or part.several
+        written = part.components_written or part.components
+        seen = {_key(c) for c in out.components}
+        for i, name in enumerate(part.components):
+            if _key(name) in seen:
+                out.note(f"{name!r} in two cells; kept once")
+                continue
+            seen.add(_key(name))
+            out.components.append(name)
+            out.components_written.append(written[i] if i < len(written) else name)
         if part.ratio_raw and not out.ratio_raw:
             out.ratio_raw, out.parts, out.ratio_source = (part.ratio_raw, part.parts,
                                                           part.ratio_source)
@@ -435,9 +525,13 @@ def compose(cells, ratio_text="", ratio_header="", water_text="", water_header="
     if from_code is not None and len(cells) == 1:
         out.code, out.source = from_code.code, from_code.source
 
-    present = {re.sub(r"\W+", "", c).lower() for c in out.components}
+    present = {_key(c) for c in out.components} | {_key(c) for c in out.components_written}
     for name in implied or ():
-        if re.sub(r"\W+", "", str(name)).lower() not in present:
+        if _PLACEHOLDER.match(str(name)):
+            continue            # "Monoterpenoid based DES" names a class, not a component
+        # Compared resolved: "ChCl" implied by the caption IS "Choline chloride" listed.
+        if _key(name) not in present and _key(_resolved(name, resolve)) not in present:
+            present.add(_key(_resolved(name, resolve)))
             out.components.append(_resolved(name, resolve))
             out.components_written.append(name)
             out.note(f"{name} implied by the caption")
@@ -592,6 +686,8 @@ def des_problem(comp, dictionary=None):
     always accepted: the paper said what it is.
     """
     names = [c for c in comp.components if c]
+    if comp.several:
+        return "several DES in one cell; not split into rows"
     defined = bool(comp.code) or (dictionary is not None
                                   and dictionary.lookup(comp.written) is not None)
     if defined and len(names) >= 2:
@@ -602,6 +698,8 @@ def des_problem(comp, dictionary=None):
         return "a structural fragment, not a compound"
     if any(_PLACEHOLDER.match(c) for c in names):
         return "a generic placeholder (Cat, X-, HBD, MClx...), not a compound"
+    if any(_PROCESS.search(c) for c in names):
+        return "a process or method, not a compound"
     if is_ionic_liquid_only(comp):
         return "a single ionic liquid, not a DES"
     # Water counts as a constituent when it is listed as one, with its own molar share
