@@ -35,6 +35,17 @@ import pandas as pd
 from . import config, dialects, paper as paper_mod, profile_table, store, units, xml_utils
 from .extract_table import read_measurement, read_measurement_cell, read_value
 
+# report() walks every paper and each check wants that paper's rows; re-reading the
+# whole corpus per paper made validation quadratic (about 27 s a paper at 2,000
+# papers). report() fills this once and empties it when done.
+_corpus = {}
+
+
+def _read_all(kind):
+    if kind not in _corpus:
+        return store.read_all(kind)
+    return _corpus[kind]
+
 
 # ---------- re-reading the source ----------
 def _reread_context(paper_row):
@@ -72,7 +83,7 @@ def check_fidelity(paper_row, sample=None):
     Exhaustive and automatic. A mismatch means the extractor and the source disagree,
     which is always our bug -- never the paper's.
     """
-    rows = [r for r in store.read_all("measurements")
+    rows = [r for r in _read_all("measurements")
             if r.get("Paper_key") == paper_row["Paper_key"]]
     if not rows:
         return 0, []
@@ -454,7 +465,7 @@ def spot_check(paper_row, n=20, seed=0, interactive=False):
             if row.get("Review_key") and not pd.isna(row["Review_key"]):
                 answered[row["Review_key"]] = row
 
-    rows = [r for r in store.read_all("measurements")
+    rows = [r for r in _read_all("measurements")
             if r.get("Paper_key") == paper_row["Paper_key"]]
     if not rows:
         return answered
@@ -512,7 +523,16 @@ def report(interactive=False, sample=20):
         print("  no papers processed yet")
         return False
 
-    measurements = store.read_all("measurements")
+    _corpus.clear()
+    _corpus["measurements"] = measurements = store.read_all("measurements")
+    _corpus["tables"] = store.read_all("tables")
+    try:
+        return _report(papers, measurements, interactive, sample)
+    finally:
+        _corpus.clear()
+
+
+def _report(papers, measurements, interactive, sample):
     all_ok = True
 
     for paper_row in papers:
@@ -521,7 +541,7 @@ def report(interactive=False, sample=20):
         checked, mismatches = check_fidelity(paper_row)
         skipped = skipped_cells(paper_row)
         implausible = check_plausibility(rows)
-        ledger = [r for r in store.read_all("tables")
+        ledger = [r for r in _read_all("tables")
                   if r.get("Paper_key") == paper_row["Paper_key"]]
         unhandled = [r for r in ledger if r.get("status") != "extracted"]
         no_data_verdict = bool(ledger) and all(
